@@ -41,19 +41,20 @@ docker build -t openclaw:local .
 
 # Restart services
 echo "Restarting services..."
-docker compose -f docker-compose.yml -f docker-compose.override.yml down --remove-orphans --timeout 30 2>/dev/null || true
-docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+COMPOSE="docker compose --env-file .env -f docker-compose.yml -f docker-compose.override.yml"
+$COMPOSE down --remove-orphans --timeout 30 2>/dev/null || true
+$COMPOSE up -d
 
 # Wait and verify
 echo "Waiting for services to start..."
 sleep 10
 
-if docker compose -f docker-compose.yml -f docker-compose.override.yml ps | grep -q "Up"; then
+if $COMPOSE ps | grep -q "Up"; then
   echo "Deployment successful!"
-  docker compose -f docker-compose.yml -f docker-compose.override.yml ps
+  $COMPOSE ps
 else
   echo "Deployment failed!"
-  docker compose -f docker-compose.yml -f docker-compose.override.yml logs --tail 50
+  $COMPOSE logs --tail 50
   exit 1
 fi
 
