@@ -5,6 +5,11 @@ echo "Starting OpenClaw deployment..."
 
 cd "$DEPLOY_PATH"
 
+# Backup .env before git operations (git reset --hard would overwrite it)
+if [ -f ".env" ]; then
+  cp .env /tmp/openclaw_env_backup
+fi
+
 # Update repository from fork
 if [ -d ".git" ]; then
   echo "Updating existing repository..."
@@ -15,6 +20,12 @@ else
   echo "Cloning repository..."
   mkdir -p "$DEPLOY_PATH"
   git clone "https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git" .
+fi
+
+# Restore .env
+if [ -f "/tmp/openclaw_env_backup" ]; then
+  cp /tmp/openclaw_env_backup .env
+  rm -f /tmp/openclaw_env_backup
 fi
 
 # Ensure OPENCLAW_SERVER_NAME is in .env
