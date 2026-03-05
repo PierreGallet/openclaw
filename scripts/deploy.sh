@@ -5,9 +5,15 @@ echo "Starting OpenClaw deployment..."
 
 cd "$DEPLOY_PATH"
 
-# Backup .env before git operations (git reset --hard would overwrite it)
+# Load .env into shell environment BEFORE any git operations
+# This ensures variables survive even if .env gets modified
 if [ -f ".env" ]; then
-  cp .env /tmp/openclaw_env_backup
+  echo "Loading .env ($(wc -l < .env) lines)..."
+  set -a
+  source .env
+  set +a
+else
+  echo "WARNING: No .env found, will need one after clone"
 fi
 
 # Update repository from fork
@@ -22,17 +28,19 @@ else
   git clone "https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git" .
 fi
 
-# Restore .env
-if [ -f "/tmp/openclaw_env_backup" ]; then
-  cp /tmp/openclaw_env_backup .env
-  rm -f /tmp/openclaw_env_backup
+# Verify required variables are set (from .env sourced earlier)
+if [ -z "$OPENCLAW_CONFIG_DIR" ]; then
+  echo "ERROR: OPENCLAW_CONFIG_DIR not set. Check .env on server."
+  exit 1
 fi
 
-# Ensure OPENCLAW_SERVER_NAME is in .env
-if grep -q '^OPENCLAW_SERVER_NAME=' .env 2>/dev/null; then
-  sed -i "s/^OPENCLAW_SERVER_NAME=.*/OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}/" .env
-else
-  echo "OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}" >> .env
+# Ensure GITHUB_TOKEN is in .env (for gh CLI inside container)
+if [ -n "$GHP_TOKEN" ]; then
+  if grep -q '^GITHUB_TOKEN=' .env 2>/dev/null; then
+    sed -i "s|^GITHUB_TOKEN=.*|GITHUB_TOKEN=${GHP_TOKEN}|" .env
+  else
+    echo "GITHUB_TOKEN=${GHP_TOKEN}" >> .env
+  fi
 fi
 
 # Rebuild Docker images
@@ -43,32 +51,19 @@ docker build -t openclaw:custom -f Dockerfile.custom .
 
 # Restart services
 echo "Restarting services..."
-echo "DEBUG: pwd=$(pwd)"
-echo "DEBUG: .env exists=$(test -f .env && echo yes || echo no)"
-echo "DEBUG: .env first 3 lines:"
-head -3 .env 2>/dev/null || echo "DEBUG: cannot read .env"
-echo "DEBUG: docker compose version:"
-docker compose version
-
-# Source .env into shell environment as fallback
-set -a
-source .env
-set +a
-
-COMPOSE="docker compose --env-file .env -f docker-compose.yml -f docker-compose.override.yml"
-$COMPOSE down --remove-orphans --timeout 30 2>/dev/null || true
-$COMPOSE up -d
+docker compose --env-file .env -f docker-compose.yml -f docker-compose.override.yml down --remove-orphans --timeout 30 2>/dev/null || true
+docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
 
 # Wait and verify
 echo "Waiting for services to start..."
 sleep 10
 
-if $COMPOSE ps | grep -q "Up"; then
+if docker compose -f docker-compose.yml -f docker-compose.override.yml ps | grep -q "Up"; then
   echo "Deployment successful!"
-  $COMPOSE ps
+  docker compose -f docker-compose.yml -f docker-compose.override.yml ps
 else
   echo "Deployment failed!"
-  $COMPOSE logs --tail 50
+  docker compose -f docker-compose.yml -f docker-compose.override.yml logs --tail 50
   exit 1
 fi
 

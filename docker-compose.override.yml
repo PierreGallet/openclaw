@@ -1,9 +1,13 @@
 services:
   openclaw-gateway:
     image: openclaw:custom
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
 
   openclaw-cli:
     image: openclaw:custom
+    environment:
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
 
   openclaw_nginx:
     image: nginx:alpine
