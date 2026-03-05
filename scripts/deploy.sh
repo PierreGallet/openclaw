@@ -35,12 +35,26 @@ else
   echo "OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}" >> .env
 fi
 
-# Rebuild Docker image
-echo "Building Docker image..."
+# Rebuild Docker images
+echo "Building base Docker image..."
 docker build -t openclaw:local .
+echo "Building custom Docker image (with brew)..."
+docker build -t openclaw:custom -f Dockerfile.custom .
 
 # Restart services
 echo "Restarting services..."
+echo "DEBUG: pwd=$(pwd)"
+echo "DEBUG: .env exists=$(test -f .env && echo yes || echo no)"
+echo "DEBUG: .env first 3 lines:"
+head -3 .env 2>/dev/null || echo "DEBUG: cannot read .env"
+echo "DEBUG: docker compose version:"
+docker compose version
+
+# Source .env into shell environment as fallback
+set -a
+source .env
+set +a
+
 COMPOSE="docker compose --env-file .env -f docker-compose.yml -f docker-compose.override.yml"
 $COMPOSE down --remove-orphans --timeout 30 2>/dev/null || true
 $COMPOSE up -d
