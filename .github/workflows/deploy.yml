@@ -49,13 +49,16 @@ jobs:
           OPENCLAW_SERVER_NAME: ${{ secrets.OPENCLAW_SERVER_NAME }}
         run: |
           # Create secrets env file
-          cat > /tmp/env_vars.sh << SECRETEOF
-          export DEPLOY_PATH='$DEPLOY_PATH'
-          export GHP_TOKEN='$GHP_TOKEN'
-          export OPENCLAW_SERVER_NAME='$OPENCLAW_SERVER_NAME'
+          cat > /tmp/env_vars.sh << 'SECRETEOF'
+          export DEPLOY_PATH='__DEPLOY_PATH__'
+          export GHP_TOKEN='__GHP_TOKEN__'
+          export OPENCLAW_SERVER_NAME='__OPENCLAW_SERVER_NAME__'
           SECRETEOF
+          sed -i "s|__DEPLOY_PATH__|$DEPLOY_PATH|g" /tmp/env_vars.sh
+          sed -i "s|__GHP_TOKEN__|$GHP_TOKEN|g" /tmp/env_vars.sh
+          sed -i "s|__OPENCLAW_SERVER_NAME__|$OPENCLAW_SERVER_NAME|g" /tmp/env_vars.sh
 
-          cat > deploy.sh << 'EOF'
+          cat > /tmp/deploy_openclaw.sh << 'DEPLOYEOF'
           #!/bin/bash
           set -e
 
@@ -113,16 +116,16 @@ jobs:
           docker image prune -f
 
           echo "Deployment completed!"
-          EOF
+          DEPLOYEOF
 
           HOST=$(echo $SSH_HOST | cut -d':' -f1)
           PORT=$(echo $SSH_HOST | grep -o ':[0-9]*' | cut -d':' -f2 || echo "22")
 
           scp -P $PORT /tmp/env_vars.sh $SSH_USER@$HOST:/tmp/env_vars.sh
-          scp -P $PORT deploy.sh $SSH_USER@$HOST:/tmp/deploy_openclaw.sh
+          scp -P $PORT /tmp/deploy_openclaw.sh $SSH_USER@$HOST:/tmp/deploy_openclaw.sh
           ssh -p $PORT $SSH_USER@$HOST "chmod 600 /tmp/env_vars.sh && source /tmp/env_vars.sh && bash /tmp/deploy_openclaw.sh; EXIT_CODE=\$?; rm -f /tmp/deploy_openclaw.sh /tmp/env_vars.sh; exit \$EXIT_CODE"
 
-          rm -f deploy.sh /tmp/env_vars.sh
+          rm -f /tmp/env_vars.sh /tmp/deploy_openclaw.sh
 
       - name: Health check
         env:
