@@ -48,15 +48,12 @@ jobs:
           GHP_TOKEN: ${{ secrets.GHP_TOKEN }}
           OPENCLAW_SERVER_NAME: ${{ secrets.OPENCLAW_SERVER_NAME }}
         run: |
-          # Create secrets env file
-          cat > /tmp/env_vars.sh << 'SECRETEOF'
-          export DEPLOY_PATH='__DEPLOY_PATH__'
-          export GHP_TOKEN='__GHP_TOKEN__'
-          export OPENCLAW_SERVER_NAME='__OPENCLAW_SERVER_NAME__'
+          # Create secrets env file (unquoted heredoc so bash substitutes variables)
+          cat > /tmp/env_vars.sh << SECRETEOF
+          export DEPLOY_PATH='${DEPLOY_PATH}'
+          export GHP_TOKEN='${GHP_TOKEN}'
+          export OPENCLAW_SERVER_NAME='${OPENCLAW_SERVER_NAME}'
           SECRETEOF
-          sed -i "s|__DEPLOY_PATH__|$DEPLOY_PATH|g" /tmp/env_vars.sh
-          sed -i "s|__GHP_TOKEN__|$GHP_TOKEN|g" /tmp/env_vars.sh
-          sed -i "s|__OPENCLAW_SERVER_NAME__|$OPENCLAW_SERVER_NAME|g" /tmp/env_vars.sh
 
           cat > /tmp/deploy_openclaw.sh << 'DEPLOYEOF'
           #!/bin/bash
