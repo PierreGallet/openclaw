@@ -23,3 +23,6 @@ ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
 ENV HOMEBREW_CELLAR="${HOMEBREW_PREFIX}/Cellar"
 ENV HOMEBREW_REPOSITORY="${HOMEBREW_PREFIX}/Homebrew"
 ENV PATH="${HOMEBREW_PREFIX}/bin:${HOMEBREW_PREFIX}/sbin:${PATH}"
+
+# Pre-install tools so they persist across deploys
+RUN brew install gh && npm install -g @anthropic-ai/claude-code
