@@ -40,47 +40,42 @@ jobs:
           PORT=$(echo "$SSH_HOST" | grep -o ':[0-9]*' | cut -d':' -f2 || echo "22")
           ssh-keyscan -H -p $PORT $HOST >> ~/.ssh/known_hosts
 
-      - name: Deploy to server
+      - name: Create deploy script
         env:
-          SSH_USER: ${{ secrets.SSH_USER }}
-          SSH_HOST: ${{ secrets.SSH_HOST }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           GHP_TOKEN: ${{ secrets.GHP_TOKEN }}
           OPENCLAW_SERVER_NAME: ${{ secrets.OPENCLAW_SERVER_NAME }}
         run: |
-          # Create secrets env file (unquoted heredoc so bash substitutes variables)
-          cat > /tmp/env_vars.sh << SECRETEOF
+          cat > /tmp/env_vars.sh <<ENVEOF
           export DEPLOY_PATH='${DEPLOY_PATH}'
           export GHP_TOKEN='${GHP_TOKEN}'
           export OPENCLAW_SERVER_NAME='${OPENCLAW_SERVER_NAME}'
-          SECRETEOF
+          ENVEOF
+          sed -i 's/^[[:space:]]*//' /tmp/env_vars.sh
 
-          cat > /tmp/deploy_openclaw.sh << 'DEPLOYEOF'
+          cat > /tmp/deploy_openclaw.sh <<'DEPLOYEOF'
           #!/bin/bash
           set -e
 
           echo "Starting OpenClaw deployment..."
 
-          cd "$DEPLOY_PATH" || {
-            echo "Creating deployment directory..."
-            mkdir -p "$DEPLOY_PATH"
-            cd "$DEPLOY_PATH"
-          }
+          cd "$DEPLOY_PATH"
 
-          # Clone or update repository
+          # Update repository from fork
           if [ -d ".git" ]; then
             echo "Updating existing repository..."
-            git remote set-url origin https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git
+            git remote set-url origin "https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git"
             git fetch origin
             git reset --hard origin/main
           else
             echo "Cloning repository..."
-            git clone https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git .
+            mkdir -p "$DEPLOY_PATH"
+            git clone "https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git" .
           fi
 
           # Ensure OPENCLAW_SERVER_NAME is in .env
           if grep -q '^OPENCLAW_SERVER_NAME=' .env 2>/dev/null; then
-            sed -i "s|^OPENCLAW_SERVER_NAME=.*|OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}|" .env
+            sed -i "s/^OPENCLAW_SERVER_NAME=.*/OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}/" .env
           else
             echo "OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}" >> .env
           fi
@@ -89,32 +84,34 @@ jobs:
           echo "Building Docker image..."
           docker build -t openclaw:local .
 
-          # Restart only openclaw services (preserve ollama volume)
+          # Restart services
           echo "Restarting services..."
-          docker compose -f docker-compose.yml -f docker-compose.override.yml down --remove-orphans \
-            --timeout 30 2>/dev/null || true
+          docker compose -f docker-compose.yml -f docker-compose.override.yml down --remove-orphans --timeout 30 2>/dev/null || true
           docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
 
-          # Wait for services
+          # Wait and verify
           echo "Waiting for services to start..."
           sleep 10
 
-          # Verify
-          if docker compose ps | grep -q "Up"; then
+          if docker compose -f docker-compose.yml -f docker-compose.override.yml ps | grep -q "Up"; then
             echo "Deployment successful!"
             docker compose -f docker-compose.yml -f docker-compose.override.yml ps
           else
-            echo "Deployment failed! Services are not running."
+            echo "Deployment failed!"
             docker compose -f docker-compose.yml -f docker-compose.override.yml logs --tail 50
             exit 1
           fi
 
-          # Cleanup old images
           docker image prune -f
-
           echo "Deployment completed!"
           DEPLOYEOF
+          sed -i 's/^[[:space:]]*//' /tmp/deploy_openclaw.sh
 
+      - name: Deploy to server
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
           HOST=$(echo $SSH_HOST | cut -d':' -f1)
           PORT=$(echo $SSH_HOST | grep -o ':[0-9]*' | cut -d':' -f2 || echo "22")
 
