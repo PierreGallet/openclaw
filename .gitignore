@@ -121,3 +121,10 @@ dist/protocol.schema.json
 
 # Synthing
 **/.stfolder/
+
+# Nginx (credentials + generated conf, never commit)
+nginx/.htpasswd
+nginx/nginx.conf
+
+# Personal notes
+NOTES.md

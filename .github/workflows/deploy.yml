@@ -1,0 +1,151 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-openclaw
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github-action
+
+      - name: Set up SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          HOST=$(echo "$SSH_HOST" | cut -d':' -f1)
+          PORT=$(echo "$SSH_HOST" | grep -o ':[0-9]*' | cut -d':' -f2 || echo "22")
+          ssh-keyscan -H -p $PORT $HOST >> ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHP_TOKEN: ${{ secrets.GHP_TOKEN }}
+          OPENCLAW_SERVER_NAME: ${{ secrets.OPENCLAW_SERVER_NAME }}
+        run: |
+          # Create secrets env file
+          cat > /tmp/env_vars.sh << SECRETEOF
+          export DEPLOY_PATH='$DEPLOY_PATH'
+          export GHP_TOKEN='$GHP_TOKEN'
+          export OPENCLAW_SERVER_NAME='$OPENCLAW_SERVER_NAME'
+          SECRETEOF
+
+          cat > deploy.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          echo "Starting OpenClaw deployment..."
+
+          cd "$DEPLOY_PATH" || {
+            echo "Creating deployment directory..."
+            mkdir -p "$DEPLOY_PATH"
+            cd "$DEPLOY_PATH"
+          }
+
+          # Clone or update repository
+          if [ -d ".git" ]; then
+            echo "Updating existing repository..."
+            git remote set-url origin https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git
+            git fetch origin
+            git reset --hard origin/main
+          else
+            echo "Cloning repository..."
+            git clone https://${GHP_TOKEN}@github.com/PierreGallet/openclaw.git .
+          fi
+
+          # Ensure OPENCLAW_SERVER_NAME is in .env
+          if grep -q '^OPENCLAW_SERVER_NAME=' .env 2>/dev/null; then
+            sed -i "s|^OPENCLAW_SERVER_NAME=.*|OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}|" .env
+          else
+            echo "OPENCLAW_SERVER_NAME=${OPENCLAW_SERVER_NAME}" >> .env
+          fi
+
+          # Rebuild Docker image
+          echo "Building Docker image..."
+          docker build -t openclaw:local .
+
+          # Restart only openclaw services (preserve ollama volume)
+          echo "Restarting services..."
+          docker compose -f docker-compose.yml -f docker-compose.override.yml down --remove-orphans \
+            --timeout 30 2>/dev/null || true
+          docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+
+          # Wait for services
+          echo "Waiting for services to start..."
+          sleep 10
+
+          # Verify
+          if docker compose ps | grep -q "Up"; then
+            echo "Deployment successful!"
+            docker compose -f docker-compose.yml -f docker-compose.override.yml ps
+          else
+            echo "Deployment failed! Services are not running."
+            docker compose -f docker-compose.yml -f docker-compose.override.yml logs --tail 50
+            exit 1
+          fi
+
+          # Cleanup old images
+          docker image prune -f
+
+          echo "Deployment completed!"
+          EOF
+
+          HOST=$(echo $SSH_HOST | cut -d':' -f1)
+          PORT=$(echo $SSH_HOST | grep -o ':[0-9]*' | cut -d':' -f2 || echo "22")
+
+          scp -P $PORT /tmp/env_vars.sh $SSH_USER@$HOST:/tmp/env_vars.sh
+          scp -P $PORT deploy.sh $SSH_USER@$HOST:/tmp/deploy_openclaw.sh
+          ssh -p $PORT $SSH_USER@$HOST "chmod 600 /tmp/env_vars.sh && source /tmp/env_vars.sh && bash /tmp/deploy_openclaw.sh; EXIT_CODE=\$?; rm -f /tmp/deploy_openclaw.sh /tmp/env_vars.sh; exit \$EXIT_CODE"
+
+          rm -f deploy.sh /tmp/env_vars.sh
+
+      - name: Health check
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+        run: |
+          HOST=$(echo $SSH_HOST | cut -d':' -f1)
+          PORT=$(echo $SSH_HOST | grep -o ':[0-9]*' | cut -d':' -f2 || echo "22")
+
+          echo "Running health check..."
+          sleep 5
+          if ssh -p $PORT $SSH_USER@$HOST "curl -f -s -o /dev/null http://localhost:18780/"; then
+            echo "Health check passed!"
+          else
+            echo "Health check failed (may need auth), checking containers..."
+            ssh -p $PORT $SSH_USER@$HOST "docker ps --filter name=openclaw"
+          fi
+
+      - name: Notify deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "Deployment completed successfully!"
+          else
+            echo "Deployment failed! Check the logs for more information."
+          fi

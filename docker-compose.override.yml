@@ -1,0 +1,24 @@
+services:
+  openclaw_nginx:
+    image: nginx:alpine
+    container_name: openclaw_nginx
+    restart: unless-stopped
+    ports:
+      - "18780:80"
+    environment:
+      OPENCLAW_SERVER_NAME: ${OPENCLAW_SERVER_NAME:-localhost}
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on:
+      - openclaw-gateway
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+
+volumes:
+  ollama:
