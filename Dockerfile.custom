@@ -1,0 +1,21 @@
+# Extends the base openclaw image with Homebrew for skill-based tool installation
+ARG BASE_IMAGE=openclaw:local
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Install Homebrew dependencies
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      build-essential procps curl file git && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+# Install Homebrew as node user
+USER node
+ENV HOMEBREW_PREFIX="/home/node/.linuxbrew"
+ENV HOMEBREW_CELLAR="${HOMEBREW_PREFIX}/Cellar"
+ENV HOMEBREW_REPOSITORY="${HOMEBREW_PREFIX}/Homebrew"
+ENV PATH="${HOMEBREW_PREFIX}/bin:${HOMEBREW_PREFIX}/sbin:${PATH}"
+
+RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"

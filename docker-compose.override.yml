@@ -1,4 +1,10 @@
 services:
+  openclaw-gateway:
+    image: openclaw:custom
+
+  openclaw-cli:
+    image: openclaw:custom
+
   openclaw_nginx:
     image: nginx:alpine
     container_name: openclaw_nginx
