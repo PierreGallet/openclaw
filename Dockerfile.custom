@@ -25,4 +25,7 @@ ENV HOMEBREW_REPOSITORY="${HOMEBREW_PREFIX}/Homebrew"
 ENV PATH="${HOMEBREW_PREFIX}/bin:${HOMEBREW_PREFIX}/sbin:${PATH}"
 
 # Pre-install tools so they persist across deploys
-RUN brew install gh && npm install -g @anthropic-ai/claude-code
+RUN brew install gh
+USER root
+RUN npm install -g @anthropic-ai/claude-code
+USER node
