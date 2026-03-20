@@ -1,34 +1,20 @@
 services:
   openclaw-gateway:
+    container_name: openclaw_gateway
     image: openclaw:custom
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
 
   openclaw-cli:
+    container_name: openclaw_cli
     image: openclaw:custom
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
 
-  openclaw_nginx:
-    image: nginx:alpine
-    container_name: openclaw_nginx
-    restart: unless-stopped
-    ports:
-      - "18780:80"
-    environment:
-      OPENCLAW_SERVER_NAME: ${OPENCLAW_SERVER_NAME:-localhost}
-    volumes:
-      - ./nginx/nginx.conf.template:/etc/nginx/templates/default.conf.template:ro
-      - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro
-    depends_on:
-      - openclaw-gateway
+  # Nginx is managed by the genius (infra) repo
+  # Ollama is managed by the genius (infra) repo
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    volumes:
-      - ollama:/root/.ollama
-
-volumes:
-  ollama:
+networks:
+  default:
+    name: shared_infra
+    external: true
