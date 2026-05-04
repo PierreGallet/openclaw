@@ -16,6 +16,60 @@ function evaluate(config: OpenClawConfig, env: NodeJS.ProcessEnv = EMPTY_ENV) {
 }
 
 describe("evaluateGatewayAuthSurfaceStates", () => {
+  it("marks gateway.auth.token active when token mode is explicit", () => {
+    const states = evaluate({
+      gateway: {
+        auth: {
+          mode: "token",
+          token: envRef("GW_AUTH_TOKEN"),
+        },
+      },
+    } as OpenClawConfig);
+
+    expect(states["gateway.auth.token"]).toMatchObject({
+      hasSecretRef: true,
+      active: true,
+      reason: 'gateway.auth.mode is "token".',
+    });
+  });
+
+  it("marks gateway.auth.token inactive when env token is configured", () => {
+    const states = evaluate(
+      {
+        gateway: {
+          auth: {
+            mode: "token",
+            token: envRef("GW_AUTH_TOKEN"),
+          },
+        },
+      } as OpenClawConfig,
+      { OPENCLAW_GATEWAY_TOKEN: "env-token" } as NodeJS.ProcessEnv,
+    );
+
+    expect(states["gateway.auth.token"]).toMatchObject({
+      hasSecretRef: true,
+      active: false,
+      reason: "gateway token env var is configured.",
+    });
+  });
+
+  it("marks gateway.auth.token inactive when password mode is explicit", () => {
+    const states = evaluate({
+      gateway: {
+        auth: {
+          mode: "password",
+          token: envRef("GW_AUTH_TOKEN"),
+        },
+      },
+    } as OpenClawConfig);
+
+    expect(states["gateway.auth.token"]).toMatchObject({
+      hasSecretRef: true,
+      active: false,
+      reason: 'gateway.auth.mode is "password".',
+    });
+  });
+
   it("marks gateway.auth.password active when password mode is explicit", () => {
     const states = evaluate({
       gateway: {
@@ -30,6 +84,23 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       hasSecretRef: true,
       active: true,
       reason: 'gateway.auth.mode is "password".',
+    });
+  });
+
+  it("marks gateway.auth.password active when trusted-proxy mode is explicit", () => {
+    const states = evaluate({
+      gateway: {
+        auth: {
+          mode: "trusted-proxy",
+          password: envRef("GW_AUTH_PASSWORD"),
+        },
+      },
+    } as OpenClawConfig);
+
+    expect(states["gateway.auth.password"]).toMatchObject({
+      hasSecretRef: true,
+      active: true,
+      reason: "no token source can win, so password auth can win.",
     });
   });
 
@@ -57,7 +128,6 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       gateway: {
         mode: "local",
         remote: {
-          enabled: true,
           token: envRef("GW_REMOTE_TOKEN"),
         },
       },
@@ -77,7 +147,6 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
           mode: "password",
         },
         remote: {
-          enabled: true,
           token: envRef("GW_REMOTE_TOKEN"),
         },
       },
@@ -90,11 +159,31 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
     });
   });
 
+  it("marks gateway.remote.token inactive when local token SecretRef is configured", () => {
+    const states = evaluate({
+      gateway: {
+        mode: "local",
+        auth: {
+          mode: "token",
+          token: envRef("GW_AUTH_TOKEN"),
+        },
+        remote: {
+          token: envRef("GW_REMOTE_TOKEN"),
+        },
+      },
+    } as OpenClawConfig);
+
+    expect(states["gateway.remote.token"]).toMatchObject({
+      hasSecretRef: true,
+      active: false,
+      reason: "gateway.auth.token is configured.",
+    });
+  });
+
   it("marks gateway.remote.password active when remote url is configured", () => {
     const states = evaluate({
       gateway: {
         remote: {
-          enabled: true,
           url: "wss://gateway.example.com",
           password: envRef("GW_REMOTE_PASSWORD"),
         },
@@ -114,7 +203,6 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
           mode: "token",
         },
         remote: {
-          enabled: true,
           password: envRef("GW_REMOTE_PASSWORD"),
         },
       },
@@ -124,6 +212,26 @@ describe("evaluateGatewayAuthSurfaceStates", () => {
       hasSecretRef: true,
       active: false,
       reason: 'password auth cannot win with gateway.auth.mode="token".',
+    });
+  });
+
+  it("marks gateway.remote.password inactive as a trusted-proxy local fallback", () => {
+    const states = evaluate({
+      gateway: {
+        mode: "local",
+        auth: {
+          mode: "trusted-proxy",
+        },
+        remote: {
+          password: envRef("GW_REMOTE_PASSWORD"),
+        },
+      },
+    } as OpenClawConfig);
+
+    expect(states["gateway.remote.password"]).toMatchObject({
+      hasSecretRef: true,
+      active: false,
+      reason: "remote password fallback is not active.",
     });
   });
 });
