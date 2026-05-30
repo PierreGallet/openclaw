@@ -2,6 +2,12 @@ services:
   openclaw-gateway:
     container_name: openclaw_gateway
     image: openclaw:custom
+    # Deployment-specific cap (genius host = 15.5 GB shared). Bounds a
+    # leak/runaway to this container instead of letting it contend for
+    # the whole host's RAM (an unbounded OOM has taken the server down).
+    # memswap_limit > mem_limit allows a brief spill to swap before kill.
+    mem_limit: 2g
+    memswap_limit: 4g
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
 
