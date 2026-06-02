@@ -74,6 +74,13 @@ services:
   openclaw-cli:
     image: ${OPENCLAW_IMAGE:-openclaw:local}
     network_mode: "service:openclaw-gateway"
+    # The image bakes a /healthz HEALTHCHECK intended for the GATEWAY. The
+    # CLI is an interactive TUI with no HTTP server, so that probe always
+    # fails and the container sits permanently "unhealthy" (noise in audits
+    # / dashboards). Disable it here — the gateway owns the real health
+    # check, and the CLI shares its network namespace anyway.
+    healthcheck:
+      disable: true
     env_file:
       - path: .env
         required: false
