@@ -8,6 +8,8 @@ services:
     # memswap_limit > mem_limit allows a brief spill to swap before kill.
     mem_limit: 2g
     memswap_limit: 4g
+    # CPU cap: peak ~0.6 core; 2.0 is ample headroom and bounds a runaway.
+    cpus: 2.0
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
 
