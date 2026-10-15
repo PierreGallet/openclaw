@@ -1,18 +1,26 @@
+/**
+ * Async stream iterator wrapper.
+ *
+ * Lets stream decorators override next/return/throw while preserving the underlying iterator contract.
+ */
 type StreamIterator<T> = AsyncIterator<T, unknown, unknown>;
 
+// Optional return/throw handlers let stream wrappers observe cleanup and errors
+// while preserving the underlying iterator contract when they do not intercept.
 type IteratorHandler<T> = (
   iterator: StreamIterator<T>,
   value?: unknown,
 ) => IteratorResult<T, unknown> | Promise<IteratorResult<T, unknown>>;
 
+/** Wraps an async iterator with custom next/return/throw behavior. */
 export function createStreamIteratorWrapper<T>(params: {
   iterator: StreamIterator<T>;
   next: (iterator: StreamIterator<T>) => Promise<IteratorResult<T, unknown>>;
   onReturn?: IteratorHandler<T>;
   onThrow?: IteratorHandler<T>;
 }): AsyncIterableIterator<T> {
-  const wrapper: AsyncIterableIterator<T> = {
-    async next() {
+  return {
+    next() {
       return params.next(params.iterator);
     },
     async return(value?: unknown) {
@@ -31,5 +39,4 @@ export function createStreamIteratorWrapper<T>(params: {
       return this;
     },
   };
-  return wrapper;
 }

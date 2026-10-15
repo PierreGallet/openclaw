@@ -1,3 +1,6 @@
+/**
+ * Tests channel send result normalization and adapter wrapping helpers.
+ */
 import { describe, expect, it } from "vitest";
 import {
   attachChannelToResult,
@@ -36,7 +39,7 @@ describe("attachChannelToResult(s)", () => {
 });
 
 describe("buildChannelSendResult", () => {
-  it("normalizes raw send results", () => {
+  it("normalizes raw send results directly", () => {
     const result = buildChannelSendResult("zalo", {
       ok: false,
       messageId: null,
@@ -52,10 +55,10 @@ describe("buildChannelSendResult", () => {
 
 describe("createEmptyChannelResult", () => {
   it("builds an empty outbound result with channel metadata", () => {
-    expect(createEmptyChannelResult("line", { chatId: "u1" })).toEqual({
+    expect(createEmptyChannelResult("line", { target: { kind: "chat", id: "u1" } })).toEqual({
       channel: "line",
       messageId: "",
-      chatId: "u1",
+      target: { kind: "chat", id: "u1" },
     });
   });
 });
@@ -64,7 +67,10 @@ describe("createAttachedChannelResultAdapter", () => {
   it("wraps outbound delivery and poll results", async () => {
     const adapter = createAttachedChannelResultAdapter({
       channel: "discord",
-      sendText: async () => ({ messageId: "m1", channelId: "c1" }),
+      sendText: async () => ({
+        messageId: "m1",
+        target: { kind: "channel", id: "c1" },
+      }),
       sendMedia: async () => ({ messageId: "m2" }),
       sendPoll: async () => ({ messageId: "m3", pollId: "p1" }),
     });
@@ -76,7 +82,7 @@ describe("createAttachedChannelResultAdapter", () => {
         expected: {
           channel: "discord",
           messageId: "m1",
-          channelId: "c1",
+          target: { kind: "channel", id: "c1" },
         },
       },
       {
@@ -110,38 +116,32 @@ describe("createAttachedChannelResultAdapter", () => {
 });
 
 describe("createRawChannelSendResultAdapter", () => {
-  it("normalizes raw send results", async () => {
+  it("normalizes successes and rejects provider failures", async () => {
     const adapter = createRawChannelSendResultAdapter({
       channel: "zalo",
       sendText: async () => ({ ok: true, messageId: "m1" }),
       sendMedia: async () => ({ ok: false, error: "boom" }),
     });
 
-    const sendCases = [
-      {
-        name: "sendText",
-        run: () => adapter.sendText!({ cfg: {} as never, to: "x", text: "hi" }),
-        expected: {
-          channel: "zalo",
-          ok: true,
-          messageId: "m1",
-          error: undefined,
-        },
-      },
-      {
-        name: "sendMedia",
-        run: () => adapter.sendMedia!({ cfg: {} as never, to: "x", text: "hi" }),
-        expected: {
-          channel: "zalo",
-          ok: false,
-          messageId: "",
-          error: new Error("boom"),
-        },
-      },
-    ];
+    await expect(adapter.sendText!({ cfg: {} as never, to: "x", text: "hi" })).resolves.toEqual({
+      channel: "zalo",
+      ok: true,
+      messageId: "m1",
+      error: undefined,
+    });
+    await expect(adapter.sendMedia!({ cfg: {} as never, to: "x", text: "hi" })).rejects.toThrow(
+      "boom",
+    );
+  });
 
-    for (const testCase of sendCases) {
-      await expect(testCase.run()).resolves.toEqual(testCase.expected);
-    }
+  it("uses a channel-specific error when a failed result has no message", async () => {
+    const adapter = createRawChannelSendResultAdapter({
+      channel: "legacy-test",
+      sendText: async () => ({ ok: false }),
+    });
+
+    await expect(adapter.sendText!({ cfg: {} as never, to: "x", text: "hi" })).rejects.toThrow(
+      "Channel send failed for legacy-test",
+    );
   });
 });

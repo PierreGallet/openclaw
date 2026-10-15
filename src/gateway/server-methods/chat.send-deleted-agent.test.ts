@@ -1,6 +1,11 @@
+/**
+ * Tests that chat send rejects deleted-agent sessions before dispatch.
+ */
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ErrorCodes } from "../protocol/index.js";
-import { chatHandlers } from "./chat.js";
+import { ErrorCodes } from "../../../packages/gateway-protocol/src/index.js";
+import { loadOrCreateProcessDeviceIdentityAsync } from "../../infra/device-identity-async.js";
+import { handleDirectExternalChatSend } from "./chat-send-external-entry.js";
 import {
   mockDeletedAgentSession,
   resetDeletedAgentSessionMocks,
@@ -8,8 +13,9 @@ import {
 import type { RespondFn } from "./types.js";
 
 describe("chat.send deleted-agent guard", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     resetDeletedAgentSessionMocks();
+    await loadOrCreateProcessDeviceIdentityAsync();
   });
 
   it("rejects keys belonging to a deleted agent", async () => {
@@ -17,11 +23,11 @@ describe("chat.send deleted-agent guard", () => {
 
     const respond = vi.fn() as unknown as RespondFn;
 
-    await chatHandlers["chat.send"]({
+    await handleDirectExternalChatSend({
       req: { id: "req-1" } as never,
       params: { sessionKey: orphanKey, message: "hi", idempotencyKey: "run-1" },
       respond,
-      context: {} as never,
+      context: { getRuntimeConfig: () => ({}) } as never,
       client: null,
       isWebchatConnect: () => false,
     });

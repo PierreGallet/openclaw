@@ -1,26 +1,31 @@
+// Xai tests cover image generation provider plugin behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { buildXaiImageGenerationProvider } from "./image-generation-provider.js";
+
+type GenerateImageParams = Parameters<
+  ReturnType<typeof buildXaiImageGenerationProvider>["generateImage"]
+>[0];
 
 const {
   resolveApiKeyForProviderMock,
   postJsonRequestMock,
-  postMultipartRequestMock,
   assertOkOrThrowHttpErrorMock,
   resolveProviderHttpRequestConfigMock,
   createProviderOperationDeadlineMock,
   resolveProviderOperationTimeoutMsMock,
-  sanitizeConfiguredModelProviderRequestMock,
 } = vi.hoisted(() => ({
   resolveApiKeyForProviderMock: vi.fn(async () => ({ apiKey: "xai-key" })),
   postJsonRequestMock: vi.fn(),
-  postMultipartRequestMock: vi.fn(),
   assertOkOrThrowHttpErrorMock: vi.fn(async () => {}),
-  resolveProviderHttpRequestConfigMock: vi.fn((params: Record<string, unknown>) => ({
-    baseUrl: params.baseUrl ?? params.defaultBaseUrl ?? "https://api.x.ai/v1",
-    allowPrivateNetwork: false,
-    headers: new Headers(params.defaultHeaders as HeadersInit | undefined),
-    dispatcherPolicy: undefined,
-  })),
+  resolveProviderHttpRequestConfigMock: vi.fn((params: Record<string, unknown>) => {
+    const headers = new Headers(params.defaultHeaders as HeadersInit | undefined);
+    return {
+      baseUrl: params.baseUrl ?? params.defaultBaseUrl ?? "https://api.x.ai/v1",
+      allowPrivateNetwork: false,
+      headers,
+      dispatcherPolicy: undefined,
+    };
+  }),
   createProviderOperationDeadlineMock: vi.fn((params: Record<string, unknown>) => ({
     timeoutMs: params.timeoutMs,
     label: params.label,
@@ -28,47 +33,88 @@ const {
   resolveProviderOperationTimeoutMsMock: vi.fn(
     (params: Record<string, unknown>) => params.defaultTimeoutMs ?? 60000,
   ),
-  sanitizeConfiguredModelProviderRequestMock: vi.fn((request) => request),
 }));
 
 vi.mock("openclaw/plugin-sdk/provider-auth-runtime", () => ({
   resolveApiKeyForProvider: resolveApiKeyForProviderMock,
 }));
 
-vi.mock("openclaw/plugin-sdk/provider-http", () => ({
-  assertOkOrThrowHttpError: assertOkOrThrowHttpErrorMock,
-  createProviderOperationDeadline: createProviderOperationDeadlineMock,
-  postJsonRequest: postJsonRequestMock,
-  postMultipartRequest: postMultipartRequestMock,
-  resolveProviderHttpRequestConfig: resolveProviderHttpRequestConfigMock,
-  resolveProviderOperationTimeoutMs: resolveProviderOperationTimeoutMsMock,
-  sanitizeConfiguredModelProviderRequest: sanitizeConfiguredModelProviderRequestMock,
-}));
+vi.mock("openclaw/plugin-sdk/provider-http", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/provider-http")>(
+    "openclaw/plugin-sdk/provider-http",
+  );
+  return {
+    assertOkOrThrowHttpError: assertOkOrThrowHttpErrorMock,
+    createProviderOperationDeadline: createProviderOperationDeadlineMock,
+    postJsonRequest: postJsonRequestMock,
+    readProviderJsonResponse: actual.readProviderJsonResponse,
+    resolveProviderHttpRequestConfig: resolveProviderHttpRequestConfigMock,
+    resolveProviderOperationTimeoutMs: resolveProviderOperationTimeoutMsMock,
+  };
+});
 
-vi.mock("openclaw/plugin-sdk/text-runtime", () => ({
-  normalizeOptionalString: (v: unknown) => (typeof v === "string" ? v.trim() : undefined),
-  normalizeOptionalLowercaseString: (v: unknown) =>
-    typeof v === "string" ? v.trim().toLowerCase() : undefined,
-  readStringValue: (v: unknown) => (typeof v === "string" ? v.trim() : undefined),
-}));
+vi.mock("openclaw/plugin-sdk/string-coerce-runtime", () => {
+  const normalizeMockOptionalString = (value: unknown) =>
+    typeof value === "string" ? value.trim() : undefined;
+  const normalizeMockOptionalLowercaseString = (value: unknown) =>
+    typeof value === "string" ? value.trim().toLowerCase() : undefined;
+  const readMockStringValue = (value: unknown) =>
+    typeof value === "string" ? value.trim() : undefined;
+  return {
+    normalizeOptionalString: normalizeMockOptionalString,
+    normalizeOptionalLowercaseString: normalizeMockOptionalLowercaseString,
+    readStringValue: readMockStringValue,
+  };
+});
+
+function jsonResponse(payload: unknown): Response {
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function requirePostJsonCall(index = 0): {
+  url?: string;
+  timeoutMs?: number;
+  body?: Record<string, unknown>;
+  headers?: Headers;
+} {
+  const params = (postJsonRequestMock.mock.calls as unknown as Array<[unknown]>)[index]?.[0] as
+    | {
+        url?: string;
+        timeoutMs?: number;
+        body?: Record<string, unknown>;
+        headers?: Headers;
+      }
+    | undefined;
+  if (!params) {
+    throw new Error(`Expected postJsonRequest call ${index}`);
+  }
+  return params;
+}
 
 describe("xai image generation provider", () => {
   afterEach(() => {
     resolveApiKeyForProviderMock.mockClear();
+    vi.unstubAllEnvs();
     postJsonRequestMock.mockReset();
     assertOkOrThrowHttpErrorMock.mockClear();
     resolveProviderHttpRequestConfigMock.mockClear();
     createProviderOperationDeadlineMock.mockClear();
     resolveProviderOperationTimeoutMsMock.mockClear();
-    sanitizeConfiguredModelProviderRequestMock.mockClear();
   });
 
-  it("builds provider with correct models, default, and capabilities", () => {
+  it("builds provider with correct models, default, and capabilities", async () => {
     const provider = buildXaiImageGenerationProvider();
     expect(provider.id).toBe("xai");
     expect(provider.label).toBe("xAI");
     expect(provider.defaultModel).toBe("grok-imagine-image");
-    expect(provider.models).toEqual(["grok-imagine-image", "grok-imagine-image-pro"]);
+    expect(provider.models).toEqual([
+      "grok-imagine-image",
+      "grok-imagine-image-2.0",
+      "grok-imagine-image-quality",
+    ]);
     expect(provider.capabilities.generate.maxCount).toBe(4);
     expect(provider.capabilities.generate.supportsAspectRatio).toBe(true);
     expect(provider.capabilities.geometry?.aspectRatios).toEqual([
@@ -77,69 +123,108 @@ describe("xai image generation provider", () => {
       "9:16",
       "4:3",
       "3:4",
-      "2:3",
       "3:2",
+      "2:3",
+      "2:1",
+      "1:2",
+      "19.5:9",
+      "9:19.5",
+      "20:9",
+      "9:20",
     ]);
     expect(provider.capabilities.edit.enabled).toBe(true);
-    expect(provider.capabilities.edit.maxInputImages).toBe(5);
-    expect(provider.isConfigured).toBeDefined();
-    expect(provider.generateImage).toBeDefined();
+    expect(provider.capabilities.edit.maxInputImages).toBe(3);
+    const isConfigured = provider.isConfiguredAsync;
+    if (!isConfigured) {
+      throw new Error("expected XAI image provider config predicate");
+    }
+    vi.stubEnv("XAI_API_KEY", undefined);
+    expect(await isConfigured({})).toBe(false);
+    expect(
+      await isConfigured({
+        cfg: {
+          models: {
+            providers: {
+              xai: {
+                apiKey: "xai-image-test-key",
+                baseUrl: "https://api.x.ai/v1",
+                models: [],
+              },
+            },
+          },
+        },
+      }),
+    ).toBe(true);
   });
 
-  it("uses main provider URL and resolves auth for generation", async () => {
+  it.each([
+    "grok-imagine-image",
+    "grok-imagine-image-2.0",
+    "grok-imagine-image-quality",
+    "grok-imagine-image-future",
+  ])("preserves explicit model %s in the generation request and result", async (model) => {
     postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
-          data: [{ b64_json: Buffer.from("testpng").toString("base64") }],
-        }),
-      },
+      response: jsonResponse({
+        data: [{ b64_json: Buffer.from("testpng").toString("base64") }],
+      }),
       release: vi.fn(async () => {}),
     });
 
     const provider = buildXaiImageGenerationProvider();
-    await provider.generateImage({
+    const result = await provider.generateImage({
       provider: "xai",
-      model: "grok-imagine-image",
+      model,
       prompt: "test prompt",
-      aspectRatio: "2:3",
+      aspectRatio: "20:9",
       resolution: "2K",
       cfg: {
         models: {
           providers: {
             xai: {
               baseUrl: "https://custom.x.ai/v1",
+              models: [],
             },
           },
         },
       },
-    } as any);
+    } as GenerateImageParams);
 
-    expect(resolveApiKeyForProviderMock).toHaveBeenCalledWith(
-      expect.objectContaining({ provider: "xai" }),
-    );
-    expect(resolveProviderHttpRequestConfigMock).toHaveBeenCalledWith(
+    const authParams = (
+      resolveApiKeyForProviderMock.mock.calls as unknown as Array<[unknown]>
+    )[0]?.[0] as { provider?: string } | undefined;
+    expect(authParams?.provider).toBe("xai");
+    const httpParams = (
+      resolveProviderHttpRequestConfigMock.mock.calls as unknown as Array<[unknown]>
+    )[0]?.[0] as
+      | {
+          provider?: string;
+          capability?: string;
+          baseUrl?: string;
+        }
+      | undefined;
+    expect(httpParams?.provider).toBe("xai");
+    expect(httpParams?.capability).toBe("image");
+    expect(httpParams?.baseUrl).toBe("https://custom.x.ai/v1");
+    const request = requirePostJsonCall();
+    expect(request.url).toContain("/images/generations");
+    expect(request.body?.model).toBe(model);
+    expect(result.model).toBe(model);
+    expect(provider.defaultTimeoutMs).toBe(600_000);
+    expect(request.timeoutMs).toBe(600_000);
+    expect(request.body?.aspect_ratio).toBe("20:9");
+    expect(request.body?.resolution).toBe("2k");
+    expect(resolveProviderOperationTimeoutMsMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        provider: "xai",
-        capability: "image",
-        baseUrl: "https://custom.x.ai/v1",
-      }),
-    );
-    expect(postJsonRequestMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: expect.stringContaining("/images/generations"),
-        timeoutMs: 180_000,
-        body: expect.objectContaining({
-          aspect_ratio: "2:3",
-          resolution: "2k",
-        }),
+        defaultTimeoutMs: 600_000,
       }),
     );
   });
 
-  it("supports edit with exact user-provided payload format including image object with type image_url", async () => {
-    postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
+  it.each(["grok-imagine-image-2.0", "grok-imagine-image-quality"])(
+    "sends %s edits as JSON with an image_url object",
+    async (model) => {
+      postJsonRequestMock.mockResolvedValue({
+        response: jsonResponse({
           data: [
             {
               b64_json:
@@ -148,53 +233,45 @@ describe("xai image generation provider", () => {
             },
           ],
         }),
-      },
-      release: vi.fn(async () => {}),
-    });
+        release: vi.fn(async () => {}),
+      });
 
-    const provider = buildXaiImageGenerationProvider();
-    const buffer = Buffer.from("fakeimage");
-    await provider.generateImage({
-      provider: "xai",
-      model: "grok-imagine-image-pro",
-      prompt: "Render this as a pencil sketch with detailed shading",
-      inputImages: [
-        {
-          buffer,
-          mimeType: "image/png",
-        },
-      ],
-      cfg: {},
-    } as any);
-
-    expect(postJsonRequestMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: expect.stringContaining("/images/edits"),
-        body: expect.objectContaining({
-          model: "grok-imagine-image-pro",
-          prompt: "Render this as a pencil sketch with detailed shading",
-          image: {
-            url: expect.stringContaining("data:image/png;base64,"),
-            type: "image_url",
+      const provider = buildXaiImageGenerationProvider();
+      const buffer = Buffer.from("fakeimage");
+      await provider.generateImage({
+        provider: "xai",
+        model,
+        prompt: "Render this as a pencil sketch with detailed shading",
+        inputImages: [
+          {
+            buffer,
+            mimeType: "image/png",
           },
-          response_format: "b64_json",
-        }),
-      }),
-    );
-  });
+        ],
+        cfg: {},
+      } as GenerateImageParams);
+
+      const request = requirePostJsonCall();
+      expect(request.url).toContain("/images/edits");
+      expect(request.body?.model).toBe(model);
+      expect(request.body?.prompt).toBe("Render this as a pencil sketch with detailed shading");
+      const image = request.body?.image as { url?: string; type?: string } | undefined;
+      expect(image?.url).toContain("data:image/png;base64,");
+      expect(image?.type).toBe("image_url");
+      expect(request.body?.response_format).toBe("b64_json");
+    },
+  );
 
   it("uses the plural xAI images payload for multiple edit inputs", async () => {
     postJsonRequestMock.mockResolvedValue({
-      response: {
-        json: async () => ({
-          data: [
-            {
-              b64_json: Buffer.from("edited").toString("base64"),
-              mime_type: "image/png",
-            },
-          ],
-        }),
-      },
+      response: jsonResponse({
+        data: [
+          {
+            b64_json: Buffer.from("edited").toString("base64"),
+            mime_type: "image/png",
+          },
+        ],
+      }),
       release: vi.fn(async () => {}),
     });
 
@@ -206,26 +283,38 @@ describe("xai image generation provider", () => {
       inputImages: [
         { buffer: Buffer.from("first"), mimeType: "image/png" },
         { buffer: Buffer.from("second"), mimeType: "image/jpeg" },
+        { buffer: Buffer.from("third"), mimeType: "image/webp" },
       ],
       cfg: {},
-    } as any);
+    } as GenerateImageParams);
 
-    expect(postJsonRequestMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        url: expect.stringContaining("/images/edits"),
-        body: expect.objectContaining({
-          images: [
-            {
-              url: expect.stringContaining("data:image/png;base64,"),
-              type: "image_url",
-            },
-            {
-              url: expect.stringContaining("data:image/jpeg;base64,"),
-              type: "image_url",
-            },
-          ],
-        }),
-      }),
-    );
+    const request = requirePostJsonCall();
+    expect(request.url).toContain("/images/edits");
+    const images = request.body?.images as Array<{ url?: string; type?: string }> | undefined;
+    expect(images).toHaveLength(3);
+    expect(images?.[0]?.url).toContain("data:image/png;base64,");
+    expect(images?.[0]?.type).toBe("image_url");
+    expect(images?.[1]?.url).toContain("data:image/jpeg;base64,");
+    expect(images?.[1]?.type).toBe("image_url");
+    expect(images?.[2]?.url).toContain("data:image/webp;base64,");
+    expect(images?.[2]?.type).toBe("image_url");
+  });
+
+  it("rejects more than three xAI edit references before HTTP", async () => {
+    const provider = buildXaiImageGenerationProvider();
+
+    await expect(
+      provider.generateImage({
+        provider: "xai",
+        model: "grok-imagine-image",
+        prompt: "Combine the references",
+        inputImages: Array.from({ length: 4 }, (_, index) => ({
+          buffer: Buffer.from(`reference-${index}`),
+          mimeType: "image/png",
+        })),
+        cfg: {},
+      } as GenerateImageParams),
+    ).rejects.toThrow("xAI image editing supports up to 3 reference images");
+    expect(postJsonRequestMock).not.toHaveBeenCalled();
   });
 });

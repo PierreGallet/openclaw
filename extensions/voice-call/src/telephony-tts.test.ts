@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+// Voice Call tests cover telephony tts plugin behavior.
+import { describe, expect, it, vi } from "vitest";
 import type { VoiceCallTtsConfig } from "./config.js";
-import type { CoreConfig } from "./core-bridge.js";
-import { createTelephonyTtsProvider } from "./telephony-tts.js";
+import { createTelephonyTtsProvider, type TelephonyTtsRuntime } from "./telephony-tts.js";
 
-function createCoreConfig(): CoreConfig {
+function createCoreConfig(): OpenClawConfig {
   const tts: VoiceCallTtsConfig = {
     provider: "openai",
     providers: {
@@ -13,101 +14,86 @@ function createCoreConfig(): CoreConfig {
       },
     },
   };
-  return { messages: { tts } };
+  return { tts };
 }
 
-function requireMergedTtsConfig(mergedConfig: CoreConfig | undefined) {
-  const tts = mergedConfig?.messages?.tts;
-  if (!tts) {
-    throw new Error("telephony TTS runtime did not receive merged TTS config");
-  }
-  return tts as Record<string, unknown>;
-}
-
-function requireOpenAIProviderConfig(tts: Record<string, unknown>): Record<string, unknown> {
-  const providers =
-    tts.providers && typeof tts.providers === "object"
-      ? (tts.providers as Record<string, unknown>)
-      : null;
-  const openai = providers?.openai;
-  if (!openai || typeof openai !== "object") {
-    throw new Error("merged TTS config did not preserve providers.openai");
-  }
-  return openai as Record<string, unknown>;
-}
-
-async function mergeOverride(override: unknown): Promise<Record<string, unknown>> {
-  let mergedConfig: CoreConfig | undefined;
-  const provider = createTelephonyTtsProvider({
-    coreConfig: createCoreConfig(),
-    ttsOverride: override as VoiceCallTtsConfig,
-    runtime: {
-      textToSpeechTelephony: async ({ cfg }) => {
-        mergedConfig = cfg;
-        return {
-          success: true,
-          audioBuffer: Buffer.alloc(2),
-          sampleRate: 8000,
-        };
-      },
-    },
-  });
-
-  await provider.synthesizeForTelephony("hello");
-  return requireMergedTtsConfig(mergedConfig);
-}
-
-afterEach(() => {
-  delete (Object.prototype as Record<string, unknown>).polluted;
+const passthroughPreparation: TelephonyTtsRuntime["prepareTtsRequest"] = async ({ cfg, text }) => ({
+  cfg,
+  directives: {
+    cleanedText: text,
+    hasDirective: false,
+    overrides: {},
+    warnings: [],
+  },
 });
 
-describe("createTelephonyTtsProvider deepMerge hardening", () => {
-  it("merges safe nested overrides", async () => {
-    const tts = await mergeOverride({
-      providers: { openai: { voice: "coral" } },
+function createRuntime(
+  textToSpeechTelephony: TelephonyTtsRuntime["textToSpeechTelephony"],
+  prepareTtsRequest: TelephonyTtsRuntime["prepareTtsRequest"] = passthroughPreparation,
+): TelephonyTtsRuntime {
+  return { prepareTtsRequest, textToSpeechTelephony };
+}
+
+const createSynthesis = () =>
+  vi.fn(async () => ({
+    success: true,
+    audioBuffer: Buffer.alloc(2),
+    sampleRate: 8000,
+  }));
+
+describe("createTelephonyTtsProvider", () => {
+  it.each([["Gradium", "ulaw_8000"]])(
+    "passes through %s 8 kHz mu-law output",
+    async (providerName, outputFormat) => {
+      const audioBuffer = Buffer.from([0x00, 0x7f, 0xff]);
+      const provider = await createTelephonyTtsProvider({
+        coreConfig: createCoreConfig(),
+        runtime: createRuntime(async () => ({
+          success: true,
+          audioBuffer,
+          outputFormat,
+          sampleRate: 8_000,
+          provider: providerName.toLowerCase(),
+        })),
+      });
+
+      await expect(provider.synthesizeForTelephony("hello")).resolves.toBe(audioBuffer);
+    },
+  );
+
+  it("rejects container output with provider context", async () => {
+    const outputFormat = "riff-8khz-8bit-mono-mulaw";
+    const sampleRate = 8_000;
+    const provider = await createTelephonyTtsProvider({
+      coreConfig: createCoreConfig(),
+      runtime: createRuntime(async () => ({
+        success: true,
+        audioBuffer: Buffer.from("container"),
+        outputFormat,
+        sampleRate,
+        provider: "example-provider",
+      })),
     });
-    const openai = requireOpenAIProviderConfig(tts);
 
-    expect(openai.voice).toBe("coral");
-    expect(openai.model).toBe("gpt-4o-mini-tts");
-  });
-
-  it("blocks top-level __proto__ keys", async () => {
-    const tts = await mergeOverride(
-      JSON.parse('{"__proto__":{"polluted":"top"},"providers":{"openai":{"voice":"coral"}}}'),
-    );
-    const openai = requireOpenAIProviderConfig(tts);
-
-    expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
-    expect(tts.polluted).toBeUndefined();
-    expect(openai.voice).toBe("coral");
-  });
-
-  it("blocks nested __proto__ keys", async () => {
-    const tts = await mergeOverride(
-      JSON.parse('{"providers":{"openai":{"model":"safe","__proto__":{"polluted":"nested"}}}}'),
-    );
-    const openai = requireOpenAIProviderConfig(tts);
-
-    expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
-    expect(openai.polluted).toBeUndefined();
-    expect(openai.model).toBe("safe");
+    const synthesis = provider.synthesizeForTelephony("hello");
+    await expect(synthesis).rejects.toMatchObject({
+      name: "UnsupportedTelephonyTtsOutputFormatError",
+      message: `Unsupported telephony TTS output format "${outputFormat}" from provider "example-provider"`,
+    });
   });
 
   it("logs fallback metadata when telephony TTS uses a fallback provider", async () => {
     const warn = vi.fn();
-    const provider = createTelephonyTtsProvider({
+    const provider = await createTelephonyTtsProvider({
       coreConfig: createCoreConfig(),
-      runtime: {
-        textToSpeechTelephony: async () => ({
-          success: true,
-          audioBuffer: Buffer.alloc(2),
-          sampleRate: 8000,
-          provider: "microsoft",
-          fallbackFrom: "elevenlabs",
-          attemptedProviders: ["elevenlabs", "microsoft"],
-        }),
-      },
+      runtime: createRuntime(async () => ({
+        success: true,
+        audioBuffer: Buffer.alloc(2),
+        sampleRate: 8000,
+        provider: "microsoft",
+        fallbackFrom: "elevenlabs",
+        attemptedProviders: ["elevenlabs", "microsoft"],
+      })),
       logger: { warn },
     });
 
@@ -117,80 +103,53 @@ describe("createTelephonyTtsProvider deepMerge hardening", () => {
     );
   });
 
-  it("strips telephony TTS directive tags before synthesis", async () => {
-    let requestText: string | undefined;
-    const provider = createTelephonyTtsProvider({
+  it("uses prepared directive-stripped text for synthesis", async () => {
+    const textToSpeechTelephony = createSynthesis();
+    const provider = await createTelephonyTtsProvider({
       coreConfig: createCoreConfig(),
-      runtime: {
-        textToSpeechTelephony: async ({ text }) => {
-          requestText = text;
-          return {
-            success: true,
-            audioBuffer: Buffer.alloc(2),
-            sampleRate: 8000,
-          };
+      runtime: createRuntime(textToSpeechTelephony, async ({ cfg, text }) => ({
+        cfg,
+        directives: {
+          cleanedText: text ? "Hello caller" : "",
+          hasDirective: text.length > 0,
+          overrides: {},
+          warnings: [],
         },
-      },
+      })),
     });
 
     await provider.synthesizeForTelephony("[[tts]]Hello caller[[/tts]]");
 
-    expect(requestText).toBe("Hello caller");
+    expect(textToSpeechTelephony).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "Hello caller" }),
+    );
   });
 
-  it("uses hidden telephony TTS directive text for synthesis", async () => {
-    let requestText: string | undefined;
-    let requestOverrides: unknown;
-    const provider = createTelephonyTtsProvider({
+  it("uses prepared hidden directive text and overrides for synthesis", async () => {
+    const textToSpeechTelephony = createSynthesis();
+    const provider = await createTelephonyTtsProvider({
       coreConfig: createCoreConfig(),
-      runtime: {
-        textToSpeechTelephony: async ({ text, overrides }) => {
-          requestText = text;
-          requestOverrides = overrides;
-          return {
-            success: true,
-            audioBuffer: Buffer.alloc(2),
-            sampleRate: 8000,
-          };
+      runtime: createRuntime(textToSpeechTelephony, async ({ cfg, text }) => ({
+        cfg,
+        directives: {
+          cleanedText: text ? "Visible text " : "",
+          ttsText: text ? "Speak this instead" : undefined,
+          hasDirective: text.length > 0,
+          overrides: text ? { ttsText: "Speak this instead" } : {},
+          warnings: [],
         },
-      },
+      })),
     });
 
     await provider.synthesizeForTelephony(
       "Visible text [[tts:text]]Speak this instead[[/tts:text]]",
     );
 
-    expect(requestText).toBe("Speak this instead");
-    expect(requestOverrides).toMatchObject({ ttsText: "Speak this instead" });
-  });
-
-  it("exposes configured timeoutMs as synthesisTimeoutMs", () => {
-    const provider = createTelephonyTtsProvider({
-      coreConfig: { messages: { tts: { provider: "openai", timeoutMs: 15000 } } },
-      runtime: {
-        textToSpeechTelephony: async () => ({
-          success: true,
-          audioBuffer: Buffer.alloc(2),
-          sampleRate: 8000,
-        }),
-      },
-    });
-
-    expect(provider.synthesisTimeoutMs).toBe(15000);
-  });
-
-  it("keeps the telephony timeout default when timeoutMs is not configured", () => {
-    const provider = createTelephonyTtsProvider({
-      coreConfig: createCoreConfig(),
-      runtime: {
-        textToSpeechTelephony: async () => ({
-          success: true,
-          audioBuffer: Buffer.alloc(2),
-          sampleRate: 8000,
-        }),
-      },
-    });
-
-    expect(provider.synthesisTimeoutMs).toBe(8000);
+    expect(textToSpeechTelephony).toHaveBeenCalledWith(
+      expect.objectContaining({
+        text: "Speak this instead",
+        overrides: { ttsText: "Speak this instead" },
+      }),
+    );
   });
 });

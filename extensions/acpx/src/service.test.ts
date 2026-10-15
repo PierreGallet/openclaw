@@ -1,37 +1,83 @@
+// ACPX tests cover service plugin behavior.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createFileSessionStore } from "acpx/runtime";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
+import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/plugin-state-runtime";
+import {
+  createPluginStateKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
+import {
+  resolvePreferredOpenClawTmpDir,
+  tempWorkspace,
+  type TempWorkspace,
+} from "openclaw/plugin-sdk/temp-path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { stateMigrations } from "../doctor-contract-api.js";
+import { createEmptyAcpxKeyedStore } from "./empty-keyed-store.test-support.js";
+import { AcpxRuntime } from "./runtime.js";
 
 const { runtimeRegistry } = vi.hoisted(() => ({
   runtimeRegistry: new Map<string, { runtime: unknown; healthy?: () => boolean }>(),
+}));
+const { availableParallelismMock } = vi.hoisted(() => ({
+  availableParallelismMock: vi.fn(() => 4),
 }));
 const { prepareAcpxCodexAuthConfigMock } = vi.hoisted(() => ({
   prepareAcpxCodexAuthConfigMock: vi.fn(
     async ({ pluginConfig }: { pluginConfig: unknown }) => pluginConfig,
   ),
 }));
+const { cleanupOpenClawOwnedAcpxProcessTreeMock } = vi.hoisted(() => ({
+  cleanupOpenClawOwnedAcpxProcessTreeMock: vi.fn(
+    async (
+      _params: Parameters<
+        (typeof import("./process-reaper.js"))["cleanupOpenClawOwnedAcpxProcessTree"]
+      >[0],
+    ): Promise<{
+      inspectedPids: number[];
+      terminatedPids: number[];
+      skippedReason?: string;
+    }> => ({
+      inspectedPids: [],
+      terminatedPids: [],
+    }),
+  ),
+}));
+const { cleanupOpenClawOwnedAcpxPendingLeaseMock } = vi.hoisted(() => ({
+  cleanupOpenClawOwnedAcpxPendingLeaseMock: vi.fn(
+    async (): Promise<{
+      inspectedPids: number[];
+      terminatedPids: number[];
+      skippedReason?: string;
+    }> => ({
+      inspectedPids: [],
+      terminatedPids: [],
+      skippedReason: "missing-root",
+    }),
+  ),
+}));
+const { reapStaleOpenClawOwnedAcpxOrphansMock } = vi.hoisted(() => ({
+  reapStaleOpenClawOwnedAcpxOrphansMock: vi.fn(
+    async (): Promise<{
+      inspectedPids: number[];
+      terminatedPids: number[];
+      skippedReason?: string;
+    }> => ({
+      inspectedPids: [],
+      terminatedPids: [],
+    }),
+  ),
+}));
 const { acpxRuntimeConstructorMock, createAgentRegistryMock, createFileSessionStoreMock } =
   vi.hoisted(() => ({
-    acpxRuntimeConstructorMock: vi.fn(function AcpxRuntime(options: unknown) {
+    acpxRuntimeConstructorMock: vi.fn(function MockAcpxRuntime() {
       return {
-        cancel: vi.fn(async () => {}),
-        close: vi.fn(async () => {}),
         doctor: vi.fn(async () => ({ ok: true, message: "ok" })),
-        ensureSession: vi.fn(async () => ({
-          backend: "acpx",
-          runtimeSessionName: "agent:codex:acp:test",
-          sessionKey: "agent:codex:acp:test",
-        })),
-        getCapabilities: vi.fn(async () => ({ controls: [] })),
-        getStatus: vi.fn(async () => ({ summary: "ready" })),
+        shutdown: vi.fn(async () => {}),
         isHealthy: vi.fn(() => true),
-        prepareFreshSession: vi.fn(async () => {}),
-        probeAvailability: vi.fn(async () => {}),
-        runTurn: vi.fn(async function* () {}),
-        setConfigOption: vi.fn(async () => {}),
-        setMode: vi.fn(async () => {}),
-        __options: options,
       };
     }),
     createAgentRegistryMock: vi.fn(() => ({})),
@@ -40,12 +86,11 @@ const { acpxRuntimeConstructorMock, createAgentRegistryMock, createFileSessionSt
 
 vi.mock("../runtime-api.js", () => ({
   getAcpRuntimeBackend: (id: string) => runtimeRegistry.get(id),
-  registerAcpRuntimeBackend: (entry: { id: string; runtime: unknown; healthy?: () => boolean }) => {
-    runtimeRegistry.set(entry.id, entry);
-  },
-  unregisterAcpRuntimeBackend: (id: string) => {
-    runtimeRegistry.delete(id);
-  },
+}));
+
+vi.mock("node:os", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:os")>()),
+  availableParallelism: availableParallelismMock,
 }));
 
 vi.mock("./runtime.js", () => ({
@@ -59,32 +104,72 @@ vi.mock("./codex-auth-bridge.js", () => ({
   prepareAcpxCodexAuthConfig: prepareAcpxCodexAuthConfigMock,
 }));
 
+vi.mock("./process-reaper.js", () => ({
+  cleanupOpenClawOwnedAcpxPendingLease: cleanupOpenClawOwnedAcpxPendingLeaseMock,
+  cleanupOpenClawOwnedAcpxProcessTree: cleanupOpenClawOwnedAcpxProcessTreeMock,
+  reapStaleOpenClawOwnedAcpxOrphans: reapStaleOpenClawOwnedAcpxOrphansMock,
+}));
+
 import { getAcpRuntimeBackend } from "../runtime-api.js";
-import { createAcpxRuntimeService } from "./service.js";
+import type { OpenClawPluginServiceContext } from "../runtime-api.js";
+import {
+  ACPX_PROBE_LEASE_SESSION_KEY,
+  openAcpxProcessLeaseStateStore,
+  type AcpxProcessLease,
+} from "./process-lease.js";
+import { createAcpxRuntimeService as createRealAcpxRuntimeService } from "./service.js";
+import {
+  ACPX_GATEWAY_INSTANCE_KEY,
+  ACPX_GATEWAY_INSTANCE_MAX_ENTRIES,
+  ACPX_GATEWAY_INSTANCE_NAMESPACE,
+  type AcpxGatewayInstanceRecord,
+} from "./state.js";
 
-const tempDirs: string[] = [];
+let testWorkspace: TempWorkspace;
+const previousEnv = {
+  OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE: process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE,
+  OPENCLAW_SKIP_ACPX_RUNTIME: process.env.OPENCLAW_SKIP_ACPX_RUNTIME,
+  OPENCLAW_SKIP_ACPX_RUNTIME_PROBE: process.env.OPENCLAW_SKIP_ACPX_RUNTIME_PROBE,
+  TOKIO_WORKER_THREADS: process.env.TOKIO_WORKER_THREADS,
+};
 
-async function makeTempDir(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-acpx-service-"));
-  tempDirs.push(dir);
-  return dir;
+function restoreEnv(name: keyof typeof previousEnv): void {
+  const value = previousEnv[name];
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
 }
 
+beforeEach(async () => {
+  testWorkspace = await tempWorkspace({
+    rootDir: resolvePreferredOpenClawTmpDir(),
+    prefix: "openclaw-acpx-service-",
+  });
+});
+
 afterEach(async () => {
+  await closeOpenClawStateDatabaseAsync();
+  resetPluginStateStoreForTests();
   runtimeRegistry.clear();
   prepareAcpxCodexAuthConfigMock.mockClear();
+  cleanupOpenClawOwnedAcpxProcessTreeMock.mockClear();
+  cleanupOpenClawOwnedAcpxPendingLeaseMock.mockClear();
+  reapStaleOpenClawOwnedAcpxOrphansMock.mockClear();
   acpxRuntimeConstructorMock.mockClear();
   createAgentRegistryMock.mockClear();
   createFileSessionStoreMock.mockClear();
-  delete process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE;
-  delete process.env.OPENCLAW_SKIP_ACPX_RUNTIME;
-  delete process.env.OPENCLAW_SKIP_ACPX_RUNTIME_PROBE;
-  for (const dir of tempDirs.splice(0)) {
-    await fs.rm(dir, { recursive: true, force: true });
-  }
+  availableParallelismMock.mockReturnValue(4);
+  restoreEnv("OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE");
+  restoreEnv("OPENCLAW_SKIP_ACPX_RUNTIME");
+  restoreEnv("OPENCLAW_SKIP_ACPX_RUNTIME_PROBE");
+  restoreEnv("TOKIO_WORKER_THREADS");
+  vi.restoreAllMocks();
+  await testWorkspace.cleanup();
 });
 
-function createServiceContext(workspaceDir: string) {
+function createServiceContext(workspaceDir: string): OpenClawPluginServiceContext {
   return {
     workspaceDir,
     stateDir: path.join(workspaceDir, ".openclaw-plugin-state"),
@@ -98,295 +183,554 @@ function createServiceContext(workspaceDir: string) {
   };
 }
 
+function createOpenKeyedStore(ctx: OpenClawPluginServiceContext) {
+  const env = { ...process.env, OPENCLAW_STATE_DIR: ctx.stateDir };
+  return <T>(options: OpenKeyedStoreOptions) =>
+    createPluginStateKeyedStoreForTests<T>("acpx", {
+      ...options,
+      env: options.env ?? env,
+    });
+}
+
+function createAcpxRuntimeService(
+  ctx: OpenClawPluginServiceContext,
+  params: Omit<Parameters<typeof createRealAcpxRuntimeService>[0], "backendLifecycle"> & {
+    backendLifecycle?: Parameters<typeof createRealAcpxRuntimeService>[0]["backendLifecycle"];
+  } = {},
+) {
+  const backendLifecycle = params.backendLifecycle ?? {
+    publish(backend: { runtime: unknown; healthy?: () => boolean }) {
+      runtimeRegistry.set("acpx", backend);
+    },
+    retract(runtime: unknown) {
+      if (runtimeRegistry.get("acpx")?.runtime === runtime) {
+        runtimeRegistry.delete("acpx");
+      }
+    },
+  };
+  return createRealAcpxRuntimeService({
+    ...params,
+    backendLifecycle,
+    openKeyedStore: params.openKeyedStore ?? createOpenKeyedStore(ctx),
+  });
+}
+
+function openGatewayInstanceStore(ctx: OpenClawPluginServiceContext) {
+  return createOpenKeyedStore(ctx)<AcpxGatewayInstanceRecord>({
+    namespace: ACPX_GATEWAY_INSTANCE_NAMESPACE,
+    maxEntries: ACPX_GATEWAY_INSTANCE_MAX_ENTRIES,
+  });
+}
+
+function openProcessLeaseStore(ctx: OpenClawPluginServiceContext) {
+  return openAcpxProcessLeaseStateStore(createOpenKeyedStore(ctx));
+}
+
 function createMockRuntime(overrides: Record<string, unknown> = {}) {
   return {
+    findSession: vi.fn(async () => undefined),
+    shutdown: vi.fn(async () => {}),
     ensureSession: vi.fn(),
     runTurn: vi.fn(),
     cancel: vi.fn(),
     close: vi.fn(),
-    probeAvailability: vi.fn(async () => {}),
     isHealthy: vi.fn(() => true),
     doctor: vi.fn(async () => ({ ok: true, message: "ok" })),
     ...overrides,
   };
 }
 
+function createRuntimeWithoutProcesses() {
+  return new AcpxRuntime({
+    cwd: testWorkspace.dir,
+    permissionMode: "deny-all",
+    sessionStore: { load: async () => undefined, save: async () => {} },
+    agentRegistry: { resolve: (agent) => agent, list: () => [] },
+  });
+}
+async function seedActiveLease(
+  ctx: OpenClawPluginServiceContext,
+  overrides: Partial<AcpxProcessLease> = {},
+) {
+  const wrapperRoot = path.join(ctx.stateDir, "acpx");
+  await openGatewayInstanceStore(ctx).register(ACPX_GATEWAY_INSTANCE_KEY, {
+    instanceId: "gw-test",
+    createdAt: 1,
+  });
+  const lease: AcpxProcessLease = {
+    leaseId: "active-sibling",
+    gatewayInstanceId: "gw-test",
+    sessionKey: "agent:main:acp:existing",
+    wrapperRoot,
+    wrapperPath: path.join(wrapperRoot, "codex-acp-wrapper.mjs"),
+    rootPid: 101,
+    commandHash: "existing-command",
+    startedAt: 1,
+    state: "open",
+    ...overrides,
+  };
+  await openProcessLeaseStore(ctx).register(lease.leaseId, lease);
+  return lease;
+}
+
+function readFirstRuntimeFactoryInput(runtimeFactory: { mock: { calls: Array<Array<unknown>> } }) {
+  const [call] = runtimeFactory.mock.calls;
+  if (!call) {
+    throw new Error("Expected runtimeFactory to be called");
+  }
+  const [input] = call;
+  if (typeof input !== "object" || input === null) {
+    throw new Error("Expected runtimeFactory to be called with an options object");
+  }
+  return input as {
+    getProbeAgent: () => string | undefined;
+    pluginConfig: {
+      timeoutSeconds?: number;
+      probeAgent?: string;
+    };
+  };
+}
+
 describe("createAcpxRuntimeService", () => {
-  it("registers and unregisters the embedded backend", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const runtime = createMockRuntime();
-    const service = createAcpxRuntimeService({
-      runtimeFactory: () => runtime as never,
-    });
+  it.each(["absent", "occupied", "move-failed", "marker-failed", "destination-unreadable"])(
+    "preserves legacy sessions at startup with a %s destination",
+    async (scenario) => {
+      const ctx = createServiceContext(testWorkspace.dir);
+      const legacy = path.join(testWorkspace.dir, "state");
+      const destination = path.join(ctx.stateDir, "acpx");
+      const recordId = "agent:main:acp:retained";
+      const recordPath = path.join(legacy, "sessions", `${encodeURIComponent(recordId)}.json`);
+      await fs.mkdir(path.dirname(recordPath), { recursive: true });
+      await fs.writeFile(
+        recordPath,
+        JSON.stringify({
+          schema: "acpx.session.v1",
+          acpx_record_id: recordId,
+          acp_session_id: "upstream-retained",
+          agent_command: "fixture",
+          cwd: testWorkspace.dir,
+          name: recordId,
+          created_at: "2026-09-01T00:00:00.000Z",
+          last_used_at: "2026-09-01T00:00:00.000Z",
+          last_seq: 0,
+          messages: [],
+          updated_at: "2026-09-01T00:00:00.000Z",
+        }),
+      );
+      await fs.writeFile(path.join(legacy, "retained-history.bin"), "opaque history");
+      const original = await createFileSessionStore({ stateDir: legacy }).load(recordId);
+      expect(original?.acpSessionId).toBe("upstream-retained");
+      if (scenario === "occupied") {
+        await fs.mkdir(destination, { recursive: true });
+        await fs.writeFile(path.join(destination, "existing"), "do not overwrite");
+      }
+      if (scenario === "move-failed") {
+        const rename = fs.rename.bind(fs);
+        vi.spyOn(fs, "rename").mockImplementation(async (source, target) => {
+          if (source === legacy) {
+            throw Object.assign(new Error("fixture move failure"), {
+              code: "EACCES",
+            });
+          }
+          return rename(source, target);
+        });
+      }
+      if (scenario === "destination-unreadable") {
+        await fs.mkdir(ctx.stateDir, { recursive: true });
+        await fs.rename(legacy, destination);
+      }
+      if (scenario === "destination-unreadable") {
+        const readdir = fs.readdir.bind(fs);
+        vi.spyOn(fs, "readdir").mockImplementation((...args) => {
+          if (args[0] === destination) {
+            return Promise.reject(
+              Object.assign(new Error("fixture unreadable"), { code: "EACCES" }),
+            );
+          }
+          return readdir(...args);
+        });
+      }
+      const runtime = createMockRuntime();
+      let selected = "";
+      let markerWrites = 0;
+      const openKeyedStore = createOpenKeyedStore(ctx);
+      const service = createAcpxRuntimeService(ctx, {
+        pluginConfig: {},
+        openKeyedStore: <T>(options: OpenKeyedStoreOptions) => {
+          const store = openKeyedStore<T>(options);
+          if (scenario === "marker-failed" && options.namespace === "state-directory-migration") {
+            const register = store.register;
+            store.register = async (...args) => {
+              if (++markerWrites === 2) {
+                throw new Error("fixture marker write failure");
+              }
+              return register(...args);
+            };
+          }
+          return store;
+        },
+        probeAtStartup: false,
+        runtimeFactory: ({ pluginConfig }) => {
+          selected = pluginConfig.stateDir;
+          return runtime as never;
+        },
+      });
+      try {
+        await service.start(ctx);
+        const retained = scenario === "move-failed";
+        expect(selected).toBe(retained ? legacy : destination);
+        if (scenario === "occupied") {
+          expect(await fs.readFile(recordPath, "utf8")).toContain("upstream-retained");
+          expect(await fs.readFile(path.join(destination, "existing"), "utf8")).toBe(
+            "do not overwrite",
+          );
+        } else {
+          expect(await createFileSessionStore({ stateDir: selected }).load(recordId)).toEqual(
+            original,
+          );
+          expect(await fs.readFile(path.join(selected, "retained-history.bin"), "utf8")).toBe(
+            "opaque history",
+          );
+        }
+        if (!retained && scenario !== "occupied" && scenario !== "destination-unreadable") {
+          await expect(fs.stat(legacy)).rejects.toMatchObject({ code: "ENOENT" });
+          expect(ctx.logger.info).toHaveBeenCalledWith(
+            expect.stringContaining("Migrated ACPX session state"),
+          );
+        }
+        if (scenario === "move-failed") {
+          expect(ctx.logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining("plugins.entries.acpx.config.stateDir"),
+          );
+        }
+        if (scenario === "move-failed") {
+          await service.stop?.(ctx);
+          await fs.writeFile(path.join(destination, "adapter-wrapper"), "generated wrapper");
+          await service.start(ctx);
+          expect(selected).toBe(legacy);
+        }
+        if (scenario === "marker-failed") {
+          expect(ctx.logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining("fixture marker write failure"),
+          );
+          await service.stop?.(ctx);
+          await service.start(ctx);
+          expect(ctx.logger.info).toHaveBeenCalledWith(
+            expect.stringContaining("Completed ACPX session state adoption"),
+          );
+        }
+        if (scenario === "absent" || scenario === "marker-failed") {
+          await service.stop?.(ctx);
+          await fs.rename(destination, path.join(ctx.stateDir, "saved-adoption"));
+          await fs.mkdir(path.dirname(recordPath), { recursive: true });
+          await fs.writeFile(recordPath, "stale source must not be adopted twice");
+          const readdir = fs.readdir.bind(fs);
+          vi.spyOn(fs, "readdir").mockImplementation((...args) => {
+            if (args[0] === path.join(legacy, "sessions")) {
+              return Promise.reject(
+                Object.assign(new Error("stale legacy directory is unreadable"), {
+                  code: "EACCES",
+                }),
+              );
+            }
+            return readdir(...args);
+          });
+          await service.start(ctx);
+          expect(selected).toBe(destination);
+          expect(await fs.readFile(recordPath, "utf8")).toBe(
+            "stale source must not be adopted twice",
+          );
+          expect(await fs.readdir(destination)).toEqual([]);
+          const migration = stateMigrations.find(
+            (item) => item.id === "acpx-session-owner-resources",
+          )!;
+          expect(
+            await migration.detectLegacyState({
+              config: {},
+              env: { ...process.env, OPENCLAW_STATE_DIR: ctx.stateDir },
+              stateDir: ctx.stateDir,
+              serviceWorkspaceDir: ctx.workspaceDir,
+              oauthDir: path.join(ctx.stateDir, "oauth"),
+              context: { openPluginStateKeyedStore: openKeyedStore },
+            }),
+          ).toBeNull();
+        }
+      } finally {
+        await service.stop?.(ctx);
+      }
+    },
+  );
 
-    await service.start(ctx);
-
-    expect(getAcpRuntimeBackend("acpx")?.runtime).toBe(runtime);
-
-    await service.stop?.(ctx);
-
-    expect(getAcpRuntimeBackend("acpx")).toBeUndefined();
-  });
-
-  it("creates the embedded runtime state directory without probing at startup by default", async () => {
-    const workspaceDir = await makeTempDir();
-    const stateDir = path.join(workspaceDir, "custom-state");
-    const ctx = createServiceContext(workspaceDir);
-    const probeAvailability = vi.fn(async () => {
-      await fs.access(stateDir);
-    });
+  it("publishes before probing and retracts the exact runtime through the injected lifecycle", async () => {
+    delete process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE;
+    const ctx = createServiceContext(testWorkspace.dir);
+    const probeStarted = createDeferred<void>();
+    const releaseProbe = createDeferred<void>();
+    const events: string[] = [];
     const runtime = createMockRuntime({
-      doctor: async () => ({ ok: true, message: "ok" }),
-      isHealthy: () => true,
-      probeAvailability,
+      doctor: vi.fn(async () => {
+        events.push("probe");
+        probeStarted.resolve();
+        await releaseProbe.promise;
+        return { ok: true, message: "ok" };
+      }),
     });
-    const service = createAcpxRuntimeService({
-      pluginConfig: { stateDir },
+    const publish = vi.fn((backend: { runtime: unknown; healthy?: () => boolean }) => {
+      events.push("publish");
+      expect(backend.runtime).toBe(runtime);
+      expect(backend.healthy?.()).toBe(true);
+    });
+    const retract = vi.fn((ownedRuntime: unknown) => {
+      events.push("retract");
+      expect(ownedRuntime).toBe(runtime);
+    });
+    const service = createAcpxRuntimeService(ctx, {
+      backendLifecycle: { publish, retract },
+      openKeyedStore: createEmptyAcpxKeyedStore,
+      runtimeFactory: () => runtime as never,
+    });
+
+    let resolved = false;
+    const starting = Promise.resolve(service.start(ctx)).then(() => {
+      resolved = true;
+    });
+    await probeStarted.promise;
+    // Let a premature startup return settle while the probe remains blocked.
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(resolved).toBe(false);
+
+    expect(events).toEqual(["publish", "probe"]);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(getAcpRuntimeBackend("acpx")).toBeUndefined();
+
+    await service.stop?.(ctx);
+    expect(retract).toHaveBeenCalledWith(runtime);
+    expect(events).toEqual(["publish", "probe", "retract"]);
+
+    releaseProbe.resolve();
+    await starting;
+    expect(resolved).toBe(true);
+    expect(runtime.shutdown).toHaveBeenCalledOnce();
+  });
+
+  it.each([{ startup: "1", skip: "1" }])(
+    "skips startup probe and health (startup=$startup, skip=$skip)",
+    async ({ startup, skip }) => {
+      process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = startup;
+      process.env.OPENCLAW_SKIP_ACPX_RUNTIME_PROBE = skip;
+      const ctx = createServiceContext(testWorkspace.dir);
+      const stateDir = path.join(testWorkspace.dir, "custom-state");
+      const runtime = createMockRuntime({ isHealthy: () => false });
+      const service = createAcpxRuntimeService(ctx, {
+        pluginConfig: { stateDir },
+        openKeyedStore: createEmptyAcpxKeyedStore,
+        runtimeFactory: () => runtime as never,
+      });
+      await service.start(ctx);
+      await fs.access(stateDir);
+      expect(runtime.doctor).not.toHaveBeenCalled();
+      expect(getAcpRuntimeBackend("acpx")?.runtime).toBe(runtime);
+      expect(getAcpRuntimeBackend("acpx")?.healthy).toBeUndefined();
+      await service.stop?.(ctx);
+      expect(getAcpRuntimeBackend("acpx")).toBeUndefined();
+      expect(runtime.shutdown).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("reaps stale ACPX process leases from the generated wrapper root at startup", async () => {
+    const ctx = createServiceContext(testWorkspace.dir);
+    const runtime = createMockRuntime();
+    const wrapperRoot = path.join(ctx.stateDir, "acpx");
+    await seedActiveLease(ctx, {
+      leaseId: "lease-1",
+      sessionKey: "agent:codex:acp:test",
+      rootPid: 101,
+    });
+    cleanupOpenClawOwnedAcpxProcessTreeMock.mockResolvedValueOnce({
+      inspectedPids: [101, 102],
+      terminatedPids: [101, 102],
+    });
+    const service = createAcpxRuntimeService(ctx, {
       runtimeFactory: () => runtime as never,
     });
 
     await service.start(ctx);
 
-    await fs.access(stateDir);
-    expect(probeAvailability).not.toHaveBeenCalled();
-    expect(getAcpRuntimeBackend("acpx")?.healthy).toBeUndefined();
+    expect(cleanupOpenClawOwnedAcpxProcessTreeMock).toHaveBeenCalledWith({
+      rootPid: 101,
+      expectedLeaseId: "lease-1",
+      expectedGatewayInstanceId: "gw-test",
+      wrapperRoot,
+      assertCurrent: expect.any(Function),
+    });
+    expect(ctx.logger.info).toHaveBeenCalledWith("reaped 2 stale OpenClaw-owned ACPX processes");
 
     await service.stop?.(ctx);
   });
 
-  it("registers the default backend without importing ACPX runtime until first use", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const service = createAcpxRuntimeService();
+  it("keeps an absent pending probe lease open for unidentifiable descendants", async () => {
+    const ctx = createServiceContext(testWorkspace.dir);
+    const runtime = createMockRuntime();
+    const lease = await seedActiveLease(ctx, {
+      leaseId: "lease-probe-missing",
+      sessionKey: ACPX_PROBE_LEASE_SESSION_KEY,
+      rootPid: 0,
+    });
+    const service = createAcpxRuntimeService(ctx, {
+      runtimeFactory: () => runtime as never,
+    });
+
+    await service.start(ctx);
+
+    await expect(openProcessLeaseStore(ctx).lookup(lease.leaseId)).resolves.toMatchObject({
+      leaseId: lease.leaseId,
+      rootPid: 0,
+      state: "open",
+    });
+    await service.stop?.(ctx);
+  });
+
+  it("snapshots legacy session ownership when acquiring a runtime without probing", async () => {
+    process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "0";
+    delete process.env.OPENCLAW_SKIP_ACPX_RUNTIME_PROBE;
+    const ctx = createServiceContext(testWorkspace.dir);
+    const service = createAcpxRuntimeService(ctx, { openKeyedStore: createEmptyAcpxKeyedStore });
+    const sessionsDir = path.join(ctx.stateDir, "acpx", "sessions");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    for (const id of ["global", "openclaw-owner-v1-existing", "agent:free:acp:test"]) {
+      await fs.writeFile(path.join(sessionsDir, `${encodeURIComponent(id)}.json`), "{}");
+    }
 
     await service.start(ctx);
 
     const backend = getAcpRuntimeBackend("acpx");
-    expect(backend?.runtime).toBeDefined();
-    expect(acpxRuntimeConstructorMock).not.toHaveBeenCalled();
-
-    await backend?.runtime.ensureSession({
-      agent: "codex",
-      mode: "oneshot",
-      sessionKey: "agent:codex:acp:test",
-    });
-
+    if (!backend) {
+      throw new Error("expected ACPX runtime backend");
+    }
+    expect(backend.healthy).toBeUndefined();
     expect(acpxRuntimeConstructorMock).toHaveBeenCalledOnce();
-
-    await service.stop?.(ctx);
-  });
-
-  it("can run the embedded runtime probe at startup when explicitly enabled", async () => {
-    process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "1";
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const probeAvailability = vi.fn(async () => {});
-    const runtime = createMockRuntime({
-      probeAvailability,
-      isHealthy: () => true,
-    });
-    const service = createAcpxRuntimeService({
-      runtimeFactory: () => runtime as never,
-    });
-
-    await service.start(ctx);
-
-    expect(probeAvailability).toHaveBeenCalledOnce();
-    expect(getAcpRuntimeBackend("acpx")?.healthy?.()).toBe(true);
-
-    await service.stop?.(ctx);
-  });
-
-  it("passes the default runtime timeout to the embedded runtime factory", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const runtime = createMockRuntime();
-    const runtimeFactory = vi.fn(() => runtime as never);
-    const service = createAcpxRuntimeService({
-      runtimeFactory,
-    });
-
-    await service.start(ctx);
-
-    expect(runtimeFactory).toHaveBeenCalledWith(
+    expect(acpxRuntimeConstructorMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        pluginConfig: expect.objectContaining({
-          timeoutSeconds: 120,
-        }),
+        elicitationModes: ["form", "url"],
+        openclawLegacyBareSessionKeys: new Set(["global", "openclaw-owner-v1-existing"]),
       }),
     );
 
     await service.stop?.(ctx);
   });
 
-  it("forwards a configured probeAgent to the runtime factory so the probe does not hardcode the default", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const runtime = {
-      ensureSession: vi.fn(),
-      runTurn: vi.fn(),
-      cancel: vi.fn(),
-      close: vi.fn(),
-      probeAvailability: vi.fn(async () => {}),
-      isHealthy: vi.fn(() => true),
-      doctor: vi.fn(async () => ({ ok: true, message: "ok" })),
-    };
-    const runtimeFactory = vi.fn(() => runtime as never);
-    const service = createAcpxRuntimeService({
-      pluginConfig: { probeAgent: "opencode" },
-      runtimeFactory,
-    });
+  it.each([{ parallelism: 64, expected: "8" }])(
+    "bounds default ACPX Tokio workers at host parallelism $parallelism",
+    async ({ parallelism, expected }) => {
+      process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "0";
+      delete process.env.TOKIO_WORKER_THREADS;
+      availableParallelismMock.mockReturnValue(parallelism);
+      const ctx = createServiceContext(testWorkspace.dir);
+      const service = createAcpxRuntimeService(ctx, { openKeyedStore: createEmptyAcpxKeyedStore });
 
-    await service.start(ctx);
+      await service.start(ctx);
 
-    expect(runtimeFactory).toHaveBeenCalledWith(
-      expect.objectContaining({
-        pluginConfig: expect.objectContaining({
-          probeAgent: "opencode",
-        }),
-      }),
-    );
-
-    await service.stop?.(ctx);
-  });
-
-  it("uses the first allowed ACP agent as the default probe agent", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    ctx.config = {
-      acp: {
-        allowedAgents: ["  OpenCode  ", "codex"],
-      },
-    };
-    const runtime = createMockRuntime();
-    const runtimeFactory = vi.fn(() => runtime as never);
-    const service = createAcpxRuntimeService({
-      runtimeFactory,
-    });
-
-    await service.start(ctx);
-
-    expect(runtimeFactory).toHaveBeenCalledWith(
-      expect.objectContaining({
-        pluginConfig: expect.objectContaining({
-          probeAgent: "opencode",
-        }),
-      }),
-    );
-
-    await service.stop?.(ctx);
-  });
-
-  it("keeps explicit probeAgent ahead of acp.allowedAgents", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    ctx.config = {
-      acp: {
-        allowedAgents: ["opencode"],
-      },
-    };
-    const runtime = createMockRuntime();
-    const runtimeFactory = vi.fn(() => runtime as never);
-    const service = createAcpxRuntimeService({
-      pluginConfig: { probeAgent: "codex" },
-      runtimeFactory,
-    });
-
-    await service.start(ctx);
-
-    expect(runtimeFactory).toHaveBeenCalledWith(
-      expect.objectContaining({
-        pluginConfig: expect.objectContaining({
-          probeAgent: "codex",
-        }),
-      }),
-    );
-
-    await service.stop?.(ctx);
-  });
-
-  it("warns when legacy compatibility config is explicitly ignored", async () => {
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const runtime = createMockRuntime();
-    const service = createAcpxRuntimeService({
-      pluginConfig: {
-        queueOwnerTtlSeconds: 30,
-        strictWindowsCmdWrapper: false,
-      },
-      runtimeFactory: () => runtime as never,
-    });
-
-    await service.start(ctx);
-
-    expect(ctx.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining(
-        "embedded acpx runtime ignores legacy compatibility config: queueOwnerTtlSeconds, strictWindowsCmdWrapper=false",
-      ),
-    );
-
-    await service.stop?.(ctx);
-  });
-
-  it("can skip the embedded runtime probe via env", async () => {
-    process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "1";
-    process.env.OPENCLAW_SKIP_ACPX_RUNTIME_PROBE = "1";
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const probeAvailability = vi.fn(async () => {});
-    const runtime = createMockRuntime({
-      doctor: async () => ({ ok: false, message: "nope" }),
-      isHealthy: () => false,
-      probeAvailability,
-    });
-    const service = createAcpxRuntimeService({
-      runtimeFactory: () => runtime as never,
-    });
-
-    await service.start(ctx);
-
-    expect(probeAvailability).not.toHaveBeenCalled();
-    expect(getAcpRuntimeBackend("acpx")).toBeTruthy();
-
-    await service.stop?.(ctx);
-  });
-
-  it("formats non-string doctor details without losing object payloads", async () => {
-    process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "1";
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
-    const runtime = createMockRuntime({
-      doctor: async () => ({
-        ok: false,
-        message: "probe failed",
-        details: [{ code: "ACP_CLOSED", agent: "codex" }, new Error("stdin closed")],
-      }),
-      isHealthy: () => false,
-    });
-    const service = createAcpxRuntimeService({
-      runtimeFactory: () => runtime as never,
-    });
-
-    await service.start(ctx);
-
-    await vi.waitFor(() => {
-      expect(ctx.logger.warn).toHaveBeenCalledWith(
-        'embedded acpx runtime backend probe failed: probe failed ({"code":"ACP_CLOSED","agent":"codex"}; stdin closed)',
+      expect(acpxRuntimeConstructorMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agentProcessEnv: { TOKIO_WORKER_THREADS: expected } }),
       );
-    });
+      await service.stop?.(ctx);
+    },
+  );
 
+  it("preserves an explicit ACPX Tokio worker override", async () => {
+    process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "0";
+    process.env.TOKIO_WORKER_THREADS = "12";
+    const ctx = createServiceContext(testWorkspace.dir);
+    const service = createAcpxRuntimeService(ctx, { openKeyedStore: createEmptyAcpxKeyedStore });
+
+    await service.start(ctx);
+
+    expect(acpxRuntimeConstructorMock).toHaveBeenCalledWith(
+      expect.objectContaining({ agentProcessEnv: undefined }),
+    );
     await service.stop?.(ctx);
   });
+
+  it("bounds startup diagnostics after an unhealthy probe", async () => {
+    process.env.OPENCLAW_ACPX_RUNTIME_STARTUP_PROBE = "1";
+    const ctx = createServiceContext(testWorkspace.dir);
+    const doctorStarted = createDeferred<void>();
+    const releaseDoctor = createDeferred<{ ok: boolean; message: string }>();
+    const runtime = createMockRuntime({
+      isHealthy: () => false,
+      doctor: vi.fn(() => {
+        doctorStarted.resolve();
+        return releaseDoctor.promise;
+      }),
+    });
+    const service = createAcpxRuntimeService(ctx, {
+      pluginConfig: { timeoutSeconds: 0.001 },
+      openKeyedStore: createEmptyAcpxKeyedStore,
+      runtimeFactory: () => runtime as never,
+    });
+    vi.useFakeTimers();
+    let settled = false;
+    const started = Promise.resolve(service.start(ctx)).then(() => {
+      settled = true;
+    });
+    try {
+      await doctorStarted.promise;
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(runtime.doctor).toHaveBeenCalledOnce();
+      expect(getAcpRuntimeBackend("acpx")?.healthy?.()).toBe(false);
+      expect(ctx.logger.warn).toHaveBeenCalledWith(
+        "embedded acpx runtime setup failed: embedded acpx runtime backend startup check timed out after 0.001s",
+      );
+    } finally {
+      releaseDoctor.resolve({ ok: false, message: "unavailable" });
+      await started;
+      await service.stop?.(ctx);
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([{ allowedAgents: undefined, probeAgent: undefined, expected: undefined }])(
+    "resolves probe $expected and the default timeout",
+    async ({ allowedAgents, probeAgent, expected }) => {
+      const ctx = createServiceContext(testWorkspace.dir);
+      ctx.config = { acp: { allowedAgents: ["claude"] } };
+      let currentAllowedAgents: readonly string[] | undefined = allowedAgents;
+      const runtime = createMockRuntime();
+      const runtimeFactory = vi.fn(() => runtime as never);
+      const service = createAcpxRuntimeService(ctx, {
+        pluginConfig: { probeAgent },
+        openKeyedStore: createEmptyAcpxKeyedStore,
+        getAllowedAgents: () => currentAllowedAgents,
+        runtimeFactory,
+      });
+      try {
+        await service.start(ctx);
+        expect(readFirstRuntimeFactoryInput(runtimeFactory).pluginConfig).toMatchObject({
+          timeoutSeconds: 120,
+        });
+        const input = readFirstRuntimeFactoryInput(runtimeFactory);
+        expect(input.getProbeAgent()).toBe(expected);
+        currentAllowedAgents = ["gemini"];
+        expect(input.getProbeAgent()).toBe(probeAgent ?? "gemini");
+        currentAllowedAgents = undefined;
+        expect(input.getProbeAgent()).toBe(probeAgent);
+        expect(runtime.shutdown).not.toHaveBeenCalled();
+      } finally {
+        await service.stop?.(ctx);
+      }
+    },
+  );
 
   it("can skip the embedded runtime backend via env", async () => {
     process.env.OPENCLAW_SKIP_ACPX_RUNTIME = "1";
-    const workspaceDir = await makeTempDir();
-    const ctx = createServiceContext(workspaceDir);
+    const ctx = createServiceContext(testWorkspace.dir);
     const runtimeFactory = vi.fn(() => {
       throw new Error("runtime factory should not run when ACPX is skipped");
     });
-    const service = createAcpxRuntimeService({
+    const service = createAcpxRuntimeService(ctx, {
       runtimeFactory: runtimeFactory as never,
     });
 
@@ -398,4 +742,38 @@ describe("createAcpxRuntimeService", () => {
       "skipping embedded acpx runtime backend (OPENCLAW_SKIP_ACPX_RUNTIME=1)",
     );
   });
+});
+
+it("catalog-only acquisition and disposal preserve another active runtime lease", async () => {
+  const ctx = createServiceContext(testWorkspace.dir);
+  await openGatewayInstanceStore(ctx).register(ACPX_GATEWAY_INSTANCE_KEY, {
+    instanceId: "gw-test",
+    createdAt: 1,
+  });
+  const primary = createRuntimeWithoutProcesses();
+  const primaryShutdown = vi.spyOn(primary, "shutdown");
+  const owner = createAcpxRuntimeService(ctx, {
+    probeAtStartup: false,
+    runtimeFactory: () => primary,
+  });
+  await owner.start(ctx);
+  const lease = await seedActiveLease(ctx);
+  const inspectionRuntime = createRuntimeWithoutProcesses();
+  const inspectionShutdown = vi.spyOn(inspectionRuntime, "shutdown");
+  const inspection = createAcpxRuntimeService(ctx, {
+    startupPurpose: "inspection",
+    probeAtStartup: false,
+    runtimeFactory: () => inspectionRuntime,
+    backendLifecycle: { publish: () => {}, retract: () => {} },
+  });
+  await inspection.start(ctx);
+  await inspection.stop?.(ctx);
+  expect(cleanupOpenClawOwnedAcpxProcessTreeMock).not.toHaveBeenCalled();
+  expect(cleanupOpenClawOwnedAcpxPendingLeaseMock).not.toHaveBeenCalled();
+  expect(reapStaleOpenClawOwnedAcpxOrphansMock).not.toHaveBeenCalled();
+  expect(await openProcessLeaseStore(ctx).lookup(lease.leaseId)).toEqual(lease);
+  expect(getAcpRuntimeBackend("acpx")?.runtime).toBe(primary);
+  expect(inspectionShutdown).toHaveBeenCalledOnce();
+  expect(primaryShutdown).not.toHaveBeenCalled();
+  await owner.stop?.(ctx);
 });

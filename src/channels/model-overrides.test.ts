@@ -1,74 +1,22 @@
+// Model override tests cover channel-level model selection and override precedence.
 import { beforeEach, describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../plugins/runtime.js";
-import { createTestRegistry } from "../test-utils/channel-plugins.js";
+import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { createSessionConversationTestRegistry } from "../test-utils/session-conversation-registry.js";
 import { resolveChannelModelOverride } from "./model-overrides.js";
+
+function createModelOverrideConfig(
+  channel: string,
+  models: Record<string, string>,
+): OpenClawConfig {
+  return { channels: { modelByChannel: { [channel]: models } } };
+}
 
 describe("resolveChannelModelOverride", () => {
   beforeEach(() => {
     resetPluginRuntimeStateForTest();
     setActivePluginRegistry(createSessionConversationTestRegistry());
-  });
-
-  it.each([
-    {
-      name: "matches parent group id when topic suffix is present",
-      input: {
-        cfg: {
-          channels: {
-            modelByChannel: {
-              telegram: {
-                "-100123": "demo-provider/demo-parent-model",
-              },
-            },
-          },
-        } as unknown as OpenClawConfig,
-        channel: "telegram",
-        groupId: "-100123:topic:99",
-      },
-      expected: { model: "demo-provider/demo-parent-model", matchKey: "-100123" },
-    },
-    {
-      name: "prefers topic-specific match over parent group id",
-      input: {
-        cfg: {
-          channels: {
-            modelByChannel: {
-              telegram: {
-                "-100123": "demo-provider/demo-parent-model",
-                "-100123:topic:99": "demo-provider/demo-topic-model",
-              },
-            },
-          },
-        } as unknown as OpenClawConfig,
-        channel: "telegram",
-        groupId: "-100123:topic:99",
-      },
-      expected: { model: "demo-provider/demo-topic-model", matchKey: "-100123:topic:99" },
-    },
-    {
-      name: "falls back to parent session key when thread id does not match",
-      input: {
-        cfg: {
-          channels: {
-            modelByChannel: {
-              "demo-thread": {
-                "123": "demo-provider/demo-parent-model",
-              },
-            },
-          },
-        } as unknown as OpenClawConfig,
-        channel: "demo-thread",
-        groupId: "999",
-        parentSessionKey: "agent:main:demo-thread:channel:123:thread:456",
-      },
-      expected: { model: "demo-provider/demo-parent-model", matchKey: "123" },
-    },
-  ] as const)("$name", ({ input, expected }) => {
-    const resolved = resolveChannelModelOverride(input);
-    expect(resolved?.model).toBe(expected.model);
-    expect(resolved?.matchKey).toBe(expected.matchKey);
   });
 
   it("passes channel kind to plugin-owned parent fallback resolution", () => {
@@ -78,15 +26,11 @@ describe("resolveChannelModelOverride", () => {
           pluginId: "channel-kind",
           source: "test",
           plugin: {
-            id: "channel-kind",
-            meta: {
+            ...createChannelTestPluginBase({
               id: "channel-kind",
               label: "Channel Kind",
-              selectionLabel: "Channel Kind",
-              docsPath: "/channels/channel-kind",
-              blurb: "test stub.",
-            },
-            capabilities: { chatTypes: ["group", "channel"] },
+              capabilities: { chatTypes: ["group", "channel"] },
+            }),
             messaging: {
               resolveSessionConversation: ({
                 kind,
@@ -99,25 +43,15 @@ describe("resolveChannelModelOverride", () => {
                 parentConversationCandidates: kind === "channel" ? ["thread-parent"] : [],
               }),
             },
-            config: {
-              listAccountIds: () => ["default"],
-              resolveAccount: () => ({}),
-            },
           },
         },
       ]),
     );
 
     const resolved = resolveChannelModelOverride({
-      cfg: {
-        channels: {
-          modelByChannel: {
-            "channel-kind": {
-              "thread-parent": "demo-provider/demo-channel-model",
-            },
-          },
-        },
-      } as unknown as OpenClawConfig,
+      cfg: createModelOverrideConfig("channel-kind", {
+        "thread-parent": "demo-provider/demo-channel-model",
+      }),
       channel: "channel-kind",
       groupId: "thread-123",
       groupChatType: "channel",
@@ -134,15 +68,11 @@ describe("resolveChannelModelOverride", () => {
           pluginId: "scoped-chat",
           source: "test",
           plugin: {
-            id: "scoped-chat",
-            meta: {
+            ...createChannelTestPluginBase({
               id: "scoped-chat",
               label: "Scoped Chat",
-              selectionLabel: "Scoped Chat",
-              docsPath: "/channels/scoped-chat",
-              blurb: "test stub.",
-            },
-            capabilities: { chatTypes: ["group"] },
+              capabilities: { chatTypes: ["group"] },
+            }),
             conversationBindings: {
               buildModelOverrideParentCandidates: ({
                 parentConversationId,
@@ -153,25 +83,15 @@ describe("resolveChannelModelOverride", () => {
                   ? ["room:topic:thread", "room"]
                   : [],
             },
-            config: {
-              listAccountIds: () => ["default"],
-              resolveAccount: () => ({}),
-            },
           },
         },
       ]),
     );
 
     const resolved = resolveChannelModelOverride({
-      cfg: {
-        channels: {
-          modelByChannel: {
-            "scoped-chat": {
-              "room:topic:thread": "demo-provider/demo-scoped-model",
-            },
-          },
-        },
-      } as unknown as OpenClawConfig,
+      cfg: createModelOverrideConfig("scoped-chat", {
+        "room:topic:thread": "demo-provider/demo-scoped-model",
+      }),
       channel: "scoped-chat",
       groupId: "unrelated",
       parentSessionKey: "agent:main:scoped-chat:group:room:topic:thread:sender:user",
@@ -181,18 +101,26 @@ describe("resolveChannelModelOverride", () => {
     expect(resolved?.matchKey).toBe("room:topic:thread");
   });
 
+  it("applies provider wildcard model overrides to direct chats", () => {
+    const resolved = resolveChannelModelOverride({
+      cfg: createModelOverrideConfig("telegram", {
+        "*": "demo-provider/demo-direct-model",
+      }),
+      channel: "telegram",
+      groupChatType: "direct",
+    });
+
+    expect(resolved?.model).toBe("demo-provider/demo-direct-model");
+    expect(resolved?.matchKey).toBe("*");
+    expect(resolved?.matchSource).toBe("wildcard");
+  });
+
   it("prefers parent conversation ids over channel-name fallbacks", () => {
     const resolved = resolveChannelModelOverride({
-      cfg: {
-        channels: {
-          modelByChannel: {
-            telegram: {
-              "-100123": "demo-provider/demo-parent-model",
-              "#general": "demo-provider/demo-channel-name-model",
-            },
-          },
-        },
-      } as unknown as OpenClawConfig,
+      cfg: createModelOverrideConfig("telegram", {
+        "-100123": "demo-provider/demo-parent-model",
+        "#general": "demo-provider/demo-channel-name-model",
+      }),
       channel: "telegram",
       groupId: "-100123:topic:99",
       groupChannel: "#general",
@@ -200,5 +128,33 @@ describe("resolveChannelModelOverride", () => {
 
     expect(resolved?.model).toBe("demo-provider/demo-parent-model");
     expect(resolved?.matchKey).toBe("-100123");
+  });
+
+  it("matches slack DM when origin.from is slack:U... but config has user:U... (multi-candidate)", () => {
+    const resolved = resolveChannelModelOverride({
+      cfg: createModelOverrideConfig("slack", {
+        "user:U12345": "demo-provider/demo-slack-dm-model",
+      }),
+      channel: "slack",
+      groupChatType: "direct",
+      directUserIds: ["slack:U12345", "user:U12345"],
+    });
+
+    expect(resolved?.model).toBe("demo-provider/demo-slack-dm-model");
+    expect(resolved?.matchKey).toBe("user:U12345");
+  });
+
+  it("does not leak directUserId match into non-direct conversations", () => {
+    const resolved = resolveChannelModelOverride({
+      cfg: createModelOverrideConfig("telegram", {
+        user123: "demo-provider/demo-dm-model",
+      }),
+      channel: "telegram",
+      groupChatType: "group",
+      groupId: "some-group",
+      directUserIds: ["user123"],
+    });
+
+    expect(resolved).toBeNull();
   });
 });

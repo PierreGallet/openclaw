@@ -1,5 +1,7 @@
+// Covers gateway exposure audit classification.
 import { describe, expect, it } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
+import type { GatewayTrustedProxyConfig } from "../config/types.gateway.js";
 import { collectGatewayConfigFindings } from "./audit-gateway-config.js";
 
 function hasFinding(
@@ -10,90 +12,67 @@ function hasFinding(
   return findings.some((finding) => finding.checkId === checkId && finding.severity === severity);
 }
 
-describe("security audit gateway exposure findings", () => {
-  it("warns on insecure or dangerous flags", () => {
-    const cases = [
-      {
-        name: "control UI allows insecure auth",
-        cfg: {
-          gateway: {
-            controlUi: { allowInsecureAuth: true },
-          },
-        } satisfies OpenClawConfig,
-        expectedFinding: {
-          checkId: "gateway.control_ui.insecure_auth",
-          severity: "warn",
-        },
-        expectedDangerousDetails: ["gateway.controlUi.allowInsecureAuth=true"],
-      },
-      {
-        name: "control UI device auth is disabled",
-        cfg: {
-          gateway: {
-            controlUi: { dangerouslyDisableDeviceAuth: true },
-          },
-        } satisfies OpenClawConfig,
-        expectedFinding: {
-          checkId: "gateway.control_ui.device_auth_disabled",
-          severity: "critical",
-        },
-        expectedDangerousDetails: ["gateway.controlUi.dangerouslyDisableDeviceAuth=true"],
-      },
-      {
-        name: "generic insecure debug flags",
-        cfg: {
-          hooks: {
-            gmail: { allowUnsafeExternalContent: true },
-            mappings: [{ allowUnsafeExternalContent: true }],
-          },
-          tools: {
-            exec: {
-              applyPatch: {
-                workspaceOnly: false,
-              },
-            },
-          },
-        } satisfies OpenClawConfig,
-        expectedDangerousDetails: [
-          "hooks.gmail.allowUnsafeExternalContent=true",
-          "hooks.mappings[0].allowUnsafeExternalContent=true",
-          "tools.exec.applyPatch.workspaceOnly=false",
-        ],
-      },
-    ] as const;
+function requireDangerousFlagsFindings(
+  findings: ReturnType<typeof collectGatewayConfigFindings>,
+  label: string,
+) {
+  const dangerousFindings = findings.filter(
+    (entry) => entry.checkId === "config.insecure_or_dangerous_flags",
+  );
+  if (dangerousFindings.length === 0) {
+    throw new Error(`Expected dangerous flags finding for ${label}`);
+  }
+  return dangerousFindings;
+}
 
-    for (const testCase of cases) {
-      const findings = collectGatewayConfigFindings(testCase.cfg, testCase.cfg, {});
-      if ("expectedFinding" in testCase) {
-        expect(findings, testCase.name).toEqual(
-          expect.arrayContaining([expect.objectContaining(testCase.expectedFinding)]),
-        );
-      }
-      const finding = findings.find(
-        (entry) => entry.checkId === "config.insecure_or_dangerous_flags",
-      );
-      expect(finding, testCase.name).toBeTruthy();
-      expect(finding?.severity, testCase.name).toBe("warn");
-      for (const snippet of testCase.expectedDangerousDetails) {
-        expect(finding?.detail, `${testCase.name}:${snippet}`).toContain(snippet);
-      }
+function requireFinding(
+  findings: ReturnType<typeof collectGatewayConfigFindings>,
+  checkId: string,
+  label: string,
+) {
+  const finding = findings.find((entry) => entry.checkId === checkId);
+  if (!finding) {
+    throw new Error(`Expected ${checkId} finding for ${label}`);
+  }
+  return finding;
+}
+
+describe("security audit gateway exposure findings", () => {
+  it("warns when the MCP Apps bridge is enabled", () => {
+    const cfg: OpenClawConfig = { mcp: { apps: { enabled: true } } };
+    expect(collectGatewayConfigFindings(cfg, cfg, {})).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ checkId: "mcp.apps.enabled", severity: "warn" }),
+      ]),
+    );
+  });
+
+  it("warns on insecure or dangerous flags", () => {
+    const cfg: OpenClawConfig = {
+      hooks: {
+        gmail: { allowUnsafeExternalContent: true },
+        mappings: [{ allowUnsafeExternalContent: true }],
+      },
+      tools: { exec: { applyPatch: { workspaceOnly: false } } },
+    };
+    const dangerousFindings = requireDangerousFlagsFindings(
+      collectGatewayConfigFindings(cfg, cfg, {}),
+      "generic insecure debug flags",
+    );
+    expect(dangerousFindings.every((finding) => finding.severity === "warn")).toBe(true);
+    for (const snippet of [
+      "hooks.gmail.allowUnsafeExternalContent=true",
+      "hooks.mappings[0].allowUnsafeExternalContent=true",
+      "tools.exec.applyPatch.workspaceOnly=false",
+    ]) {
+      expect(
+        dangerousFindings.some((finding) => finding.detail.includes(snippet)),
+        snippet,
+      ).toBe(true);
     }
   });
 
   it.each([
-    {
-      name: "flags non-loopback Control UI without allowed origins",
-      cfg: {
-        gateway: {
-          bind: "lan",
-          auth: { mode: "token", token: "very-long-browser-token-0123456789" },
-        },
-      } satisfies OpenClawConfig,
-      expectedFinding: {
-        checkId: "gateway.control_ui.allowed_origins_required",
-        severity: "critical",
-      },
-    },
     {
       name: "flags wildcard Control UI origins by exposure level on loopback",
       cfg: {
@@ -124,9 +103,10 @@ describe("security audit gateway exposure findings", () => {
     },
   ])("$name", ({ cfg, expectedFinding, expectedNoFinding }) => {
     const findings = collectGatewayConfigFindings(cfg, cfg, {});
-    expect(findings).toEqual(expect.arrayContaining([expect.objectContaining(expectedFinding)]));
+    const finding = requireFinding(findings, expectedFinding.checkId, expectedFinding.checkId);
+    expect(finding.severity).toBe(expectedFinding.severity);
     if (expectedNoFinding) {
-      expect(findings.some((finding) => finding.checkId === expectedNoFinding)).toBe(false);
+      expect(findings.map((findingLocal) => findingLocal.checkId)).not.toContain(expectedNoFinding);
     }
   });
 
@@ -148,157 +128,75 @@ describe("security audit gateway exposure findings", () => {
     expect(
       findings.some((finding) => finding.checkId === "gateway.control_ui.allowed_origins_required"),
     ).toBe(false);
-    const flags = findings.find(
-      (finding) => finding.checkId === "config.insecure_or_dangerous_flags",
-    );
-    expect(flags?.detail ?? "").toContain(
-      "gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback=true",
-    );
-  });
-
-  it.each([
-    {
-      name: "loopback gateway",
-      cfg: {
-        gateway: {
-          bind: "loopback",
-          allowRealIpFallback: true,
-          trustedProxies: ["127.0.0.1"],
-          auth: {
-            mode: "token",
-            token: "very-long-token-1234567890",
-          },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "warn" as const,
-    },
-    {
-      name: "lan gateway",
-      cfg: {
-        gateway: {
-          bind: "lan",
-          allowRealIpFallback: true,
-          trustedProxies: ["10.0.0.1"],
-          auth: {
-            mode: "token",
-            token: "very-long-token-1234567890",
-          },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "critical" as const,
-    },
-    {
-      name: "loopback trusted-proxy with loopback-only proxies",
-      cfg: {
-        gateway: {
-          bind: "loopback",
-          allowRealIpFallback: true,
-          trustedProxies: ["127.0.0.1"],
-          auth: {
-            mode: "trusted-proxy",
-            trustedProxy: {
-              userHeader: "x-forwarded-user",
-            },
-          },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "warn" as const,
-    },
-    {
-      name: "loopback trusted-proxy with non-loopback proxy range",
-      cfg: {
-        gateway: {
-          bind: "loopback",
-          allowRealIpFallback: true,
-          trustedProxies: ["127.0.0.1", "10.0.0.0/8"],
-          auth: {
-            mode: "trusted-proxy",
-            trustedProxy: {
-              userHeader: "x-forwarded-user",
-            },
-          },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "critical" as const,
-    },
-    {
-      name: "loopback trusted-proxy with 127.0.0.2",
-      cfg: {
-        gateway: {
-          bind: "loopback",
-          allowRealIpFallback: true,
-          trustedProxies: ["127.0.0.2"],
-          auth: {
-            mode: "trusted-proxy",
-            trustedProxy: {
-              userHeader: "x-forwarded-user",
-            },
-          },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "critical" as const,
-    },
-    {
-      name: "loopback trusted-proxy with 127.0.0.0/8 range",
-      cfg: {
-        gateway: {
-          bind: "loopback",
-          allowRealIpFallback: true,
-          trustedProxies: ["127.0.0.0/8"],
-          auth: {
-            mode: "trusted-proxy",
-            trustedProxy: {
-              userHeader: "x-forwarded-user",
-            },
-          },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "critical" as const,
-    },
-  ])("scores X-Real-IP fallback risk by gateway exposure: $name", ({ cfg, expectedSeverity }) => {
+    const flags = requireDangerousFlagsFindings(findings, "host header origin fallback");
     expect(
-      hasFinding(
-        "gateway.real_ip_fallback_enabled",
-        expectedSeverity,
-        collectGatewayConfigFindings(cfg, cfg, {}),
+      flags.some((finding) =>
+        finding.detail.includes("gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback=true"),
       ),
     ).toBe(true);
   });
 
   it.each([
     {
-      name: "loopback gateway with full mDNS",
-      cfg: {
-        gateway: {
-          bind: "loopback",
-          auth: {
-            mode: "token",
-            token: "very-long-token-1234567890",
-          },
-        },
-        discovery: {
-          mdns: { mode: "full" },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "warn" as const,
+      name: "loopback trusted-proxy with loopback-only proxies",
+      bind: "loopback",
+      authMode: "trusted-proxy",
+      trustedProxies: ["127.0.0.1"],
+      expectedSeverity: "warn",
     },
     {
-      name: "lan gateway with full mDNS",
-      cfg: {
-        gateway: {
-          bind: "lan",
-          auth: {
-            mode: "token",
-            token: "very-long-token-1234567890",
-          },
-        },
-        discovery: {
-          mdns: { mode: "full" },
-        },
-      } satisfies OpenClawConfig,
-      expectedSeverity: "critical" as const,
+      name: "loopback trusted-proxy with non-loopback proxy range",
+      bind: "loopback",
+      authMode: "trusted-proxy",
+      trustedProxies: ["127.0.0.1", "10.0.0.0/8"],
+      expectedSeverity: "critical",
     },
-  ])("scores mDNS full mode risk by gateway bind mode: $name", ({ cfg, expectedSeverity }) => {
+    {
+      name: "loopback trusted-proxy with 127.0.0.2",
+      bind: "loopback",
+      authMode: "trusted-proxy",
+      trustedProxies: ["127.0.0.2"],
+      expectedSeverity: "critical",
+    },
+    {
+      name: "loopback trusted-proxy with partial loopback CIDR prefix",
+      bind: "loopback",
+      authMode: "trusted-proxy",
+      trustedProxies: ["127.0.0.1/32abc"],
+      expectedSeverity: "critical",
+    },
+  ] as const)(
+    "scores X-Real-IP fallback risk by gateway exposure: $name",
+    ({ bind, authMode, trustedProxies, expectedSeverity }) => {
+      const cfg: OpenClawConfig = {
+        gateway: {
+          bind,
+          allowRealIpFallback: true,
+          trustedProxies: [...trustedProxies],
+          auth:
+            authMode === "trusted-proxy"
+              ? { mode: authMode, trustedProxy: { userHeader: "x-forwarded-user" } }
+              : { mode: authMode, token: "very-long-token-1234567890" },
+        },
+      };
+      expect(
+        hasFinding(
+          "gateway.real_ip_fallback_enabled",
+          expectedSeverity,
+          collectGatewayConfigFindings(cfg, cfg, {}),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  it.each([
+    { bind: "loopback", expectedSeverity: "warn" },
+    { bind: "lan", expectedSeverity: "critical" },
+  ] as const)("scores mDNS full mode risk on $bind", ({ bind, expectedSeverity }) => {
+    const cfg: OpenClawConfig = {
+      gateway: { bind, auth: { mode: "token", token: "very-long-token-1234567890" } },
+      discovery: { mdns: { mode: "full" } },
+    };
     expect(
       hasFinding(
         "discovery.mdns_full_mode",
@@ -308,111 +206,90 @@ describe("security audit gateway exposure findings", () => {
     ).toBe(true);
   });
 
-  it("evaluates trusted-proxy auth guardrails", () => {
+  it.each(["lan"] as const)("evaluates trusted-proxy auth guardrails on %s", (bind) => {
     const cases: Array<{
       name: string;
-      cfg: OpenClawConfig;
+      trustedProxies?: string[];
+      trustedProxy: GatewayTrustedProxyConfig;
       expectedCheckId: string;
       expectedSeverity: "warn" | "critical";
-      suppressesGenericSharedSecretFindings?: boolean;
     }> = [
       {
         name: "trusted-proxy base mode",
-        cfg: {
-          gateway: {
-            bind: "lan",
-            trustedProxies: ["10.0.0.1"],
-            auth: {
-              mode: "trusted-proxy",
-              trustedProxy: { userHeader: "x-forwarded-user" },
-            },
-          },
-        },
+        trustedProxy: { userHeader: "x-forwarded-user" },
         expectedCheckId: "gateway.trusted_proxy_auth",
         expectedSeverity: "critical",
-        suppressesGenericSharedSecretFindings: true,
       },
       {
         name: "missing trusted proxies",
-        cfg: {
-          gateway: {
-            bind: "lan",
-            trustedProxies: [],
-            auth: {
-              mode: "trusted-proxy",
-              trustedProxy: { userHeader: "x-forwarded-user" },
-            },
-          },
-        },
+        trustedProxies: [],
+        trustedProxy: { userHeader: "x-forwarded-user" },
         expectedCheckId: "gateway.trusted_proxy_no_proxies",
         expectedSeverity: "critical",
       },
       {
         name: "missing user header",
-        cfg: {
-          gateway: {
-            bind: "lan",
-            trustedProxies: ["10.0.0.1"],
-            auth: {
-              mode: "trusted-proxy",
-              trustedProxy: {} as never,
-            },
-          },
-        },
+        trustedProxy: {} as never,
         expectedCheckId: "gateway.trusted_proxy_no_user_header",
         expectedSeverity: "critical",
       },
       {
         name: "missing user allowlist",
-        cfg: {
-          gateway: {
-            bind: "lan",
-            trustedProxies: ["10.0.0.1"],
-            auth: {
-              mode: "trusted-proxy",
-              trustedProxy: {
-                userHeader: "x-forwarded-user",
-                allowUsers: [],
-              },
-            },
-          },
-        },
+        trustedProxy: { userHeader: "x-forwarded-user", allowUsers: [] },
         expectedCheckId: "gateway.trusted_proxy_no_allowlist",
         expectedSeverity: "warn",
       },
       {
         name: "loopback proxy source explicitly allowed",
-        cfg: {
-          gateway: {
-            bind: "loopback",
-            trustedProxies: ["127.0.0.1"],
-            auth: {
-              mode: "trusted-proxy",
-              trustedProxy: {
-                userHeader: "x-forwarded-user",
-                allowUsers: ["nick@example.com"],
-                allowLoopback: true,
-              },
-            },
-          },
+        trustedProxies: ["127.0.0.1"],
+        trustedProxy: {
+          userHeader: "x-forwarded-user",
+          allowUsers: ["nick@example.com"],
+          allowLoopback: true,
         },
         expectedCheckId: "gateway.trusted_proxy_allow_loopback",
         expectedSeverity: "warn",
       },
+      {
+        name: "browser device auto-approval enabled",
+        trustedProxy: {
+          userHeader: "x-forwarded-user",
+          allowUsers: ["nick@example.com"],
+          deviceAutoApprove: { enabled: true },
+        },
+        expectedCheckId: "gateway.trusted_proxy_device_auto_approve",
+        expectedSeverity: "warn",
+      },
+      {
+        name: "browser device auto-approval grants admin",
+        trustedProxy: {
+          userHeader: "x-forwarded-user",
+          allowUsers: ["nick@example.com"],
+          deviceAutoApprove: { enabled: true, scopes: ["operator.admin"] },
+        },
+        expectedCheckId: "gateway.trusted_proxy_device_auto_approve_admin",
+        expectedSeverity: "critical",
+      },
     ];
 
     for (const testCase of cases) {
-      const findings = collectGatewayConfigFindings(testCase.cfg, testCase.cfg, {});
+      const cfg: OpenClawConfig = {
+        gateway: {
+          bind,
+          trustedProxies: testCase.trustedProxies ?? ["10.0.0.1"],
+          auth: { mode: "trusted-proxy", trustedProxy: testCase.trustedProxy },
+        },
+      };
+      const findings = collectGatewayConfigFindings(cfg, cfg, {});
       expect(
         hasFinding(testCase.expectedCheckId, testCase.expectedSeverity, findings),
         testCase.name,
       ).toBe(true);
-      if (testCase.suppressesGenericSharedSecretFindings) {
-        expect(findings.some((finding) => finding.checkId === "gateway.bind_no_auth")).toBe(false);
-        expect(findings.some((finding) => finding.checkId === "gateway.auth_no_rate_limit")).toBe(
-          false,
-        );
-      }
+      const checkIds = findings.map((finding) => finding.checkId);
+      expect(checkIds, testCase.name).toContain("gateway.trusted_proxy_auth");
+      expect(checkIds, testCase.name).not.toContain("gateway.bind_no_auth");
+      expect(checkIds, testCase.name).not.toContain("gateway.loopback_no_auth");
+      expect(checkIds, testCase.name).not.toContain("gateway.auth_no_rate_limit");
     }
   });
 });

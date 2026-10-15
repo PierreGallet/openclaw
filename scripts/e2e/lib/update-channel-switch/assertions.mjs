@@ -1,19 +1,97 @@
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { legacyPackageAcceptanceCompat } from "../package-compat.mjs";
+import { readJson } from "../fixtures/common.mjs";
 
 const [command, ...args] = process.argv.slice(2);
 const controlUiHtml = "<!doctype html><title>fixture</title>\n";
 
 function usage() {
   console.error(
-    "usage: assertions.mjs <prepare-git-fixture|write-control-ui|assert-update|assert-config-channel|assert-status-kind> [...]",
+    "usage: assertions.mjs <prepare-git-fixture|write-control-ui|assert-update|assert-dry-run|assert-config-channel|assert-status-kind|assert-installed-version|assert-runtime-staging-clean|assert-dirty-exit|assert-dirty-update> [...]",
   );
   process.exit(2);
 }
 
-function readJson(file) {
-  return JSON.parse(fs.readFileSync(file, "utf8"));
+// Runs inside the bare Docker E2E image, before package dependencies are installed.
+// Keep this to the small pnpm-workspace.yaml surface the fixture mutates.
+function findTopLevelBlock(lines, key) {
+  const start = lines.findIndex((line) => new RegExp(`^${key}:\\s*(?:#.*)?$`).test(line));
+  if (start === -1) {
+    return null;
+  }
+  let end = start + 1;
+  while (end < lines.length && !/^[A-Za-z0-9_-]+:\s*/.test(lines[end])) {
+    end += 1;
+  }
+  return { start, end };
+}
+
+function parseYamlScalar(raw) {
+  const trimmed = raw.trim();
+  const withoutComment = trimmed.replace(/\s+#.*$/, "");
+  if (
+    (withoutComment.startsWith('"') && withoutComment.endsWith('"')) ||
+    (withoutComment.startsWith("'") && withoutComment.endsWith("'"))
+  ) {
+    return withoutComment.slice(1, -1);
+  }
+  return withoutComment;
+}
+
+function readWorkspacePatchedDependencies(file) {
+  const lines = fs.readFileSync(file, "utf8").split("\n");
+  const block = findTopLevelBlock(lines, "patchedDependencies");
+  if (!block) {
+    return { patches: undefined };
+  }
+
+  const patches = {};
+  for (const line of lines.slice(block.start + 1, block.end)) {
+    const match = line.match(/^\s+(.+?):\s+(.+?)\s*$/);
+    if (!match) {
+      continue;
+    }
+    patches[parseYamlScalar(match[1])] = parseYamlScalar(match[2]);
+  }
+  return { patches };
+}
+
+function writeWorkspacePnpmConfig(file, keptPatches) {
+  const original = fs.readFileSync(file, "utf8");
+  const hadTrailingNewline = original.endsWith("\n");
+  const lines = original.replace(/\n$/, "").split("\n");
+  const patchBlock = findTopLevelBlock(lines, "patchedDependencies");
+
+  if (patchBlock) {
+    const nextLines = [];
+    nextLines.push(...lines.slice(0, patchBlock.start));
+    if (Object.keys(keptPatches).length > 0) {
+      nextLines.push("patchedDependencies:");
+      for (const [dependency, patchFile] of Object.entries(keptPatches)) {
+        nextLines.push(`  ${JSON.stringify(dependency)}: ${JSON.stringify(patchFile)}`);
+      }
+    }
+    nextLines.push(...lines.slice(patchBlock.end));
+    lines.length = 0;
+    lines.push(...nextLines);
+  }
+
+  for (const [key, value] of [
+    ["allowUnusedPatches", true],
+    ["minimumReleaseAge", 0],
+  ]) {
+    const index = lines.findIndex((line) => new RegExp(`^${key}:\\s*`).test(line));
+    const setting = `${key}: ${value}`;
+    if (index === -1) {
+      lines.push(setting);
+    } else {
+      lines[index] = setting;
+    }
+  }
+
+  fs.writeFileSync(file, `${lines.join("\n")}${hadTrailingNewline ? "\n" : ""}`);
 }
 
 function writeControlUi(root) {
@@ -25,36 +103,59 @@ function writeControlUi(root) {
 function prepareGitFixture(root) {
   const packageJsonPath = path.join(root, "package.json");
   const packageJson = readJson(packageJsonPath);
-  packageJson.pnpm = { ...packageJson.pnpm, allowUnusedPatches: true };
-  const patches = packageJson.pnpm.patchedDependencies;
+  const pnpmWorkspacePath = path.join(root, "pnpm-workspace.yaml");
+  const workspaceConfig = fs.existsSync(pnpmWorkspacePath)
+    ? readWorkspacePatchedDependencies(pnpmWorkspacePath)
+    : undefined;
+  const pnpmConfig = workspaceConfig ? {} : { ...packageJson.pnpm };
+  const patches = workspaceConfig?.patches ?? pnpmConfig.patchedDependencies;
+  const keptPatches = {};
   if (patches && typeof patches === "object" && !Array.isArray(patches)) {
-    const kept = {};
     const missing = [];
     for (const [dependency, patchFile] of Object.entries(patches)) {
       const exists =
         typeof patchFile === "string" &&
         fs.existsSync(path.resolve(path.dirname(packageJsonPath), patchFile));
       if (exists) {
-        kept[dependency] = patchFile;
+        keptPatches[dependency] = patchFile;
       } else {
         missing.push(`${dependency} -> ${String(patchFile)}`);
       }
     }
-    if (missing.length > 0 && !legacyPackageAcceptanceCompat(packageJson.version)) {
+    if (missing.length > 0) {
       throw new Error(
-        `package ${packageJson.version} has missing pnpm.patchedDependencies in package fixture: ${missing.join(", ")}`,
+        `package ${packageJson.version} has missing pnpm patchedDependencies in package fixture: ${missing.join(", ")}`,
       );
     }
-    if (Object.keys(kept).length > 0) {
-      packageJson.pnpm.patchedDependencies = kept;
+  }
+  if (workspaceConfig) {
+    writeWorkspacePnpmConfig(pnpmWorkspacePath, keptPatches);
+  } else {
+    pnpmConfig.allowUnusedPatches = true;
+    pnpmConfig.minimumReleaseAge = 0;
+    if (Object.keys(keptPatches).length > 0) {
+      pnpmConfig.patchedDependencies = keptPatches;
     } else {
-      delete packageJson.pnpm.patchedDependencies;
+      delete pnpmConfig.patchedDependencies;
     }
+    packageJson.pnpm = pnpmConfig;
   }
   const fixtureUiBuildSource = `const fs=require("node:fs");fs.mkdirSync("dist/control-ui",{recursive:true});fs.writeFileSync("dist/control-ui/index.html",${JSON.stringify(controlUiHtml)})`;
+  const fixtureBuildPath = path.join(root, ".openclaw-fixture", "build.mjs");
+  fs.mkdirSync(path.dirname(fixtureBuildPath), { recursive: true });
+  fs.copyFileSync(new URL("./build.mjs", import.meta.url), fixtureBuildPath);
+  fs.copyFileSync(
+    path.join(root, "dist", "build-info.json"),
+    path.join(root, ".openclaw-fixture", "build-info.json"),
+  );
+  // The tarball omits source .gitignore rules; build metadata must remain generated.
+  fs.appendFileSync(
+    path.join(root, ".gitignore"),
+    "\n/dist/build-info.json\n/dist/.buildstamp\n/dist/.runtime-postbuildstamp\n",
+  );
   packageJson.scripts = {
     ...packageJson.scripts,
-    build: 'node -e "console.log(\\"fixture build skipped\\")"',
+    build: "node .openclaw-fixture/build.mjs",
     lint: 'node -e "console.log(\\"fixture lint skipped\\")"',
     "ui:build": `node -e ${JSON.stringify(fixtureUiBuildSource)}`,
   };
@@ -70,8 +171,8 @@ function assertUpdate(channel) {
   if (channel === "dev" && payload.mode !== "git") {
     throw new Error(`expected dev update mode git, got ${payload.mode}`);
   }
-  if (channel === "stable" && !["npm", "pnpm", "bun"].includes(payload.mode)) {
-    throw new Error(`expected package-manager mode after stable switch, got ${payload.mode}`);
+  if (["stable", "beta"].includes(channel) && !["npm", "pnpm", "bun"].includes(payload.mode)) {
+    throw new Error(`expected package-manager mode after ${channel} switch, got ${payload.mode}`);
   }
   if (payload.postUpdate?.plugins && payload.postUpdate.plugins.status !== "ok") {
     throw new Error(
@@ -80,20 +181,57 @@ function assertUpdate(channel) {
   }
 }
 
+function assertRuntimeStagingClean(root) {
+  const pending = [root];
+  const leftovers = [];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const fullPath = path.join(directory, entry.name);
+      if (/\.openclaw-update-.*\.tmp$/u.test(entry.name)) {
+        leftovers.push(path.relative(root, fullPath));
+      } else if (entry.isDirectory() && entry.name !== ".git") {
+        pending.push(fullPath);
+      }
+    }
+  }
+  assert.deepEqual(leftovers, [], "successful update retained runtime staging entries");
+}
+
+function assertDirtyUpdate(root, expectedHead) {
+  const payload = JSON.parse(process.env.UPDATE_JSON ?? "");
+  assert.equal(payload.reason, "dirty", "ordinary untracked input must block admission");
+  assert.equal(
+    execFileSync("git", ["-C", root, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+    expectedHead,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(root, "operator-update-notes.tmp"), "utf8"),
+    "retain user notes\n",
+  );
+  assertRuntimeStagingClean(root);
+}
+
 function assertConfigChannel(channel) {
   const config = readJson(path.join(process.env.HOME, ".openclaw", "openclaw.json"));
   if (config.update?.channel === channel) {
     return;
   }
-  if (process.env.OPENCLAW_PACKAGE_ACCEPTANCE_LEGACY_COMPAT === "1") {
-    console.log(
-      `legacy package did not persist update.channel ${channel}; got ${JSON.stringify(config.update?.channel)}`,
-    );
-    return;
-  }
   throw new Error(
     `expected persisted update.channel ${channel}, got ${JSON.stringify(config.update?.channel)}`,
   );
+}
+
+function assertDryRun(kind, channel) {
+  const preview = JSON.parse(process.env.UPDATE_JSON ?? "");
+  assert.equal(preview.dryRun, true);
+  assert.equal(preview.installKind, "package");
+  assert.equal(preview.storedChannel, "dev");
+  assert.equal(preview.effectiveChannel, channel);
+  assert.equal(preview.updateInstallKind, kind);
+  assert.equal(preview.mode, kind === "git" ? "git" : "npm");
+  assert.equal(preview.switchToGit, kind === "git");
+  assert.equal(preview.switchToPackage, false);
 }
 
 function assertStatusKind(kind) {
@@ -103,22 +241,36 @@ function assertStatusKind(kind) {
   }
 }
 
-switch (command) {
-  case "prepare-git-fixture":
-    prepareGitFixture(args[0] ?? "/tmp/openclaw-git");
-    break;
-  case "write-control-ui":
-    writeControlUi(args[0] ?? "/tmp/openclaw-git");
-    break;
-  case "assert-update":
-    assertUpdate(args[0]);
-    break;
-  case "assert-config-channel":
-    assertConfigChannel(args[0]);
-    break;
-  case "assert-status-kind":
-    assertStatusKind(args[0]);
-    break;
-  default:
-    usage();
+function assertInstalledVersion(root, expectedVersion) {
+  const manifest = readJson(path.join(root, "package.json"));
+  if (manifest.version !== expectedVersion) {
+    throw new Error(
+      `expected installed openclaw ${expectedVersion}, got ${String(manifest.version)}`,
+    );
+  }
 }
+
+function assertDirtyExit(statusRaw) {
+  const status = Number(statusRaw);
+  if (status === 1) {
+    return;
+  }
+  throw new Error(`unexpected dirty-worktree update exit ${statusRaw}; expected 1`);
+}
+
+const commands = {
+  "prepare-git-fixture": (root = "/tmp/openclaw-git") => prepareGitFixture(root),
+  "write-control-ui": (root = "/tmp/openclaw-git") => writeControlUi(root),
+  "assert-update": assertUpdate,
+  "assert-runtime-staging-clean": assertRuntimeStagingClean,
+  "assert-dirty-update": assertDirtyUpdate,
+  "assert-dirty-exit": assertDirtyExit,
+  "assert-config-channel": assertConfigChannel,
+  "assert-dry-run": assertDryRun,
+  "assert-status-kind": assertStatusKind,
+  "assert-installed-version": assertInstalledVersion,
+};
+if (!Object.hasOwn(commands, command)) {
+  usage();
+}
+commands[command](...args);

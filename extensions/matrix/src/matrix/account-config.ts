@@ -1,11 +1,10 @@
-import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
-import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/account-id";
+import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import {
   listConfiguredAccountIds,
   resolveMergedAccountConfig,
   resolveNormalizedAccountEntry,
 } from "openclaw/plugin-sdk/account-resolution-runtime";
-import { hasConfiguredSecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
+import { hasConfiguredSecretInput } from "openclaw/plugin-sdk/secret-input";
 import type { CoreConfig, MatrixAccountConfig, MatrixConfig } from "../types.js";
 
 type MatrixRoomEntries = Record<string, NonNullable<MatrixConfig["groups"]>[string]>;
@@ -121,7 +120,7 @@ export function resolveMatrixAccountConfig(params: {
       | undefined,
     accountId,
     normalizeAccountId,
-    nestedObjectKeys: ["dm", "actions", "execApprovals"],
+    nestedObjectKeys: ["dm", "actions", "execApprovals", "botLoopProtection"],
   });
   const accountConfig = findMatrixAccountConfig(params.cfg, accountId);
   const groups = mergeMatrixRoomEntries(

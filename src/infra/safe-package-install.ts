@@ -1,5 +1,5 @@
 import type { NpmProjectInstallEnvOptions } from "./npm-install-env.js";
-import { createNpmProjectInstallEnv } from "./npm-install-env.js";
+import { createNpmProjectInstallEnv, findExplicitNpmConfigKeys } from "./npm-install-env.js";
 
 type SafeNpmInstallEnvOptions = NpmProjectInstallEnvOptions & {
   ignoreWorkspaces?: boolean;
@@ -10,12 +10,17 @@ type SafeNpmInstallEnvOptions = NpmProjectInstallEnvOptions & {
 
 type SafeNpmInstallArgsOptions = {
   ignoreWorkspaces?: boolean;
-  loglevel?: "error" | "silent";
+  legacyPeerDeps?: boolean;
   noAudit?: boolean;
   noFund?: boolean;
-  omitDev?: boolean;
+  omitPeer?: boolean;
 };
 
+/**
+ * Creates a project-local npm install environment for untrusted package dirs.
+ * It disables lifecycle scripts, global/workspace leakage, prompts, and noisy
+ * npm features while preserving caller-supplied process env values.
+ */
 export function createSafeNpmInstallEnv(
   env: NodeJS.ProcessEnv,
   options: SafeNpmInstallEnvOptions = {},
@@ -27,10 +32,11 @@ export function createSafeNpmInstallEnv(
     npm_config_audit: "false",
     npm_config_fund: "false",
     npm_config_ignore_scripts: "true",
+    npm_config_legacy_peer_deps: options.legacyPeerDeps ? "true" : "false",
     npm_config_package_lock: options.packageLock === true ? "true" : "false",
+    npm_config_strict_peer_deps: "false",
     ...(options.packageLock === true ? { npm_config_save: "true" } : {}),
     ...(options.ignoreWorkspaces ? { npm_config_workspaces: "false" } : {}),
-    ...(options.legacyPeerDeps ? { npm_config_legacy_peer_deps: "true" } : {}),
   };
   if (options.quiet) {
     Object.assign(nextEnv, {
@@ -39,14 +45,25 @@ export function createSafeNpmInstallEnv(
       npm_config_yes: "true",
     });
   }
+  // npm 12 changed these defaults from all to none. Preserve npm 11 behavior
+  // only when the operator has not set a policy through env or npmrc.
+  const sourcePolicies = findExplicitNpmConfigKeys(nextEnv, ["allow-git", "allow-remote"], options);
+  if (!sourcePolicies.has("allow-git")) {
+    nextEnv.npm_config_allow_git = "all";
+  }
+  if (!sourcePolicies.has("allow-remote")) {
+    nextEnv.npm_config_allow_remote = "all";
+  }
   return nextEnv;
 }
 
 export function createSafeNpmInstallArgs(options: SafeNpmInstallArgsOptions = {}): string[] {
   return [
     "install",
-    ...(options.omitDev ? ["--omit=dev"] : []),
-    ...(options.loglevel ? [`--loglevel=${options.loglevel}`] : []),
+    "--omit=dev",
+    ...(options.omitPeer ? ["--omit=peer"] : []),
+    ...(options.legacyPeerDeps ? ["--legacy-peer-deps"] : []),
+    "--loglevel=error",
     "--ignore-scripts",
     ...(options.ignoreWorkspaces ? ["--workspaces=false"] : []),
     ...(options.noAudit ? ["--no-audit"] : []),

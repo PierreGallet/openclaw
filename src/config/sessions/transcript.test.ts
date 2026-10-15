@@ -1,184 +1,1101 @@
+// Transcript tests cover session transcript persistence and formatting.
 import fs from "node:fs";
-import { describe, expect, it, vi } from "vitest";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { repairToolUseResultPairing } from "../../agents/session-transcript-repair.js";
+import { normalizeLegacySessionEntryDelivery } from "../../infra/state-migrations.legacy-session-store.js";
+import { recordDeliveredCommandExchange } from "../../plugin-sdk/session-transcript-runtime.js";
 import * as transcriptEvents from "../../sessions/transcript-events.js";
+import type { InternalSessionTranscriptUpdate } from "../../sessions/transcript-events.js";
+import {
+  CRON_DIRECT_DELIVERY_CONTEXT_KIND,
+  OPENCLAW_TRANSCRIPT_ARTIFACT_API,
+  isTranscriptOnlyOpenClawAssistantMessage,
+} from "../../shared/transcript-only-openclaw-assistant.js";
+import { deleteTestEnvValue, setTestEnvValue } from "../../test-utils/env.js";
+import { useSessionStoreTempDirs } from "../../test-utils/session-state-cleanup.js";
+import { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot } from "../runtime-snapshot.js";
 import { resolveSessionTranscriptPathInDir } from "./paths.js";
+import {
+  loadTranscriptEvents,
+  appendTranscriptEvent,
+  loadSessionEntry,
+  persistSessionTranscriptTurn,
+  readLatestTranscriptAssistantText,
+  replaceSessionEntry,
+  updateSessionEntry,
+} from "./session-accessor.js";
+import * as activeTranscriptEvents from "./session-accessor.sqlite-active-events.js";
+import { replaceSessionEntrySync } from "./session-accessor.sqlite-entry.js";
+import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.test-support.js";
+import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { waitForSessionTranscriptIndexReconcile } from "./session-transcript-reconcile.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
-import { appendSessionTranscriptMessage } from "./transcript-append.js";
+import {
+  createExactAssistantMessage,
+  type ExactAssistantMessage,
+} from "./transcript-message.test-support.js";
+import { registerRecentTranscriptTextSnapshotTests } from "./transcript-recent-text.test-support.js";
+import {
+  bindOwnedSessionTranscriptWrites,
+  runWithOwnedSessionTranscriptWrite,
+  withOwnedSessionTranscriptWrites,
+} from "./transcript-write-context.js";
 import {
   appendAssistantMessageToSessionTranscript,
   appendExactAssistantMessageToSessionTranscript,
+  readLatestAssistantTextFromSessionTranscript,
+  readRecentUserAssistantTextForSession,
 } from "./transcript.js";
+import type { InternalSessionEntry, SessionEntry } from "./types.js";
+
+type SessionEntryFixture = Partial<SessionEntry> & { channel?: string };
+
+const sessionDirs = useSessionStoreTempDirs(
+  (cleanup) =>
+    afterAll(async () => {
+      await cleanup();
+      clearRuntimeConfigSnapshot();
+    }),
+  "transcript-test-",
+);
 
 describe("appendAssistantMessageToSessionTranscript", () => {
-  const fixture = useTempSessionsFixture("transcript-test-");
-  const sessionId = "test-session-id";
-  const sessionKey = "test-session";
-  type ExactAssistantMessage = Parameters<
-    typeof appendExactAssistantMessageToSessionTranscript
-  >[0]["message"];
+  beforeAll(async () => {
+    const tempDir = sessionDirs.make();
+    setRuntimeConfigSnapshot({});
+    const sessionsDir = path.join(tempDir, "agents", "main", "sessions");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    const storePath = path.join(sessionsDir, "sessions.json");
+    await replaceSessionEntry(
+      { sessionKey: "agent:main:warm", storePath },
+      { sessionId: "warm-session", chatType: "direct", updatedAt: 1 },
+    );
+    await appendAssistantMessageToSessionTranscript({
+      agentId: "main",
+      sessionKey: "agent:main:warm",
+      text: "warm",
+      storePath,
+    });
+  });
 
-  function writeTranscriptStore() {
+  const fixture = useTempSessionsFixture("transcript-test-");
+  beforeEach(() => setRuntimeConfigSnapshot({}));
+  const sessionId = "test-session-id";
+  const sessionKey = "agent:main:test-session";
+  function createFixtureTranscriptScope() {
+    return { agentId: "main", sessionId, sessionKey, storePath: fixture.storePath() };
+  }
+  type BeforeMessageWriteParams = Parameters<
+    NonNullable<
+      Parameters<typeof appendExactAssistantMessageToSessionTranscript>[0]["beforeMessageWrite"]
+    >
+  >[0];
+  type TranscriptRepairMessage = Parameters<typeof repairToolUseResultPairing>[0][number];
+  type TranscriptUpdateEmitterSpy = {
+    mock: {
+      calls: [string | InternalSessionTranscriptUpdate][];
+    };
+  };
+
+  function writeLegacyTranscriptFixture(params: {
+    transcriptPath: string;
+    message: { role: "user"; content: string; timestamp: number };
+  }) {
+    const entries = [
+      {
+        type: "session",
+        version: 4,
+        id: sessionId,
+        timestamp: new Date(0).toISOString(),
+        cwd: fixture.sessionsDir(),
+      },
+      {
+        type: "message",
+        id: "legacy-message",
+        parentId: null,
+        timestamp: new Date(params.message.timestamp).toISOString(),
+        message: params.message,
+      },
+    ];
     fs.writeFileSync(
-      fixture.storePath(),
-      JSON.stringify({
-        [sessionKey]: {
-          sessionId,
-          chatType: "direct",
-          channel: "discord",
-        },
-      }),
-      "utf-8",
+      params.transcriptPath,
+      `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     );
   }
 
-  function createExactAssistantMessage(params: {
-    text?: string;
-    content?: ExactAssistantMessage["content"];
-    provider?: string;
-    model?: string;
-  }): ExactAssistantMessage {
-    return {
-      role: "assistant",
-      content: params.content ?? [{ type: "text", text: params.text ?? "" }],
-      api: "openai-responses",
-      provider: params.provider ?? "codex",
-      model: params.model ?? "gpt-5.4",
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: "stop",
-      timestamp: Date.now(),
-    };
+  async function writeTranscriptStore(entry: SessionEntryFixture = {}) {
+    await replaceSessionEntry(
+      { agentId: "main", sessionKey, storePath: fixture.storePath() },
+      normalizeLegacySessionEntryDelivery({
+        sessionId,
+        chatType: "direct",
+        updatedAt: 1,
+        channel: "discord",
+        ...entry,
+      } as SessionEntry),
+    );
   }
 
-  it("creates transcript file and appends message for valid session", async () => {
-    writeTranscriptStore();
+  async function writeTranscriptSessionEntry(params: {
+    entry: SessionEntryFixture & Pick<SessionEntry, "sessionId">;
+    sessionKey: string;
+  }) {
+    await replaceSessionEntry(
+      { agentId: "main", sessionKey: params.sessionKey, storePath: fixture.storePath() },
+      normalizeLegacySessionEntryDelivery({ updatedAt: 1, ...params.entry } as SessionEntry),
+    );
+  }
+
+  function requireTranscriptUpdateCall(
+    spy: TranscriptUpdateEmitterSpy,
+  ): InternalSessionTranscriptUpdate {
+    const call = spy.mock.calls[0];
+    if (!call) {
+      throw new Error("expected transcript update event");
+    }
+    const event = call[0];
+    if (typeof event === "string") {
+      throw new Error("expected structured transcript update event");
+    }
+    return event;
+  }
+
+  async function loadFixtureMessages(
+    override: {
+      agentId?: string;
+      sessionId?: string;
+      sessionKey?: string;
+      storePath?: string;
+    } = {},
+  ): Promise<Array<{ message?: unknown }>> {
+    return (await loadTranscriptEvents({
+      agentId: override.agentId ?? "main",
+      sessionId: override.sessionId ?? sessionId,
+      sessionKey: override.sessionKey ?? sessionKey,
+      storePath: override.storePath ?? fixture.storePath(),
+    })) as Array<{ message?: unknown }>;
+  }
+
+  it("appends replayable, redacted command exchanges exactly once without changing prior rows", async () => {
+    await writeTranscriptStore();
+    await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      text: "Earlier reply",
+    });
+    const before = await loadFixtureMessages();
+    const params = {
+      sessionKey,
+      storePath: fixture.storePath(),
+      commandText: "/login openai",
+      commandId: "login-message",
+      replyText: "Sign in at https://example.test/device?state=secret-state\nCode: EXAMPLE-CODE",
+      replyId: "device-code",
+    };
+    expect((await recordDeliveredCommandExchange(params)).ok).toBe(true);
+    expect((await recordDeliveredCommandExchange(params)).ok).toBe(true);
+    expect(
+      (
+        await recordDeliveredCommandExchange({
+          ...params,
+          replyId: "complete",
+          replyText: "Login complete.",
+        })
+      ).ok,
+    ).toBe(true);
+    const after = await loadFixtureMessages();
+    expect(after.slice(0, before.length)).toEqual(before);
+    const messages = after.slice(before.length).map((event) => event.message);
+    expect(messages).toEqual([
+      expect.objectContaining({ role: "user", content: [{ type: "text", text: "/login openai" }] }),
+      expect.objectContaining({
+        role: "assistant",
+        content: [
+          { type: "text", text: "Sign in at [login URL redacted]\nCode: [login code redacted]" },
+        ],
+      }),
+      expect.objectContaining({
+        role: "assistant",
+        content: [{ type: "text", text: "Login complete." }],
+      }),
+    ]);
+    expect(messages.some(isTranscriptOnlyOpenClawAssistantMessage)).toBe(false);
+    expect(JSON.stringify(after)).not.toContain("EXAMPLE-CODE");
+    expect(JSON.stringify(after)).not.toContain("secret-state");
+  });
+
+  it.each([
+    {
+      commandText: "/pair",
+      replyText: Buffer.from(
+        JSON.stringify({ url: "wss://example.test", bootstrapToken: "secret-pairing-token" }),
+      ).toString("base64url"),
+      expected: "[pairing code redacted]",
+    },
+    {
+      commandText: "/status",
+      replyText:
+        "Verify: https://example.test/auth?state=secret-state\nHelp: https://example.test/help",
+      expected: "Verify: [login URL redacted]\nHelp: https://example.test/help",
+    },
+  ])("redacts credential-bearing $commandText replies before storage", async (testCase) => {
+    await writeTranscriptStore();
+    expect(
+      (
+        await recordDeliveredCommandExchange({
+          ...testCase,
+          sessionKey,
+          storePath: fixture.storePath(),
+          commandId: "secret-command",
+          replyId: "reply",
+        })
+      ).ok,
+    ).toBe(true);
+    const events = await loadFixtureMessages();
+    expect(events.at(-1)?.message).toEqual(
+      expect.objectContaining({
+        role: "assistant",
+        content: [{ type: "text", text: testCase.expected }],
+      }),
+    );
+    expect(JSON.stringify(events)).not.toContain(testCase.replyText);
+  });
+
+  it.each([
+    [
+      '/debug set gateway.auth.token="synthetic-private-token"',
+      '/debug set gateway.auth.token="__OPENCLAW_REDACTED__"',
+    ],
+    [
+      '/config set gateway.auth={"mode":"token","token":"synthetic-private-token"}',
+      '/config set gateway.auth={"mode":"token","token":"__OPENCLAW_REDACTED__"}',
+    ],
+    [
+      "/debug set channels.telegram.botToken=synthetic-private-token",
+      '/debug set channels.telegram.botToken="__OPENCLAW_REDACTED__"',
+    ],
+    [
+      '/debug: set models.providers.local.headers.X-Service-Access="q7m2n9v4p6r8x5"',
+      '/debug set models.providers.local.headers.X-Service-Access="__OPENCLAW_REDACTED__"',
+    ],
+    [
+      '/config@OpenClawBot: set models.providers.local.headers.X-Service-Access="q7m2n9v4p6r8x5"',
+      '/config set models.providers.local.headers.X-Service-Access="__OPENCLAW_REDACTED__"',
+    ],
+    ['/debug set logging.level="debug"', '/debug set logging.level="debug"'],
+  ])("redacts configuration input %s before recording", async (commandText, expected) => {
+    await writeTranscriptStore();
+    const result = await recordDeliveredCommandExchange({
+      sessionKey,
+      storePath: fixture.storePath(),
+      commandText,
+      replyText: "Configuration updated.",
+      commandId: "config-command",
+      replyId: "reply",
+    });
+    expect(result.ok).toBe(true);
+    const events = await loadFixtureMessages();
+    expect(events.at(-2)?.message).toMatchObject({
+      role: "user",
+      content: [{ type: "text", text: expected }],
+    });
+    expect(JSON.stringify(events)).not.toContain("synthetic-private-token");
+    expect(JSON.stringify(events)).not.toContain("q7m2n9v4p6r8x5");
+  });
+
+  it.each(["/btw hello", "/side hello", "/btw: hello", "/side@OpenClawBot: hello"])(
+    "keeps %s ephemeral",
+    async (commandText) => {
+      await writeTranscriptStore();
+      const before = await loadFixtureMessages();
+      await recordDeliveredCommandExchange({
+        sessionKey,
+        storePath: fixture.storePath(),
+        commandText,
+        replyText: "Side answer",
+        commandId: "side-command",
+        replyId: "reply",
+      });
+      expect(await loadFixtureMessages()).toEqual(before);
+    },
+  );
+
+  it("uses configured session.store when storePath is omitted", async () => {
+    const tempDir = sessionDirs.make();
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    try {
+      setTestEnvValue("OPENCLAW_STATE_DIR", path.join(tempDir, "default-state"));
+      const sessionsDir = path.join(tempDir, "configured", "sessions");
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      const storePath = path.join(sessionsDir, "sessions.json");
+      setRuntimeConfigSnapshot({ session: { store: storePath } });
+      const configuredSessionKey = "agent:main:configured-store";
+      await replaceSessionEntry(
+        { agentId: "main", sessionKey: configuredSessionKey, storePath },
+        {
+          sessionId: "configured-session-id",
+          chatType: "direct",
+          updatedAt: 1,
+        },
+      );
+
+      const result = await appendAssistantMessageToSessionTranscript({
+        agentId: "main",
+        sessionKey: configuredSessionKey,
+        text: "mirrored configured store reply",
+        config: { session: { store: storePath } },
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        throw new Error(result.reason);
+      }
+      expect(result.target).toEqual({
+        agentId: "main",
+        sessionId: "configured-session-id",
+        sessionKey: configuredSessionKey,
+        storePath,
+      });
+      await expect(
+        loadTranscriptEvents({
+          agentId: "main",
+          sessionId: "configured-session-id",
+          sessionKey: configuredSessionKey,
+          storePath,
+        }),
+      ).resolves.toContainEqual(
+        expect.objectContaining({
+          message: expect.objectContaining({
+            role: "assistant",
+            content: [{ type: "text", text: "mirrored configured store reply" }],
+          }),
+        }),
+      );
+    } finally {
+      if (previousStateDir === undefined) {
+        deleteTestEnvValue("OPENCLAW_STATE_DIR");
+      } else {
+        setTestEnvValue("OPENCLAW_STATE_DIR", previousStateDir);
+      }
+    }
+  });
+
+  it("uses the session key agent for configured session.store templates", async () => {
+    const tempDir = sessionDirs.make();
+    const previousStateDir = process.env.OPENCLAW_STATE_DIR;
+    const emitSpy = vi.spyOn(transcriptEvents, "emitSessionTranscriptUpdate");
+    try {
+      setTestEnvValue("OPENCLAW_STATE_DIR", path.join(tempDir, "default-state"));
+      const storeTemplate = path.join(tempDir, "agents", "{agentId}", "sessions", "sessions.json");
+      const sessionsDir = path.join(tempDir, "agents", "worker", "sessions");
+      fs.mkdirSync(sessionsDir, { recursive: true });
+      const storePath = path.join(sessionsDir, "sessions.json");
+      setRuntimeConfigSnapshot({ session: { store: storeTemplate } });
+      const configuredSessionKey = "agent:worker:configured-store";
+      await replaceSessionEntry(
+        { agentId: "worker", sessionKey: configuredSessionKey, storePath },
+        {
+          sessionId: "worker-session-id",
+          chatType: "direct",
+          updatedAt: 1,
+        },
+      );
+      const beforeMessageWrite = vi.fn(({ message }: BeforeMessageWriteParams) => message);
+
+      const result = await appendAssistantMessageToSessionTranscript({
+        sessionKey: configuredSessionKey,
+        text: "mirrored worker store reply",
+        config: { session: { store: storeTemplate } },
+        beforeMessageWrite,
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        throw new Error(result.reason);
+      }
+      expect(result.target).toEqual({
+        agentId: "worker",
+        sessionId: "worker-session-id",
+        sessionKey: configuredSessionKey,
+        storePath,
+      });
+      await expect(
+        loadTranscriptEvents({
+          agentId: "worker",
+          sessionId: "worker-session-id",
+          sessionKey: configuredSessionKey,
+          storePath,
+        }),
+      ).resolves.toContainEqual(
+        expect.objectContaining({
+          message: expect.objectContaining({
+            role: "assistant",
+            content: [{ type: "text", text: "mirrored worker store reply" }],
+          }),
+        }),
+      );
+      expect(beforeMessageWrite).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentId: "worker",
+          sessionKey: configuredSessionKey,
+        }),
+      );
+      const event = requireTranscriptUpdateCall(emitSpy);
+      expect(event.agentId).toBe("worker");
+      expect(event.sessionKey).toBe(configuredSessionKey);
+    } finally {
+      emitSpy.mockRestore();
+      if (previousStateDir === undefined) {
+        deleteTestEnvValue("OPENCLAW_STATE_DIR");
+      } else {
+        setTestEnvValue("OPENCLAW_STATE_DIR", previousStateDir);
+      }
+    }
+  });
+
+  it("persists reply text alongside media names in SQLite", async () => {
+    await writeTranscriptStore();
 
     const result = await appendAssistantMessageToSessionTranscript({
       sessionKey,
-      text: "Hello from delivery mirror!",
+      text: "Revenue fell 12% quarter over quarter.",
+      mediaUrls: ["https://example.com/files/chart-q3.png?token=secret"],
+      storePath: fixture.storePath(),
+    });
+
+    expect(result.ok).toBe(true);
+    const events = await loadFixtureMessages();
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        message: expect.objectContaining({
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "Revenue fell 12% quarter over quarter.\nchart-q3.png",
+            },
+          ],
+        }),
+      }),
+    );
+  });
+
+  it("does not advance the registry marker for duplicate delivery mirror replays", async () => {
+    const updatedAt = Date.parse("2026-05-18T10:00:00.000Z");
+    const firstAppendAt = Date.parse("2026-05-18T10:05:00.000Z");
+    const duplicateReplayAt = Date.parse("2026-05-18T10:10:00.000Z");
+    const sessionFile = "duplicate-marker.jsonl";
+    await writeTranscriptStore({ sessionFile, updatedAt, status: "done" });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(firstAppendAt);
+      const first = await appendAssistantMessageToSessionTranscript({
+        sessionKey,
+        text: "Replay-safe marker",
+        storePath: fixture.storePath(),
+      });
+      expect(first.ok).toBe(true);
+
+      vi.setSystemTime(duplicateReplayAt);
+      const duplicate = await appendAssistantMessageToSessionTranscript({
+        sessionKey,
+        text: "Replay-safe marker",
+        storePath: fixture.storePath(),
+      });
+      expect(duplicate.ok).toBe(true);
+
+      const saved = loadSessionEntry({
+        agentId: "main",
+        sessionKey,
+        storePath: fixture.storePath(),
+      });
+      expect(saved?.updatedAt).toBe(firstAppendAt);
+      if (first.ok && duplicate.ok) {
+        expect(duplicate.messageId).toBe(first.messageId);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses spawned cwd when creating a missing transcript header", async () => {
+    const taskCwd = path.join(fixture.sessionsDir(), "task-repo");
+    fs.mkdirSync(taskCwd, { recursive: true });
+    await writeTranscriptStore({ spawnedCwd: taskCwd });
+
+    const result = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Hello from task cwd!",
       storePath: fixture.storePath(),
     });
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(fs.existsSync(result.sessionFile)).toBe(true);
-      const sessionFileMode = fs.statSync(result.sessionFile).mode & 0o777;
-      if (process.platform !== "win32") {
-        expect(sessionFileMode).toBe(0o600);
-      }
-
-      const lines = fs.readFileSync(result.sessionFile, "utf-8").trim().split("\n");
-      expect(lines.length).toBe(2);
-
-      const header = JSON.parse(lines[0]);
-      expect(header.type).toBe("session");
-      expect(header.id).toBe(sessionId);
-
-      const messageLine = JSON.parse(lines[1]);
-      expect(messageLine.type).toBe("message");
-      expect(messageLine.message.role).toBe("assistant");
-      expect(messageLine.message.content[0].type).toBe("text");
-      expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
+      const events = await loadFixtureMessages();
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          cwd: taskCwd,
+          type: "session",
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          message: expect.objectContaining({
+            role: "assistant",
+            content: [{ type: "text", text: "Hello from task cwd!" }],
+          }),
+        }),
+      );
     }
   });
 
-  it("emits transcript update events for delivery mirrors", async () => {
-    const store = {
-      [sessionKey]: {
-        sessionId,
-        chatType: "direct",
-        channel: "discord",
-      },
-    };
-    fs.writeFileSync(fixture.storePath(), JSON.stringify(store), "utf-8");
-    const emitSpy = vi.spyOn(transcriptEvents, "emitSessionTranscriptUpdate");
+  it("runs matching owned transcript appends through the active write context", async () => {
+    await writeTranscriptStore();
+    const sessionFile = `sqlite:main:${sessionId}:${fixture.storePath()}`;
+    const events: string[] = [];
 
-    await appendAssistantMessageToSessionTranscript({
-      sessionKey,
-      text: "Hello from delivery mirror!",
-      storePath: fixture.storePath(),
-    });
-
-    const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
-    expect(emitSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
+    const result = await withOwnedSessionTranscriptWrites(
+      {
         sessionFile,
         sessionKey,
-        messageId: expect.any(String),
-        message: expect.objectContaining({
-          role: "assistant",
-          provider: "openclaw",
-          model: "delivery-mirror",
-          content: [{ type: "text", text: "Hello from delivery mirror!" }],
+        sessionTarget: {
+          agentId: "main",
+          sessionId,
+          sessionKey,
+          storePath: fixture.storePath(),
+        },
+        withTranscriptWrite: async (run) => {
+          events.push("owned-write");
+          return await run();
+        },
+      },
+      async () =>
+        await appendAssistantMessageToSessionTranscript({
+          sessionKey,
+          text: "Hello under lock",
+          storePath: fixture.storePath(),
         }),
-      }),
     );
-    emitSpy.mockRestore();
+
+    expect(result.ok).toBe(true);
+    expect(events).toEqual(["owned-write"]);
   });
 
-  it("does not append a duplicate delivery mirror for the same idempotency key", async () => {
-    writeTranscriptStore();
+  it("does not reuse an owned write context for a different concrete transcript file", async () => {
+    const oldSessionFile = resolveSessionTranscriptPathInDir("old-session", fixture.sessionsDir());
+    const nextSessionFile = resolveSessionTranscriptPathInDir(
+      "next-session",
+      fixture.sessionsDir(),
+    );
+    const events: string[] = [];
 
-    await appendAssistantMessageToSessionTranscript({
-      sessionKey,
-      text: "Hello from delivery mirror!",
-      idempotencyKey: "mirror:test-source-message",
-      storePath: fixture.storePath(),
-    });
-    await appendAssistantMessageToSessionTranscript({
-      sessionKey,
-      text: "Hello from delivery mirror!",
-      idempotencyKey: "mirror:test-source-message",
-      storePath: fixture.storePath(),
-    });
+    const result = await withOwnedSessionTranscriptWrites(
+      {
+        sessionFile: oldSessionFile,
+        sessionKey,
+        withTranscriptWrite: async (run) => {
+          events.push("owned-write");
+          return await run();
+        },
+      },
+      async () =>
+        await runWithOwnedSessionTranscriptWrite(
+          { sessionFile: nextSessionFile, sessionKey },
+          () => {
+            events.push("write");
+            return "ok";
+          },
+        ),
+    );
 
+    expect(result).toBe("ok");
+    expect(events).toEqual(["write"]);
+  });
+
+  it("does not reuse an owned write context for the same key in another transcript target", async () => {
+    const cases = [
+      [
+        { agentId: "main", sessionKey: "global", storePath: "/tmp/main.sqlite" },
+        { agentId: "worker", sessionKey: "global", storePath: "/tmp/worker.sqlite" },
+      ],
+      [
+        { agentId: "main", sessionKey: "global" },
+        { agentId: "worker", sessionKey: "global" },
+      ],
+    ] as const;
+
+    for (const [ownerTarget, otherTarget] of cases) {
+      const events: string[] = [];
+      const result = await withOwnedSessionTranscriptWrites(
+        {
+          sessionFile: ownerTarget.sessionKey,
+          sessionKey: ownerTarget.sessionKey,
+          sessionTarget: ownerTarget,
+          withTranscriptWrite: async (run) => {
+            events.push("owned-write");
+            return await run();
+          },
+        },
+        async () =>
+          await runWithOwnedSessionTranscriptWrite(
+            {
+              sessionFile: otherTarget.sessionKey,
+              sessionKey: otherTarget.sessionKey,
+              sessionTarget: otherTarget,
+            },
+            () => {
+              events.push("write");
+              return "ok";
+            },
+          ),
+      );
+
+      expect(result).toBe("ok");
+      expect(events).toEqual(["write"]);
+    }
+  });
+
+  it("keeps matching owned transcript appends tracked from bound callbacks", async () => {
     const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
-    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
-    expect(lines.length).toBe(2);
+    const events: string[] = [];
+    const callback = bindOwnedSessionTranscriptWrites(
+      {
+        sessionFile,
+        sessionKey,
+        withTranscriptWrite: async (run) => {
+          events.push("owned-write");
+          return await run();
+        },
+      },
+      async () =>
+        await runWithOwnedSessionTranscriptWrite({ sessionFile, sessionKey }, () => {
+          events.push("write");
+          return "ok";
+        }),
+    );
 
-    const messageLine = JSON.parse(lines[1]);
-    expect(messageLine.message.idempotencyKey).toBe("mirror:test-source-message");
-    expect(messageLine.message.content[0].text).toBe("Hello from delivery mirror!");
+    const result = await callback();
+
+    expect(result).toBe("ok");
+    expect(events).toEqual(["owned-write", "write"]);
   });
 
-  it("does not append a duplicate delivery mirror when the latest assistant message already matches", async () => {
-    writeTranscriptStore();
+  it("dedupes delivery mirrors against the active SQLite branch tail", async () => {
+    await writeTranscriptStore();
+    await persistSessionTranscriptTurn(createFixtureTranscriptScope(), {
+      updateMode: "none",
+      messages: [
+        {
+          message: createExactAssistantMessage({ text: "Active branch reply" }),
+        },
+        {
+          message: createExactAssistantMessage({ text: "Inactive branch reply" }),
+        },
+      ],
+    });
+    const events = await loadTranscriptEvents(createFixtureTranscriptScope());
+    const assistantEvents = events.filter(
+      (event): event is { id: string; message: { role: string; content: unknown } } =>
+        Boolean(event) &&
+        typeof event === "object" &&
+        !Array.isArray(event) &&
+        (event as { message?: { role?: string } }).message?.role === "assistant" &&
+        typeof (event as { id?: unknown }).id === "string",
+    );
+    const active = assistantEvents[0];
+    const inactive = assistantEvents[1];
+    if (!active || !inactive) {
+      throw new Error("expected assistant events");
+    }
+    await appendTranscriptEvent(
+      { agentId: "main", sessionId, sessionKey, storePath: fixture.storePath() },
+      {
+        type: "leaf",
+        id: "active-leaf",
+        parentId: inactive.id,
+        targetId: active.id,
+      },
+    );
+
+    const hostRead = vi
+      .spyOn(activeTranscriptEvents, "readLatestSessionTranscriptMessageEvent")
+      .mockImplementation(() => {
+        throw new Error("Delivery mirror must read the active tail in its worker");
+      });
+    let mirrorResult;
+    try {
+      mirrorResult = await appendAssistantMessageToSessionTranscript({
+        sessionKey,
+        text: "Active branch reply",
+        storePath: fixture.storePath(),
+      });
+      expect(hostRead).not.toHaveBeenCalled();
+    } finally {
+      hostRead.mockRestore();
+    }
+
+    expect(mirrorResult.ok).toBe(true);
+    if (mirrorResult.ok) {
+      expect(mirrorResult.messageId).toBe(active.id);
+    }
+  });
+
+  it("idempotently appends identified channel finals while preserving repeated replies", async () => {
+    await writeTranscriptStore();
+
+    const first = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Repeated command reply",
+      storePath: fixture.storePath(),
+      idempotencyKey: "channel-final:message-1:0",
+      deliveryMirror: { kind: "channel-final", sourceMessageId: "message-1" },
+    });
+    const replay = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Repeated command reply",
+      storePath: fixture.storePath(),
+      idempotencyKey: "channel-final:message-1:0",
+      deliveryMirror: { kind: "channel-final", sourceMessageId: "message-1" },
+    });
+    const nextTurn = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Repeated command reply",
+      storePath: fixture.storePath(),
+      idempotencyKey: "channel-final:message-2:0",
+      deliveryMirror: { kind: "channel-final", sourceMessageId: "message-2" },
+    });
+
+    expect(first.ok).toBe(true);
+    expect(replay.ok).toBe(true);
+    expect(nextTurn.ok).toBe(true);
+    if (first.ok && replay.ok && nextTurn.ok) {
+      expect(replay.messageId).toBe(first.messageId);
+      expect(nextTurn.messageId).not.toBe(first.messageId);
+      const messages = (await loadFixtureMessages()).flatMap((entry) =>
+        entry.message ? [entry.message] : [],
+      ) as Array<{ openclawDeliveryMirror?: unknown }>;
+      expect(messages).toHaveLength(2);
+      expect(messages[0]?.openclawDeliveryMirror).toEqual({
+        kind: "channel-final",
+        sourceMessageId: "message-1",
+      });
+    }
+  });
+
+  it("does not dedupe delivery mirrors against an older assistant after a user turn", async () => {
+    await writeTranscriptStore();
 
     const exactResult = await appendExactAssistantMessageToSessionTranscript({
       sessionKey,
       storePath: fixture.storePath(),
-      message: createExactAssistantMessage({ text: "Hello from Codex!" }),
+      message: createExactAssistantMessage({ text: "Hello before the large user entry" }),
     });
 
     expect(exactResult.ok).toBe(true);
+    if (!exactResult.ok) {
+      return;
+    }
+
+    await persistSessionTranscriptTurn(createFixtureTranscriptScope(), {
+      updateMode: "none",
+      messages: [{ message: { role: "user", content: "x".repeat(128 * 1024) } }],
+    });
+
+    const latestAssistantText = await readLatestAssistantTextFromSessionTranscript({
+      agentId: "main",
+      sessionId,
+      sessionKey,
+      storePath: fixture.storePath(),
+    });
+    if (!latestAssistantText) {
+      throw new Error("expected latest assistant text");
+    }
+    expect(latestAssistantText.id).toBe(exactResult.messageId);
+    expect(latestAssistantText.text).toBe("Hello before the large user entry");
 
     const mirrorResult = await appendAssistantMessageToSessionTranscript({
       sessionKey,
-      text: "Hello from Codex!",
+      text: "Hello before the large user entry",
       storePath: fixture.storePath(),
     });
 
     expect(mirrorResult.ok).toBe(true);
-    if (exactResult.ok && mirrorResult.ok) {
-      expect(mirrorResult.messageId).toBe(exactResult.messageId);
-      const lines = fs.readFileSync(mirrorResult.sessionFile, "utf-8").trim().split("\n");
-      expect(lines.length).toBe(2);
-
-      const messageLine = JSON.parse(lines[1]);
-      expect(messageLine.message.provider).toBe("codex");
-      expect(messageLine.message.model).toBe("gpt-5.4");
-      expect(messageLine.message.content[0].text).toBe("Hello from Codex!");
+    if (mirrorResult.ok) {
+      expect(mirrorResult.messageId).not.toBe(exactResult.messageId);
+      const records = await loadFixtureMessages();
+      const messages = records.flatMap((record) =>
+        record.message ? [record.message] : [],
+      ) as Array<{ model?: string; content?: Array<{ text?: string }> }>;
+      expect(messages).toHaveLength(3);
+      expect(messages[2]?.model).toBe("delivery-mirror");
+      expect(messages[2]?.content?.[0]?.text).toBe("Hello before the large user entry");
     }
   });
 
+  it("admits only marked Cron delivery context when explicitly requested", async () => {
+    await writeTranscriptStore();
+    await persistSessionTranscriptTurn(createFixtureTranscriptScope(), {
+      updateMode: "none",
+      messages: [
+        { eventId: "user", message: { role: "user", content: "ordinary user" } },
+        { eventId: "assistant", message: { role: "assistant", content: "ordinary assistant" } },
+      ],
+    });
+    await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      text: "scheduled result",
+      idempotencyKey: "cron-delivery",
+      deliveryMirror: { kind: CRON_DIRECT_DELIVERY_CONTEXT_KIND },
+    });
+    await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      text: "ordinary delivery mirror",
+      idempotencyKey: "channel-delivery",
+      deliveryMirror: { kind: "channel-final" },
+    });
+    const params = {
+      agentId: "main",
+      sessionKey,
+      storePath: fixture.storePath(),
+      limit: 10,
+    };
+
+    await expect(readRecentUserAssistantTextForSession(params)).resolves.toEqual([
+      expect.objectContaining({ role: "user", text: "ordinary user" }),
+      expect.objectContaining({ role: "assistant", text: "ordinary assistant" }),
+    ]);
+    await expect(
+      readRecentUserAssistantTextForSession({
+        ...params,
+        includeCronDirectDeliveryContext: true,
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({ role: "user", text: "ordinary user" }),
+      expect.objectContaining({ role: "assistant", text: "ordinary assistant" }),
+      expect.objectContaining({ role: "assistant", text: "scheduled result" }),
+    ]);
+  });
+
+  registerRecentTranscriptTextSnapshotTests({
+    fixture,
+    sessionId,
+    sessionKey,
+    createFixtureTranscriptScope,
+    writeTranscriptStore,
+  });
+
+  it("rejects a session key scoped to a different agent", async () => {
+    await expect(
+      readRecentUserAssistantTextForSession({
+        agentId: "main",
+        sessionKey: "agent:worker:main",
+        storePath: fixture.storePath(),
+      }),
+    ).rejects.toMatchObject({
+      code: "SESSION_TRANSCRIPT_AGENT_SCOPE_MISMATCH",
+      name: "SessionTranscriptAgentScopeMismatchError",
+    });
+  });
+
+  it("resolves an unscoped main alias with the configured agent owner", async () => {
+    const mainSessionKey = "agent:main:main";
+    await writeTranscriptSessionEntry({ entry: { sessionId }, sessionKey: mainSessionKey });
+    await persistSessionTranscriptTurn(
+      { agentId: "main", sessionId, sessionKey: mainSessionKey, storePath: fixture.storePath() },
+      {
+        updateMode: "none",
+        messages: [{ message: { role: "user", content: "from main alias", timestamp: 4_000 } }],
+      },
+    );
+
+    await expect(
+      readRecentUserAssistantTextForSession({
+        agentId: "main",
+        sessionKey: "main",
+        storePath: fixture.storePath(),
+        beforeTimestampMs: 5_000,
+      }),
+    ).resolves.toEqual([
+      {
+        id: expect.any(String),
+        role: "user",
+        text: "from main alias",
+        timestamp: 4_000,
+      },
+    ]);
+  });
+
+  it("does not fall back to stale JSONL when SQLite has no transcript rows", async () => {
+    await writeTranscriptStore({
+      sessionFile: `sqlite:main:${sessionId}:${fixture.storePath()}`,
+    });
+    const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
+    writeLegacyTranscriptFixture({
+      transcriptPath: sessionFile,
+      message: { role: "user", content: "stale jsonl context", timestamp: 1_000 },
+    });
+
+    await expect(
+      readRecentUserAssistantTextForSession({
+        agentId: "main",
+        sessionKey,
+        storePath: fixture.storePath(),
+        beforeTimestampMs: 5_000,
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it("ignores stored session files outside the sessions directory for recent context", async () => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "transcript-outside-"));
+    try {
+      const outsideFile = path.join(outsideDir, "outside.jsonl");
+      await writeTranscriptStore({ sessionFile: outsideFile });
+      writeLegacyTranscriptFixture({
+        transcriptPath: outsideFile,
+        message: { role: "user", content: "outside text", timestamp: 1_000 },
+      });
+      const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
+      writeLegacyTranscriptFixture({
+        transcriptPath: sessionFile,
+        message: { role: "user", content: "contained text", timestamp: 2_000 },
+      });
+      await persistSessionTranscriptTurn(createFixtureTranscriptScope(), {
+        updateMode: "none",
+        messages: [{ message: { role: "user", content: "sqlite text", timestamp: 2_500 } }],
+      });
+
+      await expect(
+        readRecentUserAssistantTextForSession({
+          agentId: "main",
+          sessionKey,
+          storePath: fixture.storePath(),
+          beforeTimestampMs: 3_000,
+        }),
+      ).resolves.toEqual([
+        {
+          id: expect.any(String),
+          role: "user",
+          text: "sqlite text",
+          timestamp: 2_500,
+        },
+      ]);
+    } finally {
+      fs.rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips transcript-only OpenClaw assistant entries when reading latest assistant text", async () => {
+    await writeTranscriptStore();
+
+    const finalResult = await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({ text: "Complete final answer" }),
+    });
+    expect(finalResult.ok).toBe(true);
+    if (!finalResult.ok) {
+      return;
+    }
+
+    await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Earlier retained preview",
+      storePath: fixture.storePath(),
+    });
+    await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({
+        text: "Injected transcript text",
+        provider: "openclaw",
+        model: "gateway-injected",
+      }),
+    });
+
+    const latestAssistantText = await readLatestAssistantTextFromSessionTranscript({
+      agentId: "main",
+      sessionId,
+      sessionKey,
+      storePath: fixture.storePath(),
+    });
+    expect(latestAssistantText?.id).toBe(finalResult.messageId);
+    expect(latestAssistantText?.text).toBe("Complete final answer");
+  });
+
+  it("does not report transcript-only OpenClaw assistant entries as latest assistant text", async () => {
+    await writeTranscriptStore();
+
+    const mirrorResult = await appendAssistantMessageToSessionTranscript({
+      sessionKey,
+      text: "Only delivery mirror",
+      storePath: fixture.storePath(),
+    });
+    expect(mirrorResult.ok).toBe(true);
+    if (!mirrorResult.ok) {
+      return;
+    }
+
+    const latestAssistantText = await readLatestAssistantTextFromSessionTranscript({
+      agentId: "main",
+      sessionId,
+      sessionKey,
+      storePath: fixture.storePath(),
+    });
+    expect(latestAssistantText).toBeUndefined();
+  });
+
+  it("scans past trailing assistant entries without visible text", async () => {
+    await writeTranscriptStore();
+
+    const assistantResult = await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({
+        text: "Visible answer before tool call",
+      }),
+    });
+    expect(assistantResult.ok).toBe(true);
+    if (!assistantResult.ok) {
+      return;
+    }
+
+    const toolOnlyResult = await appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      storePath: fixture.storePath(),
+      message: {
+        ...createExactAssistantMessage({
+          content: [
+            {
+              type: "toolCall",
+              id: "call_latest_no_visible_text",
+              name: "maniple__list_workers",
+              arguments: {},
+            },
+          ],
+        }),
+        stopReason: "toolUse",
+      },
+    });
+    expect(toolOnlyResult.ok).toBe(true);
+    if (!toolOnlyResult.ok) {
+      return;
+    }
+
+    const latestAssistantText = readLatestTranscriptAssistantText({
+      sessionId,
+      sessionKey,
+      storePath: fixture.storePath(),
+    });
+    expect(latestAssistantText?.id).toBe(assistantResult.messageId);
+    expect(latestAssistantText?.text).toBe("Visible answer before tool call");
+  });
+
   it("does not reuse an older matching assistant message across turns", async () => {
-    writeTranscriptStore();
+    await writeTranscriptStore();
 
     const olderResult = await appendExactAssistantMessageToSessionTranscript({
       sessionKey,
@@ -205,140 +1122,460 @@ describe("appendAssistantMessageToSessionTranscript", () => {
       expect(mirrorResult.messageId).not.toBe(olderResult.messageId);
       expect(mirrorResult.messageId).not.toBe(latestResult.messageId);
 
-      const lines = fs.readFileSync(mirrorResult.sessionFile, "utf-8").trim().split("\n");
-      expect(lines.length).toBe(4);
-
-      const messageLine = JSON.parse(lines[3]);
-      expect(messageLine.message.provider).toBe("openclaw");
-      expect(messageLine.message.model).toBe("delivery-mirror");
-      expect(messageLine.message.content[0].text).toBe("Repeated answer");
+      const messages = (await loadFixtureMessages()).flatMap((entry) =>
+        entry.message ? [entry.message] : [],
+      ) as Array<{
+        api?: string;
+        provider?: string;
+        model?: string;
+        content?: Array<{ text?: string }>;
+      }>;
+      expect(messages).toHaveLength(3);
+      expect(messages[2]?.api).toBe(OPENCLAW_TRANSCRIPT_ARTIFACT_API);
+      expect(messages[2]?.provider).toBe("openclaw");
+      expect(messages[2]?.model).toBe("delivery-mirror");
+      expect(messages[2]?.content?.[0]?.text).toBe("Repeated answer");
     }
   });
 
-  it("finds session entry using normalized (lowercased) key", async () => {
-    const storeKey = "agent:main:bluebubbles:direct:+15551234567";
-    const store = {
-      [storeKey]: {
-        sessionId: "test-session-normalized",
-        chatType: "direct",
-        channel: "bluebubbles",
-      },
-    };
-    fs.writeFileSync(fixture.storePath(), JSON.stringify(store), "utf-8");
+  it("keeps delivery mirrors in transcripts while repair preserves real tool results", async () => {
+    await writeTranscriptStore();
+    const toolCallId = "call_maniple_list";
 
-    const result = await appendAssistantMessageToSessionTranscript({
-      sessionKey: "agent:main:BlueBubbles:direct:+15551234567",
-      text: "Hello normalized!",
-      storePath: fixture.storePath(),
-    });
-
-    expect(result.ok).toBe(true);
-  });
-
-  it("finds Slack session entry using normalized (lowercased) key", async () => {
-    const storeKey = "agent:main:slack:direct:u12345abc";
-    const store = {
-      [storeKey]: {
-        sessionId: "test-slack-session",
-        chatType: "direct",
-        channel: "slack",
-      },
-    };
-    fs.writeFileSync(fixture.storePath(), JSON.stringify(store), "utf-8");
-
-    const result = await appendAssistantMessageToSessionTranscript({
-      sessionKey: "agent:main:slack:direct:U12345ABC",
-      text: "Hello Slack user!",
-      storePath: fixture.storePath(),
-    });
-
-    expect(result.ok).toBe(true);
-  });
-
-  it("ignores malformed transcript lines when checking mirror idempotency", async () => {
-    writeTranscriptStore();
-
-    const sessionFile = resolveSessionTranscriptPathInDir(sessionId, fixture.sessionsDir());
-    fs.writeFileSync(
-      sessionFile,
-      [
-        JSON.stringify({
-          type: "session",
-          version: 1,
-          id: sessionId,
-          timestamp: new Date().toISOString(),
-          cwd: process.cwd(),
-        }),
-        "{not-json",
-        JSON.stringify({
-          type: "message",
+    const toolCallTurn = await persistSessionTranscriptTurn(createFixtureTranscriptScope(), {
+      updateMode: "none",
+      messages: [
+        {
           message: {
             role: "assistant",
-            idempotencyKey: "mirror:test-source-message",
-            content: [{ type: "text", text: "Hello from delivery mirror!" }],
+            content: [
+              {
+                type: "toolCall",
+                id: toolCallId,
+                name: "maniple__list_workers",
+                arguments: {},
+              },
+            ],
+            stopReason: "toolUse",
           },
-        }),
-      ].join("\n") + "\n",
-      "utf-8",
-    );
+        },
+      ],
+    });
+    const toolCallResult = toolCallTurn.messages[0];
+    expect(toolCallResult?.messageId).toBeTypeOf("string");
 
-    const result = await appendAssistantMessageToSessionTranscript({
+    const mirrorResult = await appendAssistantMessageToSessionTranscript({
       sessionKey,
-      text: "Hello from delivery mirror!",
-      idempotencyKey: "mirror:test-source-message",
+      text: "Maniple List Workers",
       storePath: fixture.storePath(),
     });
 
-    expect(result.ok).toBe(true);
-    const lines = fs.readFileSync(sessionFile, "utf-8").trim().split("\n");
-    expect(lines.length).toBe(3);
+    expect(mirrorResult.ok).toBe(true);
+    if (!mirrorResult.ok) {
+      return;
+    }
+    expect(mirrorResult.messageId).not.toBe(toolCallResult?.messageId);
+    const messagesAfterMirror = (await loadFixtureMessages()).flatMap((entry) =>
+      entry.message ? [entry.message] : [],
+    ) as Array<{ api?: string; model?: string }>;
+    expect(messagesAfterMirror).toHaveLength(2);
+    expect(messagesAfterMirror[1]?.api).toBe(OPENCLAW_TRANSCRIPT_ARTIFACT_API);
+    expect(messagesAfterMirror[1]?.model).toBe("delivery-mirror");
+
+    await persistSessionTranscriptTurn(createFixtureTranscriptScope(), {
+      updateMode: "none",
+      messages: [
+        {
+          message: {
+            role: "toolResult",
+            toolCallId,
+            toolName: "maniple__list_workers",
+            content: [{ type: "text", text: "workers listed" }],
+            isError: false,
+          },
+        },
+      ],
+    });
+
+    const messages = (await loadFixtureMessages()).flatMap((entry) =>
+      entry.message ? [entry.message as TranscriptRepairMessage] : [],
+    );
+    expect(messages.map((message) => message.role)).toEqual([
+      "assistant",
+      "assistant",
+      "toolResult",
+    ]);
+    const repair = repairToolUseResultPairing(messages, {
+      missingToolResultText: "aborted",
+    });
+
+    expect(repair.added).toHaveLength(0);
+    expect(repair.messages.map((message) => message.role)).toEqual([
+      "assistant",
+      "toolResult",
+      "assistant",
+    ]);
+    expect((repair.messages[2] as { model?: string }).model).toBe("delivery-mirror");
   });
 
-  it("appends exact assistant transcript messages without rewriting phased content", async () => {
-    writeTranscriptStore();
+  it("applies before_message_write after idempotency checks and preserves the key", async () => {
+    await writeTranscriptStore();
+    const beforeMessageWrite = vi.fn(({ message }: BeforeMessageWriteParams) => ({
+      ...message,
+      content: [{ type: "text" as const, text: "[redacted by hook]" }],
+    }));
+    const append = () =>
+      appendExactAssistantMessageToSessionTranscript({
+        sessionKey,
+        storePath: fixture.storePath(),
+        idempotencyKey: "cli-assistant:redacted",
+        beforeMessageWrite,
+        message: createExactAssistantMessage({ text: "secret output" }),
+      });
+
+    const first = await append();
+    const replay = await append();
+
+    expect(first.ok).toBe(true);
+    expect(replay.ok).toBe(true);
+    expect(beforeMessageWrite).toHaveBeenCalledOnce();
+    if (!first.ok) {
+      throw new Error("expected assistant append to succeed");
+    }
+    const messages = (await loadFixtureMessages()).flatMap((entry) =>
+      entry.message ? [entry.message as ExactAssistantMessage] : [],
+    );
+    expect(messages).toEqual([
+      expect.objectContaining({
+        role: "assistant",
+        content: [{ type: "text", text: "[redacted by hook]" }],
+        idempotencyKey: "cli-assistant:redacted",
+      }),
+    ]);
+  });
+
+  it("dedupes unkeyed delivery mirrors after before_message_write rewrites", async () => {
+    await writeTranscriptStore();
+    const beforeMessageWrite = vi.fn(({ message }: BeforeMessageWriteParams) => ({
+      ...message,
+      content: [{ type: "text" as const, text: "[redacted by hook]" }],
+    }));
+    const append = () =>
+      appendAssistantMessageToSessionTranscript({
+        sessionKey,
+        storePath: fixture.storePath(),
+        text: "secret output",
+        beforeMessageWrite,
+      });
+
+    const first = await append();
+    const replay = await append();
+
+    expect(first.ok).toBe(true);
+    expect(replay.ok).toBe(true);
+    expect(beforeMessageWrite).toHaveBeenCalledTimes(2);
+    if (!first.ok) {
+      throw new Error("expected delivery mirror append to succeed");
+    }
+    const messages = (await loadFixtureMessages()).flatMap((entry) =>
+      entry.message ? [entry.message as ExactAssistantMessage] : [],
+    );
+    expect(messages).toEqual([
+      expect.objectContaining({
+        role: "assistant",
+        content: [{ type: "text", text: "[redacted by hook]" }],
+      }),
+    ]);
+  });
+
+  it("dedupes a delivery mirror without parsing historical message bodies", async () => {
+    await writeTranscriptStore();
+    const scope = createFixtureTranscriptScope();
+    const history = Array.from({ length: 500 }, (_, index) => ({
+      type: "message",
+      id: `history-${index}`,
+      parentId: index === 0 ? null : `history-${index - 1}`,
+      message: {
+        role: "user",
+        content: `archived-mirror-body-${index} ${"x".repeat(2_000)}`,
+      },
+    }));
+    await replaceTranscriptEvents(scope, [
+      ...history,
+      {
+        type: "message",
+        id: "latest-reply",
+        parentId: "history-499",
+        message: createExactAssistantMessage({ text: "The current reply" }),
+      },
+    ]);
+    await waitForSessionTranscriptIndexReconcile({
+      agentId: "main",
+      path: resolveSqliteTargetFromSessionStorePath(fixture.storePath(), { agentId: "main" }).path,
+    });
+    const parse = JSON.parse;
+    let parsedHistoricalBodies = 0;
+    const parseSpy = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) => {
+      if (typeof text === "string" && text.includes("archived-mirror-body-")) {
+        parsedHistoricalBodies += 1;
+      }
+      return parse(text, reviver);
+    });
+    try {
+      const result = await appendAssistantMessageToSessionTranscript({
+        sessionKey,
+        storePath: fixture.storePath(),
+        text: "The current reply",
+      });
+      expect(result).toMatchObject({ ok: true, messageId: "latest-reply" });
+      expect(parsedHistoricalBodies).toBe(0);
+    } finally {
+      parseSpy.mockRestore();
+    }
+    expect(await loadFixtureMessages()).toHaveLength(history.length + 1);
+  });
+
+  it("reports assistant messages blocked by before_message_write", async () => {
+    await writeTranscriptStore();
+
+    const result = await appendExactAssistantMessageToSessionTranscript({
+      agentId: "main",
+      sessionKey,
+      storePath: fixture.storePath(),
+      idempotencyKey: "cli-assistant:blocked",
+      beforeMessageWrite: vi.fn(() => null),
+      message: createExactAssistantMessage({ text: "secret output" }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      code: "blocked",
+    });
+  });
+
+  it("rejects a concurrent session rebind before the assistant append", async () => {
+    await writeTranscriptStore();
+    let releaseReset = () => {};
+    const resetGate = new Promise<void>((resolve) => {
+      releaseReset = resolve;
+    });
+    let markResetStarted = () => {};
+    const resetStarted = new Promise<void>((resolve) => {
+      markResetStarted = resolve;
+    });
+    const replacementSessionFile = resolveSessionTranscriptPathInDir(
+      "replacement-session",
+      fixture.sessionsDir(),
+    );
+    const reset = updateSessionEntry(
+      {
+        agentId: "main",
+        storePath: fixture.storePath(),
+        sessionKey,
+      },
+      async () => {
+        markResetStarted();
+        await resetGate;
+        return {
+          sessionId: "replacement-session",
+          sessionFile: replacementSessionFile,
+        };
+      },
+    );
+    await resetStarted;
+
+    const append = appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      expectedSessionId: sessionId,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({ text: "late output" }),
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    releaseReset();
+
+    await reset;
+    const result = await append;
+    expect(result).toMatchObject({
+      ok: false,
+      code: "session-rebound",
+    });
+    expect(fs.existsSync(replacementSessionFile)).toBe(false);
+  });
+
+  it("rejects a concurrent lifecycle owner change without a session id rotation", async () => {
+    await writeTranscriptStore({
+      lifecycleRevision: "original-revision",
+    });
+    let releaseOwnerChange = () => {};
+    const ownerChangeGate = new Promise<void>((resolve) => {
+      releaseOwnerChange = resolve;
+    });
+    let markOwnerChangeStarted = () => {};
+    const ownerChangeStarted = new Promise<void>((resolve) => {
+      markOwnerChangeStarted = resolve;
+    });
+    const ownerChange = updateSessionEntry(
+      {
+        agentId: "main",
+        storePath: fixture.storePath(),
+        sessionKey,
+      },
+      async () => {
+        markOwnerChangeStarted();
+        await ownerChangeGate;
+        return {
+          lifecycleRevision: "replacement-revision",
+        };
+      },
+    );
+    await ownerChangeStarted;
+
+    const append = appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      expectedLifecycleRevision: "original-revision",
+      expectedSessionId: sessionId,
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({ text: "late output" }),
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    releaseOwnerChange();
+
+    await ownerChange;
+    await expect(append).resolves.toMatchObject({
+      ok: false,
+      code: "session-rebound",
+    });
+  });
+
+  it("rejects revision materialization between the initial check and SQLite append", async () => {
+    await writeTranscriptStore({ lifecycleRevision: undefined });
+    const scope = createFixtureTranscriptScope();
+    const entry = loadSessionEntry(scope);
+    if (!entry) {
+      throw new Error("expected session entry");
+    }
+    let revisionMaterialized = false;
 
     const result = await appendExactAssistantMessageToSessionTranscript({
       sessionKey,
+      expectedLifecycleRevision: null,
+      expectedSessionId: sessionId,
       storePath: fixture.storePath(),
-      message: createExactAssistantMessage({
-        content: [
-          {
-            type: "text",
-            text: "internal reasoning",
-            textSignature: JSON.stringify({ v: 1, id: "item_commentary", phase: "commentary" }),
-          },
-          {
-            type: "text",
-            text: "Done.",
-            textSignature: JSON.stringify({ v: 1, id: "item_final", phase: "final_answer" }),
-          },
-        ],
-        provider: "openclaw",
-        model: "delivery-mirror",
-      }),
+      beforeMessageWrite: ({ message }) => {
+        replaceSessionEntrySync(scope, {
+          ...entry,
+          lifecycleRevision: "replacement-revision",
+          updatedAt: 2,
+        });
+        revisionMaterialized = true;
+        return message;
+      },
+      message: createExactAssistantMessage({ text: "late output" }),
     });
 
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      const lines = fs.readFileSync(result.sessionFile, "utf-8").trim().split("\n");
-      const messageLine = JSON.parse(lines[1]);
-      expect(messageLine.message.content).toEqual([
-        {
-          type: "text",
-          text: "internal reasoning",
-          textSignature: JSON.stringify({ v: 1, id: "item_commentary", phase: "commentary" }),
-        },
-        {
-          type: "text",
-          text: "Done.",
-          textSignature: JSON.stringify({ v: 1, id: "item_final", phase: "final_answer" }),
-        },
-      ]);
+    expect(revisionMaterialized).toBe(true);
+    expect(result).toMatchObject({ ok: false, code: "session-rebound" });
+    expect(await loadFixtureMessages()).toEqual([]);
+  });
+
+  it("rejects a superseded writer claim and accepts the admitted writer", async () => {
+    await writeTranscriptStore({
+      activeWriterRunId: "run-a",
+      lifecycleRevision: "owned-revision",
+    } as InternalSessionEntry);
+    let releaseWriterChange = () => {};
+    const writerChangeGate = new Promise<void>((resolve) => {
+      releaseWriterChange = resolve;
+    });
+    let markWriterChangeStarted = () => {};
+    const writerChangeStarted = new Promise<void>((resolve) => {
+      markWriterChangeStarted = resolve;
+    });
+    const writerChange = updateSessionEntry(
+      {
+        agentId: "main",
+        storePath: fixture.storePath(),
+        sessionKey,
+      },
+      async () => {
+        markWriterChangeStarted();
+        await writerChangeGate;
+        return { activeWriterRunId: "run-b" } as Partial<InternalSessionEntry>;
+      },
+    );
+    await writerChangeStarted;
+
+    const staleAppend = appendExactAssistantMessageToSessionTranscript({
+      sessionKey,
+      expectedLifecycleRevision: "owned-revision",
+      expectedSessionId: sessionId,
+      expectedWriterRunId: "run-a",
+      storePath: fixture.storePath(),
+      message: createExactAssistantMessage({ text: "late output" }),
+    });
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    releaseWriterChange();
+
+    await writerChange;
+    await expect(staleAppend).resolves.toMatchObject({
+      ok: false,
+      code: "session-rebound",
+    });
+    await expect(
+      appendExactAssistantMessageToSessionTranscript({
+        sessionKey,
+        expectedLifecycleRevision: "owned-revision",
+        expectedSessionId: sessionId,
+        expectedWriterRunId: "run-b",
+        storePath: fixture.storePath(),
+        message: createExactAssistantMessage({ text: "current output" }),
+      }),
+    ).resolves.toMatchObject({ ok: true });
+  });
+
+  it("dedupes concurrent exact assistant appends by idempotency key", async () => {
+    await writeTranscriptStore();
+    const idempotencyKey = "mirror:concurrent-assistant";
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        appendExactAssistantMessageToSessionTranscript({
+          sessionKey,
+          storePath: fixture.storePath(),
+          idempotencyKey,
+          updateMode: "none",
+          message: createExactAssistantMessage({
+            text: "Mirrored reply",
+            provider: "openclaw",
+            model: "delivery-mirror",
+          }),
+        }),
+      ),
+    );
+
+    expect(results.every((result) => result.ok)).toBe(true);
+    const messageIds = results.map((result) => (result.ok ? result.messageId : ""));
+    expect(new Set(messageIds).size).toBe(1);
+
+    const firstOk = results.find((result) => result.ok);
+    if (!firstOk?.ok) {
+      throw new Error("expected exact assistant append to succeed");
     }
+    const records = (await loadFixtureMessages()).filter((record) => {
+      const message = record.message as { role?: string; idempotencyKey?: string } | undefined;
+      return message?.role === "assistant" && message.idempotencyKey === idempotencyKey;
+    });
+    expect(records).toHaveLength(1);
   });
 
   it("can emit file-only transcript refresh events for exact assistant appends", async () => {
-    writeTranscriptStore();
+    await writeTranscriptStore();
     const emitSpy = vi.spyOn(transcriptEvents, "emitSessionTranscriptUpdate");
 
     const result = await appendExactAssistantMessageToSessionTranscript({
@@ -355,130 +1592,17 @@ describe("appendAssistantMessageToSessionTranscript", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(emitSpy).toHaveBeenCalledWith({
-        sessionFile: result.sessionFile,
+        agentId: "main",
         sessionKey,
+        target: {
+          agentId: "main",
+          sessionId,
+          sessionKey,
+          storePath: fixture.storePath(),
+        },
       });
     }
     emitSpy.mockRestore();
   });
-
-  it("serializes concurrent parent-linked transcript appends", async () => {
-    const sessionFile = resolveSessionTranscriptPathInDir(
-      "concurrent-tree-session",
-      fixture.sessionsDir(),
-    );
-    fs.writeFileSync(
-      sessionFile,
-      [
-        JSON.stringify({
-          type: "session",
-          version: 1,
-          id: "concurrent-tree-session",
-          timestamp: new Date().toISOString(),
-          cwd: process.cwd(),
-        }),
-        JSON.stringify({
-          type: "message",
-          id: "root-message",
-          parentId: null,
-          timestamp: new Date().toISOString(),
-          message: { role: "user", content: "root" },
-        }),
-      ].join("\n") + "\n",
-      "utf-8",
-    );
-
-    await Promise.all(
-      Array.from({ length: 8 }, (_, index) =>
-        appendSessionTranscriptMessage({
-          transcriptPath: sessionFile,
-          message: { role: "assistant", content: `reply ${index}` },
-        }),
-      ),
-    );
-
-    const records = fs
-      .readFileSync(sessionFile, "utf-8")
-      .trim()
-      .split("\n")
-      .map(
-        (line) =>
-          JSON.parse(line) as {
-            type?: string;
-            id?: string;
-            parentId?: string | null;
-            message?: { content?: string };
-          },
-      )
-      .filter((record) => record.type === "message");
-
-    expect(records).toHaveLength(9);
-    for (let index = 1; index < records.length; index += 1) {
-      expect(records[index]?.parentId).toBe(records[index - 1]?.id);
-    }
-  });
-
-  it("migrates small linear transcripts before appending", async () => {
-    const sessionFile = resolveSessionTranscriptPathInDir(
-      "small-linear-session",
-      fixture.sessionsDir(),
-    );
-    fs.writeFileSync(
-      sessionFile,
-      [
-        JSON.stringify({
-          type: "session",
-          version: 3,
-          id: "small-linear-session",
-          timestamp: new Date().toISOString(),
-          cwd: process.cwd(),
-        }),
-        JSON.stringify({
-          type: "message",
-          id: "legacy-first",
-          timestamp: new Date().toISOString(),
-          message: { role: "user", content: "legacy first" },
-        }),
-        JSON.stringify({
-          type: "message",
-          id: "legacy-second",
-          timestamp: new Date().toISOString(),
-          message: { role: "assistant", content: "legacy second" },
-        }),
-      ].join("\n") + "\n",
-      "utf-8",
-    );
-
-    const appended = await appendSessionTranscriptMessage({
-      transcriptPath: sessionFile,
-      message: { role: "assistant", content: "new reply" },
-    });
-
-    const records = fs
-      .readFileSync(sessionFile, "utf-8")
-      .trim()
-      .split("\n")
-      .map(
-        (line) =>
-          JSON.parse(line) as {
-            type?: string;
-            id?: string;
-            parentId?: string | null;
-            message?: { content?: string };
-          },
-      );
-    const messages = records.filter((record) => record.type === "message");
-
-    expect(messages.map((record) => record.message?.content)).toEqual([
-      "legacy first",
-      "legacy second",
-      "new reply",
-    ]);
-    expect(messages[0]).toMatchObject({ id: "legacy-first", parentId: null });
-    expect(messages[1]).toMatchObject({ id: "legacy-second", parentId: "legacy-first" });
-    expect(messages[2]).toMatchObject({
-      id: appended.messageId,
-      parentId: "legacy-second",
-    });
-  });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

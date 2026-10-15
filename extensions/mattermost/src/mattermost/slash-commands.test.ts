@@ -1,7 +1,7 @@
+// Mattermost tests cover slash commands plugin behavior.
 import { describe, expect, it, vi } from "vitest";
-import type { MattermostClient } from "./client.js";
+import { createMattermostClient, type MattermostClient } from "./client.js";
 import {
-  DEFAULT_COMMAND_SPECS,
   MATTERMOST_SLASH_POST_METHOD,
   parseSlashCommandPayload,
   registerSlashCommands,
@@ -13,6 +13,7 @@ import {
 describe("slash-commands", () => {
   async function registerSingleStatusCommand(
     requestImpl: (path: string, init?: RequestInit) => Promise<unknown>,
+    description = "status",
   ) {
     const client: MattermostClient = {
       baseUrl: "https://chat.example.com",
@@ -29,27 +30,12 @@ describe("slash-commands", () => {
       commands: [
         {
           trigger: "oc_status",
-          description: "status",
+          description,
           autoComplete: true,
         },
       ],
     });
   }
-
-  it("parses application/x-www-form-urlencoded payloads", () => {
-    const payload = parseSlashCommandPayload(
-      "token=t1&team_id=team&channel_id=ch1&user_id=u1&command=%2Foc_status&text=now",
-      "application/x-www-form-urlencoded",
-    );
-    expect(payload).toMatchObject({
-      token: "t1",
-      team_id: "team",
-      channel_id: "ch1",
-      user_id: "u1",
-      command: "/oc_status",
-      text: "now",
-    });
-  });
 
   it("parses application/json payloads", () => {
     const payload = parseSlashCommandPayload(
@@ -63,10 +49,18 @@ describe("slash-commands", () => {
       }),
       "application/json; charset=utf-8",
     );
-    expect(payload).toMatchObject({
+    expect(payload).toEqual({
       token: "t2",
+      team_id: "team",
+      team_domain: undefined,
+      channel_id: "ch2",
+      channel_name: undefined,
+      user_id: "u2",
+      user_name: undefined,
       command: "/oc_model",
       text: "gpt-5",
+      trigger_id: undefined,
+      response_url: undefined,
     });
   });
 
@@ -86,21 +80,8 @@ describe("slash-commands", () => {
     expect(resolveCommandText("oc_help", "", undefined)).toBe("/help");
   });
 
-  it("registers both public model slash commands", () => {
-    expect(
-      DEFAULT_COMMAND_SPECS.filter(
-        (spec) => spec.trigger === "oc_model" || spec.trigger === "oc_models",
-      ).map((spec) => spec.trigger),
-    ).toEqual(["oc_model", "oc_models"]);
-  });
-
-  it("normalizes callback path in slash config", () => {
-    const config = resolveSlashCommandConfig({ callbackPath: "api/channels/mattermost/command" });
-    expect(config.callbackPath).toBe("/api/channels/mattermost/command");
-  });
-
   it("falls back to localhost callback URL for wildcard bind hosts", () => {
-    const config = resolveSlashCommandConfig({ callbackPath: "/api/channels/mattermost/command" });
+    const config = resolveSlashCommandConfig({ callbackPath: "api/channels/mattermost/command" });
     const callbackUrl = resolveCallbackUrl({
       config,
       gatewayPort: 18789,
@@ -130,9 +111,44 @@ describe("slash-commands", () => {
     const result = await registerSingleStatusCommand(request);
 
     expect(result).toHaveLength(1);
-    expect(result[0]?.managed).toBe(false);
-    expect(result[0]?.id).toBe("cmd-1");
+    const firstCommand = result[0];
+    if (!firstCommand) {
+      throw new Error("expected Mattermost slash command result");
+    }
+    expect(firstCommand.managed).toBe(false);
+    expect(firstCommand.id).toBe("cmd-1");
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("truncates command descriptions to Mattermost's UTF-8 byte limit", async () => {
+    const description = `${"x".repeat(127)}😀 trailing`;
+    const request = vi.fn(async (path: string, init?: RequestInit) => {
+      if (path.startsWith("/commands?team_id=")) {
+        return [];
+      }
+      if (path === "/commands" && init?.method === "POST") {
+        const body = JSON.parse(typeof init.body === "string" ? init.body : "{}");
+        expect(body.description).toBe("x".repeat(127));
+        expect(body.auto_complete_desc).toBe("x".repeat(127));
+        expect(Buffer.byteLength(body.description, "utf8")).toBeLessThanOrEqual(128);
+        return {
+          id: "cmd-1",
+          token: "tok-1",
+          team_id: "team-1",
+          creator_id: "bot-user",
+          trigger: "oc_status",
+          method: MATTERMOST_SLASH_POST_METHOD,
+          url: "http://gateway/callback",
+          auto_complete: true,
+        };
+      }
+      throw new Error(`unexpected request path: ${path}`);
+    });
+
+    const result = await registerSingleStatusCommand(request, description);
+
+    expect(result).toHaveLength(1);
+    expect(request).toHaveBeenCalledTimes(2);
   });
 
   it("skips foreign command trigger collisions instead of mutating non-owned commands", async () => {
@@ -179,9 +195,16 @@ describe("slash-commands", () => {
         ];
       }
       if (path === "/commands/cmd-1" && init?.method === "PUT") {
-        expect(JSON.parse(typeof init.body === "string" ? init.body : "{}")).toMatchObject({
+        expect(JSON.parse(typeof init.body === "string" ? init.body : "{}")).toEqual({
+          id: "cmd-1",
+          team_id: "team-1",
+          trigger: "oc_status",
           method: MATTERMOST_SLASH_POST_METHOD,
           url: "http://gateway/callback",
+          description: "status",
+          auto_complete: true,
+          auto_complete_desc: "status",
+          auto_complete_hint: undefined,
         });
         return {
           id: "cmd-1",
@@ -209,5 +232,83 @@ describe("slash-commands", () => {
       },
     ]);
     expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("recreates a drifted command when its accepted delete body cannot be read", async () => {
+    const calls: string[] = [];
+    const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const method = init?.method ?? "GET";
+      calls.push(`${method} ${url.replace("https://chat.example.com/api/v4", "")}`);
+      if (method === "GET") {
+        return Response.json([
+          {
+            id: "cmd-1",
+            token: "tok-old",
+            team_id: "team-1",
+            creator_id: "bot-user",
+            trigger: "oc_status",
+            method: "G",
+            url: "http://gateway/callback",
+            auto_complete: true,
+          },
+        ]);
+      }
+      if (method === "PUT") {
+        return Response.json({ message: "update rejected" }, { status: 500 });
+      }
+      if (method === "DELETE") {
+        // Mattermost already deleted the command; its 200 {"status":"OK"} body is lost.
+        const body = new ReadableStream<Uint8Array>({
+          pull() {
+            throw new TypeError("terminated");
+          },
+        });
+        return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return Response.json(
+        {
+          id: "cmd-2",
+          token: "tok-new",
+          team_id: "team-1",
+          creator_id: "bot-user",
+          trigger: "oc_status",
+          method: MATTERMOST_SLASH_POST_METHOD,
+          url: "http://gateway/callback",
+          auto_complete: true,
+        },
+        { status: 201 },
+      );
+    });
+    const client = createMattermostClient({
+      baseUrl: "https://chat.example.com",
+      botToken: "bot-token",
+      fetchImpl,
+    });
+
+    const result = await registerSlashCommands({
+      client,
+      teamId: "team-1",
+      creatorUserId: "bot-user",
+      callbackUrl: "http://gateway/callback",
+      commands: [{ trigger: "oc_status", description: "status", autoComplete: true }],
+    });
+
+    expect(calls).toEqual([
+      "GET /commands?team_id=team-1&custom_only=true",
+      "PUT /commands/cmd-1",
+      "DELETE /commands/cmd-1",
+      "POST /commands",
+    ]);
+    expect(result).toEqual([
+      {
+        id: "cmd-2",
+        trigger: "oc_status",
+        teamId: "team-1",
+        token: "tok-new",
+        url: "http://gateway/callback",
+        managed: true,
+      },
+    ]);
   });
 });

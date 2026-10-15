@@ -1,7 +1,9 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+// Discord provider module implements model/runtime integration.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import type { Mock } from "vitest";
-import { expect, vi } from "vitest";
+import { vi } from "vitest";
+import { createRuntimeSpies } from "../../../test-support/runtime-spies.js";
 
 type NativeCommandSpecMock = {
   name: string;
@@ -9,14 +11,8 @@ type NativeCommandSpecMock = {
   acceptsArgs: boolean;
 };
 
-type PluginCommandSpecMock = {
-  name: string;
-  description: string;
-  acceptsArgs: boolean;
-};
-
 type ProviderMonitorTestMocks = {
-  clientDeployCommandsMock: Mock<(options?: { mode?: string }) => Promise<void>>;
+  clientDeployCommandsMock: Mock<() => Promise<void>>;
   clientFetchUserMock: Mock<(target: string) => Promise<{ id: string }>>;
   clientGetPluginMock: Mock<(name: string) => unknown>;
   clientConstructorOptionsMock: Mock<(options?: unknown) => void>;
@@ -33,7 +29,9 @@ type ProviderMonitorTestMocks = {
   createDiscordNativeCommandMock: Mock<(params?: { command?: { name?: string } }) => unknown>;
   createDiscordMessageHandlerMock: Mock<() => unknown>;
   createNoopThreadBindingManagerMock: Mock<() => { stop: ReturnType<typeof vi.fn> }>;
-  createThreadBindingManagerMock: Mock<() => { stop: ReturnType<typeof vi.fn> }>;
+  createThreadBindingManagerMock: Mock<
+    () => { stop: ReturnType<typeof vi.fn> } | Promise<{ stop: ReturnType<typeof vi.fn> }>
+  >;
   reconcileAcpThreadBindingsOnStartupMock: Mock<() => unknown>;
   createdBindingManagers: Array<{ stop: ReturnType<typeof vi.fn> }>;
   getAcpSessionStatusMock: Mock<
@@ -43,15 +41,14 @@ type ProviderMonitorTestMocks = {
       signal?: AbortSignal;
     }) => Promise<{ state: string }>
   >;
-  getPluginCommandSpecsMock: Mock<(provider?: string) => PluginCommandSpecMock[]>;
   listNativeCommandSpecsForConfigMock: Mock<
     (
       cfg?: unknown,
       params?: { skillCommands?: unknown[]; provider?: string },
     ) => NativeCommandSpecMock[]
   >;
-  listSkillCommandsForAgentsMock: Mock<
-    (params?: { cfg?: unknown; agentIds?: string[] }) => unknown[]
+  prepareSkillCommandsForAgentsMock: Mock<
+    (params?: { cfg?: unknown; agentIds?: string[] }) => Promise<unknown[]>
   >;
   monitorLifecycleMock: Mock<(params: { threadBindings: { stop: () => void } }) => Promise<void>>;
   resolveDiscordAccountMock: Mock<
@@ -90,7 +87,6 @@ const providerMonitorTestMocks: ProviderMonitorTestMocks = vi.hoisted(() => {
       start: vi.fn(),
       stop: vi.fn(),
       refresh: vi.fn(),
-      runNow: vi.fn(),
     })),
     createDiscordExecApprovalButtonContextMock: vi.fn(() => ({
       getApprovers: () => [],
@@ -104,7 +100,7 @@ const providerMonitorTestMocks: ProviderMonitorTestMocks = vi.hoisted(() => {
       Object.assign(
         vi.fn(async () => undefined),
         {
-          deactivate: vi.fn(),
+          deactivate: vi.fn(async () => {}),
         },
       ),
     ),
@@ -129,20 +125,19 @@ const providerMonitorTestMocks: ProviderMonitorTestMocks = vi.hoisted(() => {
         state: "idle",
       }),
     ),
-    getPluginCommandSpecsMock: vi.fn<(provider?: string) => PluginCommandSpecMock[]>(() => []),
     listNativeCommandSpecsForConfigMock: vi.fn<
       (
         cfg?: unknown,
         params?: { skillCommands?: unknown[]; provider?: string },
       ) => NativeCommandSpecMock[]
     >(() => [{ name: "cmd", description: "built-in", acceptsArgs: false }]),
-    listSkillCommandsForAgentsMock: vi.fn<
-      (params?: { cfg?: unknown; agentIds?: string[] }) => unknown[]
-    >(() => []),
+    prepareSkillCommandsForAgentsMock: vi.fn<
+      (params?: { cfg?: unknown; agentIds?: string[] }) => Promise<unknown[]>
+    >(async () => []),
     monitorLifecycleMock: vi.fn(async (params: { threadBindings: { stop: () => void } }) => {
       params.threadBindings.stop();
     }),
-    resolveDiscordAccountMock: vi.fn((_) => ({
+    resolveDiscordAccountMock: vi.fn((_params) => ({
       accountId: "default",
       token: "cfg-token",
       config: baseDiscordAccountConfig(),
@@ -179,9 +174,8 @@ const {
   reconcileAcpThreadBindingsOnStartupMock,
   createdBindingManagers,
   getAcpSessionStatusMock,
-  getPluginCommandSpecsMock,
   listNativeCommandSpecsForConfigMock,
-  listSkillCommandsForAgentsMock,
+  prepareSkillCommandsForAgentsMock,
   monitorLifecycleMock,
   resolveDiscordAccountMock,
   resolveDiscordAllowlistConfigMock,
@@ -197,13 +191,6 @@ export function getProviderMonitorTestMocks(): typeof providerMonitorTestMocks {
   return providerMonitorTestMocks;
 }
 
-// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Test helper lets assertions ascribe handler params shape.
-export function getFirstDiscordMessageHandlerParams<T extends object>() {
-  expect(createDiscordMessageHandlerMock).toHaveBeenCalledTimes(1);
-  const firstCall = createDiscordMessageHandlerMock.mock.calls.at(0) as [T] | undefined;
-  return firstCall?.[0];
-}
-
 export function resetDiscordProviderMonitorMocks(params?: {
   nativeCommands?: NativeCommandSpecMock[];
 }) {
@@ -216,7 +203,6 @@ export function resetDiscordProviderMonitorMocks(params?: {
     start: vi.fn(),
     stop: vi.fn(),
     refresh: vi.fn(),
-    runNow: vi.fn(),
   }));
   createDiscordExecApprovalButtonContextMock.mockClear().mockImplementation(() => ({
     getApprovers: () => [],
@@ -230,7 +216,7 @@ export function resetDiscordProviderMonitorMocks(params?: {
     Object.assign(
       vi.fn(async () => undefined),
       {
-        deactivate: vi.fn(),
+        deactivate: vi.fn(async () => {}),
       },
     ),
   );
@@ -243,13 +229,12 @@ export function resetDiscordProviderMonitorMocks(params?: {
   });
   createdBindingManagers.length = 0;
   getAcpSessionStatusMock.mockClear().mockResolvedValue({ state: "idle" });
-  getPluginCommandSpecsMock.mockClear().mockReturnValue([]);
   listNativeCommandSpecsForConfigMock
     .mockClear()
     .mockReturnValue(
       params?.nativeCommands ?? [{ name: "cmd", description: "built-in", acceptsArgs: false }],
     );
-  listSkillCommandsForAgentsMock.mockClear().mockReturnValue([]);
+  prepareSkillCommandsForAgentsMock.mockClear().mockResolvedValue([]);
   monitorLifecycleMock.mockClear().mockImplementation(async (monitorParams) => {
     monitorParams.threadBindings.stop();
   });
@@ -270,11 +255,7 @@ export function resetDiscordProviderMonitorMocks(params?: {
   voiceRuntimeModuleLoadedMock.mockClear();
 }
 
-export const baseRuntime = (): RuntimeEnv => ({
-  log: vi.fn(),
-  error: vi.fn(),
-  exit: vi.fn(),
-});
+export const baseRuntime = (): RuntimeEnv => createRuntimeSpies();
 
 export const baseConfig = (): OpenClawConfig =>
   ({
@@ -311,6 +292,7 @@ vi.mock("../internal/discord.js", async () => {
   class Client {
     listeners: unknown[];
     rest: {
+      options: { timeout: number };
       get: ReturnType<typeof vi.fn>;
       post: ReturnType<typeof vi.fn>;
       put: ReturnType<typeof vi.fn>;
@@ -322,6 +304,7 @@ vi.mock("../internal/discord.js", async () => {
       this.options = options;
       this.listeners = handlers.listeners ?? [];
       this.rest = {
+        options: { timeout: 15_000 },
         get: vi.fn(async () => undefined),
         post: vi.fn(async () => undefined),
         put: vi.fn(async () => undefined),
@@ -330,8 +313,8 @@ vi.mock("../internal/discord.js", async () => {
       };
       clientConstructorOptionsMock(options);
     }
-    async deployCommands(options?: { mode?: string }) {
-      return await clientDeployCommandsMock(options);
+    async deployCommands() {
+      return await clientDeployCommandsMock();
     }
     async fetchUser(target: string) {
       return await clientFetchUserMock(target);
@@ -365,14 +348,14 @@ vi.mock("openclaw/plugin-sdk/acp-runtime", async () => {
   };
 });
 
-vi.mock("openclaw/plugin-sdk/command-auth", async () => {
-  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/command-auth")>(
-    "openclaw/plugin-sdk/command-auth",
+vi.mock("openclaw/plugin-sdk/command-auth-native", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/command-auth-native")>(
+    "openclaw/plugin-sdk/command-auth-native",
   );
   return {
     ...actual,
     listNativeCommandSpecsForConfig: listNativeCommandSpecsForConfigMock,
-    listSkillCommandsForAgents: listSkillCommandsForAgentsMock,
+    prepareSkillCommandsForAgents: prepareSkillCommandsForAgentsMock,
   };
 });
 vi.mock("openclaw/plugin-sdk/reply-runtime", async () => {
@@ -403,7 +386,7 @@ vi.mock("openclaw/plugin-sdk/runtime-config-snapshot", async () => {
   >("openclaw/plugin-sdk/runtime-config-snapshot");
   return {
     ...actual,
-    getRuntimeConfig: () => ({}),
+    captureRuntimeConfigAsyncReader: () => async () => ({}),
   };
 });
 
@@ -450,6 +433,7 @@ vi.mock(buildDiscordSourceModuleId("accounts.js"), () => ({
 
 vi.mock(buildDiscordSourceModuleId("probe.js"), () => ({
   fetchDiscordApplicationId: async () => "app-1",
+  probeDiscordApplicationId: async () => ({ kind: "resolved", applicationId: "app-1" }),
   parseApplicationIdFromToken: (token: string) => {
     const segment = token.trim().split(".")[0];
     if (!segment) {
@@ -469,7 +453,12 @@ vi.mock(buildDiscordSourceModuleId("token.js"), () => ({
 }));
 
 vi.mock(buildDiscordSourceModuleId("voice/command.js"), () => ({
-  createDiscordVoiceCommand: () => ({ name: "voice-command" }),
+  DISCORD_VOICE_COMMAND_SPEC: {
+    name: "vc",
+    description: "Voice channel controls",
+    acceptsArgs: false,
+  },
+  createDiscordVoiceCommand: () => ({ name: "vc" }),
 }));
 
 vi.mock(buildDiscordSourceModuleId("monitor/agent-components.js"), () => ({
@@ -508,6 +497,8 @@ vi.mock(buildDiscordSourceModuleId("monitor/listeners.js"), () => ({
   DiscordPresenceListener: function DiscordPresenceListener() {},
   DiscordReactionListener: function DiscordReactionListener() {},
   DiscordReactionRemoveListener: function DiscordReactionRemoveListener() {},
+  DiscordThreadDeleteListener: function DiscordThreadDeleteListener() {},
+  DiscordThreadReadyListener: function DiscordThreadReadyListener() {},
   DiscordThreadUpdateListener: function DiscordThreadUpdateListener() {},
   registerDiscordListener: vi.fn(),
 }));

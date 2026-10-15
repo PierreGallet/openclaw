@@ -1,6 +1,11 @@
+// Discord tests cover native command.status direct plugin behavior.
 import { ChannelType } from "discord-api-types/v10";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import * as channelInbound from "openclaw/plugin-sdk/channel-inbound";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type * as SessionTranscriptRuntime from "openclaw/plugin-sdk/session-transcript-runtime";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { installDiscordIngressTestRuntime } from "../test-support/ingress-runtime.js";
+import * as nativeCommandRoute from "./native-command-route.js";
 import { createMockCommandInteraction as createInteraction } from "./native-command.test-helpers.js";
 import { createNoopThreadBindingManager } from "./thread-bindings.js";
 
@@ -8,6 +13,7 @@ const runtimeModuleMocks = vi.hoisted(() => ({
   dispatchReplyWithDispatcher: vi.fn(),
   loadWebMedia: vi.fn(),
   resolveDirectStatusReplyForSession: vi.fn(),
+  recordDeliveredCommandExchange: vi.fn(async () => ({ ok: true })),
 }));
 
 vi.mock("openclaw/plugin-sdk/reply-dispatch-runtime", async () => {
@@ -26,21 +32,50 @@ vi.mock("openclaw/plugin-sdk/command-status-runtime", () => ({
     runtimeModuleMocks.resolveDirectStatusReplyForSession(...args),
 }));
 
+vi.mock("openclaw/plugin-sdk/session-transcript-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionTranscriptRuntime>()),
+  recordDeliveredCommandExchange: runtimeModuleMocks.recordDeliveredCommandExchange,
+}));
+
 vi.mock("openclaw/plugin-sdk/web-media", () => ({
   loadWebMedia: (...args: unknown[]) => runtimeModuleMocks.loadWebMedia(...args),
 }));
 
+const dispatchChannelInboundTurnForTest: typeof channelInbound.dispatchChannelInboundTurn = async (
+  plan,
+) => {
+  const dispatchResult = await runtimeModuleMocks.dispatchReplyWithDispatcher({
+    ctx: plan.ctxPayload,
+    cfg: plan.cfg,
+    dispatcherOptions: {
+      ...plan.dispatcherOptions,
+      deliver: "deliver" in plan.delivery ? plan.delivery.deliver : undefined,
+      onError: plan.delivery.onError,
+    },
+    replyOptions: plan.replyOptions,
+  });
+  return {
+    admission: { kind: "dispatch" },
+    dispatched: true,
+    ctxPayload: plan.ctxPayload,
+    routeSessionKey: plan.route.sessionKey,
+    dispatchResult,
+  };
+};
+
 let createDiscordNativeCommand: typeof import("./native-command.js").createDiscordNativeCommand;
-let discordNativeCommandTesting: typeof import("./native-command.js").__testing;
 
 function createConfig(params?: { requireMention?: boolean }): OpenClawConfig {
   return {
     commands: {
-      useAccessGroups: false,
+      allowFrom: { discord: ["user:owner"] },
     },
     channels: {
       discord: {
-        dm: { enabled: true, policy: "open", allowFrom: ["*"] },
+        dm: { enabled: true },
+        dmPolicy: "open",
+        groupPolicy: "open",
+        allowFrom: ["*"],
         guilds: {
           guild1: {
             requireMention: true,
@@ -57,13 +92,25 @@ function createConfig(params?: { requireMention?: boolean }): OpenClawConfig {
   } as OpenClawConfig;
 }
 
-async function createStatusCommand(cfg: OpenClawConfig) {
+async function createStatusCommand(cfg: OpenClawConfig, pluginExecute?: ReturnType<typeof vi.fn>) {
   return createDiscordNativeCommand({
     command: {
       name: "status",
       description: "Status",
       acceptsArgs: false,
-    },
+      ...(pluginExecute
+        ? {
+            requireAuth: true,
+            prepareDispatch: () => ({
+              kind: "plugin" as const,
+              invocation: {
+                runtime: { execute: pluginExecute },
+                selection: Object.freeze({}),
+              },
+            }),
+          }
+        : {}),
+    } as never,
     cfg,
     discordConfig: cfg.channels?.discord ?? {},
     accountId: "default",
@@ -74,30 +121,35 @@ async function createStatusCommand(cfg: OpenClawConfig) {
 }
 
 function setDefaultRouteState() {
-  discordNativeCommandTesting.setResolveDiscordNativeInteractionRouteState(async (params) => ({
-    route: {
-      agentId: "main",
-      channel: "discord",
-      accountId: params.accountId ?? "default",
-      sessionKey: "agent:main:main",
-      mainSessionKey: "agent:main:main",
-      lastRoutePolicy: "session",
-      matchedBy: "default",
-    },
-    effectiveRoute: {
-      agentId: "main",
-      channel: "discord",
-      accountId: params.accountId ?? "default",
-      sessionKey: "agent:main:main",
-      mainSessionKey: "agent:main:main",
-      lastRoutePolicy: "session",
-      matchedBy: "default",
-    },
-    boundSessionKey: undefined,
-    configuredRoute: null,
-    configuredBinding: null,
-    bindingReadiness: null,
-  }));
+  vi.spyOn(nativeCommandRoute, "resolveDiscordNativeInteractionRouteState").mockImplementation(
+    (params) => ({
+      effectiveRoute: {
+        agentId: "main",
+        channel: "discord",
+        accountId: params.accountId ?? "default",
+        sessionKey: "agent:main:main",
+        mainSessionKey: "agent:main:main",
+        lastRoutePolicy: "session",
+        matchedBy: "default",
+      },
+      boundSessionKey: undefined,
+      configuredBinding: null,
+    }),
+  );
+}
+
+type MockWithCalls = { mock: { calls: unknown[][] } };
+
+function firstMockCall(mock: MockWithCalls, label: string): unknown[] {
+  const call = mock.mock.calls.at(0);
+  if (!call) {
+    throw new Error(`expected ${label} call`);
+  }
+  return call;
+}
+
+function firstMockArg(mock: MockWithCalls, label: string) {
+  return firstMockCall(mock, label)[0];
 }
 
 function firstStatusCall(): {
@@ -107,10 +159,10 @@ function firstStatusCall(): {
   isGroup: boolean;
   defaultGroupActivation: () => "always" | "mention";
 } {
-  const call = runtimeModuleMocks.resolveDirectStatusReplyForSession.mock.calls[0]?.[0];
-  if (!call) {
-    throw new Error("expected resolveDirectStatusReplyForSession to be called");
-  }
+  const call = firstMockArg(
+    runtimeModuleMocks.resolveDirectStatusReplyForSession,
+    "resolveDirectStatusReplyForSession",
+  );
   return call as {
     cfg: OpenClawConfig;
     sessionKey: string;
@@ -122,9 +174,10 @@ function firstStatusCall(): {
 
 describe("discord native /status", () => {
   beforeAll(async () => {
-    ({ createDiscordNativeCommand, __testing: discordNativeCommandTesting } =
-      await import("./native-command.js"));
+    ({ createDiscordNativeCommand } = await import("./native-command.js"));
   });
+
+  afterEach(() => vi.restoreAllMocks());
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -143,67 +196,16 @@ describe("discord native /status", () => {
       buffer: Buffer.from("image"),
       fileName: "status.png",
     });
-    discordNativeCommandTesting.setDispatchReplyWithDispatcher(
-      runtimeModuleMocks.dispatchReplyWithDispatcher as typeof import("openclaw/plugin-sdk/reply-dispatch-runtime").dispatchReplyWithDispatcher,
-    );
-    discordNativeCommandTesting.setMatchPluginCommand(
-      (() => null) as typeof import("openclaw/plugin-sdk/plugin-runtime").matchPluginCommand,
+    vi.spyOn(channelInbound, "dispatchChannelInboundTurn").mockImplementation(
+      dispatchChannelInboundTurnForTest,
     );
     setDefaultRouteState();
   });
 
-  it("returns a direct status reply without falling through the generic dispatcher", async () => {
-    const cfg = createConfig();
-    const command = await createStatusCommand(cfg);
-    const interaction = createInteraction();
-
-    await (command as { run: (interaction: unknown) => Promise<void> }).run(interaction as unknown);
-
-    expect(runtimeModuleMocks.resolveDirectStatusReplyForSession).toHaveBeenCalledTimes(1);
-    expect(runtimeModuleMocks.dispatchReplyWithDispatcher).not.toHaveBeenCalled();
-    expect(interaction.followUp).toHaveBeenCalledWith(
-      expect.objectContaining({
-        content: "status reply",
-        ephemeral: true,
-      }),
-    );
-    expect(interaction.reply).not.toHaveBeenCalled();
-  });
-
-  it("prioritizes direct status replies over matching plugin commands", async () => {
-    const executePluginCommand = vi.fn(async () => ({ text: "plugin status" }));
-    discordNativeCommandTesting.setMatchPluginCommand((() => ({
-      command: {
-        name: "status",
-        description: "Plugin status",
-        pluginId: "status-plugin",
-        acceptsArgs: false,
-        handler: async () => ({ text: "plugin status" }),
-      },
-      args: undefined,
-    })) as typeof import("openclaw/plugin-sdk/plugin-runtime").matchPluginCommand);
-    discordNativeCommandTesting.setExecutePluginCommand(
-      executePluginCommand as typeof import("openclaw/plugin-sdk/plugin-runtime").executePluginCommand,
-    );
-    const cfg = createConfig();
-    const command = await createStatusCommand(cfg);
-    const interaction = createInteraction();
-
-    await (command as { run: (interaction: unknown) => Promise<void> }).run(interaction as unknown);
-
-    expect(runtimeModuleMocks.resolveDirectStatusReplyForSession).toHaveBeenCalledTimes(1);
-    expect(executePluginCommand).not.toHaveBeenCalled();
-    expect(interaction.followUp).toHaveBeenCalledWith(
-      expect.objectContaining({
-        content: "status reply",
-        ephemeral: true,
-      }),
-    );
-  });
-
-  it("keeps every direct status chunk ephemeral", async () => {
+  it("delivers an embed-only direct status reply without reporting it unavailable", async () => {
+    const embeds = [{ title: "Status", description: "All systems operational" }];
     runtimeModuleMocks.resolveDirectStatusReplyForSession.mockResolvedValue({
-      text: `fallback models\nruntime info\n${"x".repeat(2200)}`,
+      channelData: { discord: { embeds } },
     });
     const cfg = createConfig();
     const command = await createStatusCommand(cfg);
@@ -211,15 +213,63 @@ describe("discord native /status", () => {
 
     await (command as { run: (interaction: unknown) => Promise<void> }).run(interaction as unknown);
 
-    expect(interaction.followUp.mock.calls.length).toBeGreaterThan(1);
-    for (const [payload] of interaction.followUp.mock.calls) {
-      expect(payload).toEqual(
-        expect.objectContaining({
-          ephemeral: true,
-        }),
-      );
-    }
+    expect(runtimeModuleMocks.dispatchReplyWithDispatcher).not.toHaveBeenCalled();
+    expect(interaction.followUp).toHaveBeenCalledOnce();
+    expect(firstMockArg(interaction.followUp, "interaction.followUp")).toStrictEqual({
+      embeds,
+      ephemeral: true,
+    });
   });
+
+  it("prioritizes direct status replies over matching plugin commands", async () => {
+    const executePluginCommand = vi.fn(async () => ({ text: "plugin status" }));
+    const cfg = createConfig();
+    const command = await createStatusCommand(cfg, executePluginCommand);
+    const interaction = createInteraction();
+
+    await (command as { run: (interaction: unknown) => Promise<void> }).run(interaction as unknown);
+
+    expect(runtimeModuleMocks.resolveDirectStatusReplyForSession).toHaveBeenCalledTimes(1);
+    expect(executePluginCommand).not.toHaveBeenCalled();
+    expect(runtimeModuleMocks.dispatchReplyWithDispatcher).not.toHaveBeenCalled();
+    expect(interaction.reply).not.toHaveBeenCalled();
+    expect(interaction.followUp).toHaveBeenCalledTimes(1);
+    expect(firstMockArg(interaction.followUp, "interaction.followUp")).toStrictEqual({
+      content: "status reply",
+      ephemeral: true,
+    });
+    expect(runtimeModuleMocks.recordDeliveredCommandExchange).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "agent:main:main",
+        commandText: "/status",
+        replyText: "status reply",
+        commandId: expect.stringMatching(/^discord:default:/),
+      }),
+    );
+  });
+
+  it.each([false, true])(
+    "records the unavailable status only after delivery (failed=%s)",
+    async (failed) => {
+      runtimeModuleMocks.resolveDirectStatusReplyForSession.mockResolvedValue(undefined);
+      const command = await createStatusCommand(createConfig());
+      const interaction = createInteraction();
+      if (failed) {
+        interaction.followUp.mockRejectedValueOnce({ discordCode: 10062 });
+      }
+
+      await command.run(interaction as never);
+
+      expect(runtimeModuleMocks.recordDeliveredCommandExchange).toHaveBeenCalledTimes(
+        failed ? 0 : 1,
+      );
+      if (!failed) {
+        expect(runtimeModuleMocks.recordDeliveredCommandExchange).toHaveBeenCalledWith(
+          expect.objectContaining({ commandText: "/status", replyText: "Status unavailable." }),
+        );
+      }
+    },
+  );
 
   it("keeps direct status media follow-up chunks ephemeral", async () => {
     runtimeModuleMocks.resolveDirectStatusReplyForSession.mockResolvedValue({
@@ -232,22 +282,20 @@ describe("discord native /status", () => {
 
     await (command as { run: (interaction: unknown) => Promise<void> }).run(interaction as unknown);
 
-    expect(runtimeModuleMocks.loadWebMedia).toHaveBeenCalledWith("https://example.com/status.png", {
-      localRoots: expect.any(Array),
-    });
-    expect(interaction.followUp.mock.calls.length).toBeGreaterThan(1);
-    expect(interaction.followUp.mock.calls[0]?.[0]).toEqual(
-      expect.objectContaining({
-        ephemeral: true,
-        files: expect.arrayContaining([expect.objectContaining({ name: "status.png" })]),
-      }),
+    expect(runtimeModuleMocks.loadWebMedia).toHaveBeenCalledTimes(1);
+    const [mediaUrl, mediaOptions] = firstMockCall(runtimeModuleMocks.loadWebMedia, "loadWebMedia");
+    expect(mediaUrl).toBe("https://example.com/status.png");
+    expect(Array.isArray((mediaOptions as { localRoots?: unknown } | undefined)?.localRoots)).toBe(
+      true,
     );
+    expect(interaction.followUp.mock.calls.length).toBeGreaterThan(1);
+    const firstPayload = firstMockArg(interaction.followUp, "interaction.followUp") as
+      | { ephemeral?: boolean; files?: Array<{ name?: string; data?: unknown }> }
+      | undefined;
+    expect(firstPayload?.ephemeral).toBe(true);
+    expect(firstPayload?.files?.map((file) => file.name)).toEqual(["status.png"]);
     for (const [payload] of interaction.followUp.mock.calls) {
-      expect(payload).toEqual(
-        expect.objectContaining({
-          ephemeral: true,
-        }),
-      );
+      expect((payload as { ephemeral?: boolean }).ephemeral).toBe(true);
     }
     expect(interaction.reply).not.toHaveBeenCalled();
   });
@@ -270,3 +318,5 @@ describe("discord native /status", () => {
     expect(statusCall.defaultGroupActivation()).toBe("always");
   });
 });
+
+installDiscordIngressTestRuntime();

@@ -1,56 +1,624 @@
 ---
-summary: "Run OpenClaw embedded agent turns through the bundled Codex app-server harness"
+doc-schema-version: 1
+summary: "Run OpenClaw embedded agent turns through the official Codex app-server harness"
 title: "Codex harness"
 read_when:
-  - You want to use the bundled Codex app-server harness
+  - You want to use the official Codex app-server harness
   - You need Codex harness config examples
-  - You want Codex-only deployments to fail instead of falling back to PI
+  - You need explicit Codex runtime policy and fallback rules
 ---
 
-The bundled `codex` plugin lets OpenClaw run embedded agent turns through the
-Codex app-server instead of the built-in PI harness.
+The official `codex` plugin runs embedded OpenAI agent turns through Codex
+app-server instead of the built-in OpenClaw harness. Codex owns the
+low-level agent session: native thread resume, native tool continuation,
+native compaction, and app-server execution. OpenClaw still owns chat
+channels, session files, model selection, OpenClaw dynamic tools, approvals,
+media delivery, and the visible transcript mirror.
 
-Use this when you want Codex to own the low-level agent session: model
-discovery, native thread resume, native compaction, and app-server execution.
-OpenClaw still owns chat channels, session files, model selection, tools,
-approvals, media delivery, and the visible transcript mirror.
+## Shared output projection
 
-When a source chat turn runs through the Codex harness, visible replies default
-to the OpenClaw `message` tool if the deployment has not explicitly configured
-`messages.visibleReplies`. The agent can still finish its Codex turn privately;
-it only posts to the channel when it calls `message(action="send")`. Set
-`messages.visibleReplies: "automatic"` to keep direct-chat final replies on the
-legacy automatic delivery path.
+Codex uses the shared native harness projection owners for bounded tool output,
+attributed assistant and tool messages, and presentation callback settlement.
+The shared settlement owner preserves callback order and joins pending
+presentation work before terminal delivery. Projection draining stays under the
+attempt cancellation and settlement deadline.
 
-Codex heartbeat turns also get the `heartbeat_respond` tool by default, so the
-agent can record whether the wake should stay quiet or notify without encoding
-that control flow in final text.
+The Codex adapter retains native item identities, protocol parsing, approvals,
+hook handling, and transcript provenance. Constructed messages are persisted
+through the existing scoped transcript APIs; the shared projection helpers do
+not own storage.
 
-Heartbeat-specific initiative guidance is sent as a Codex collaboration-mode
-developer instruction on the heartbeat turn itself. Ordinary chat turns restore
-Codex Default mode instead of carrying heartbeat philosophy in their normal
-runtime prompt.
+During `initialize`, OpenClaw uses `capabilities.optOutNotificationMethods` to
+suppress unused app-server notifications before they reach the transport and JSON
+decoder. This includes cumulative turn diffs; file-change items still carry the
+individual changes. The plugin's notification policy owns the exact method list.
+Turn and item lifecycle, transcript, usage, approval, and catalog notifications
+remain enabled. Some events whose payloads are not projected still carry progress:
+MCP progress, streamed patch updates, reasoning section markers, and model metadata
+keep native work from appearing stalled. Terminal interaction also informs process
+cleanup. These notifications remain enabled. Older app-servers that do not recognize
+the optional capability ignore it; the normal minimum-version check still applies.
 
-If you are trying to orient yourself, start with
-[Agent runtimes](/concepts/agent-runtimes). The short version is:
-`openai/gpt-5.5` is the model ref, `codex` is the runtime, and Telegram,
-Discord, Slack, or another channel remains the communication surface.
+The native session catalog keeps one resident index per Codex home, shared across
+agents, working-directory filters, searches, and pages. Lists normally filter and page
+bounded display rows in memory. They do not expire or restart native discovery
+on the normal sidebar polling interval. Row publication maintains one sorted view
+of eligible display rows and prepares their case-folded title text. A row change
+does not make the next poll rebuild or sort the inventory. Page selection stops
+after finding its rows and continuation; live status and workspace settings still
+apply per page. Searches with few matches and backward navigation can still
+examine the retained inventory, but do not allocate a filtered copy of it.
+This memory-only boundary is the local
+resident query. The Gateway also reads session entries from its resident session-row
+projection once its metadata is ready; mutations can require exact-key metadata refreshes
+before delivery. Catalog requests do not prepare unrelated session display rows, and
+sharing and adoption checks still use current metadata before each delivery.
+Display-only catalog refreshes retain prepared metadata selections; stored-entry,
+identity, and topology changes still invalidate them.
+Native adoption bindings still use their storage owner, and paired-node enumeration
+can use network I/O. Previews remain limited to 500 characters;
+native hydration and catalog pages remain limited to 64 rows each. Native `thread/list` has no bounded metadata projection, so wire JSON can still be
+large. Complete catalog `thread/list` pages and metadata-only `thread/read` responses
+up to 64 KiB are parsed and projected inline, avoiding worker startup for small
+catalog refreshes. Larger responses use a worker owned by their app-server client.
+Both paths apply the same projection. The stdout reader waits for the compact result
+before delivering later responses or notifications. It transfers larger responses
+as bytes, admits one worker task at a time, and pauses the transport while that task runs.
+Malformed JSON frames produce a redacted diagnostic and are dropped; subsequent
+valid frames continue normally. Native control reads, normal streaming notifications,
+and full-history reads keep their in-process decoder. Control reads preserve complete
+native metadata, including model selection and direct-input capability; transcript
+consumers require complete native raw items.
+Each native list page contains at most 64 rows (less than 6 MiB of serialized
+catalog metadata even at all field limits). Both paths apply the existing
+prefix-first preview selector and 500-character display bound. Unchanged
+background rows can reuse resident previews before delivery. Large native payloads
+and their temporary objects stay in the worker. Metadata reads preserve exact
+working directories and the native history paging mode.
+Ephemeral threads are excluded as soon as native metadata acknowledges them, so
+closing a short-lived helper cannot lose the exclusion while a background refresh is pending.
+Recency, native position within exposed timestamp ties, and thread ID form the
+stable ordering and opaque continuation key. Initial native positions preserve
+the sub-second order that the protocol rounds to seconds. Unchanged rows keep
+their positions across background refreshes, so existing cursors do not repeat
+or skip them. Newly discovered or newly active rows receive fresh positions ahead
+of an existing timestamp tie, preserving native order within each discovery batch.
+An observed turn start also receives a fresh position when its recency falls in
+the same exposed timestamp second as earlier activity.
+If every earlier matching row disappears, backward navigation returns the first
+remaining matching page. An empty known prefix retains forward continuation while
+hydration is incomplete.
 
-## Quick config
+The retained window is not a discovery limit. Once a home reaches 20,000 retained
+rows, recent unfiltered pages still use memory. Paging at the retained boundary,
+working-directory queries, and title searches use authoritative native database-only
+pages, including sessions absent from memory. Those requests can be slower. Each
+fallback request retains at most one 64-row native page. Search, exclusion filling,
+and any nested membership, status, or descendant reads share one 20-read budget
+and the existing request deadline, including across scheduler pauses. The request
+returns an opaque continuation when more discovery remains. Continue paging even
+when a partial search page is empty. Native cursors preserve native ordering and
+backward navigation. If a resident-to-native transition loses its anchor to a
+concurrent native mutation, it reports a refresh error instead of silently ending
+discovery. The snapshot remembers that the retained window may be incomplete.
 
-Most users who want "Codex in OpenClaw" want this route: sign in with a
-ChatGPT/Codex subscription, then run embedded agent turns through the native
-Codex app-server runtime. The model ref still stays canonical as
-`openai/gpt-*`; subscription auth comes from the Codex account/profile, not
-from an `openai-codex/*` model prefix.
+Search and managed-session exclusion filling examine at most 20 resident pages
+per request. If that limit is reached, the result retains an opaque continuation
+cursor so the next request can find later visible matches. Queries served entirely
+from the resident window perform no native reads; overflow discovery is the explicit exception.
 
-First sign in with Codex OAuth if you have not already:
+Source backoff settles when the whole foreground fallback request completes,
+including a bounded partial result with a continuation. Successful intermediate
+pages do not clear earlier failures. A failed recovery check advances the existing
+backoff schedule; abandoning a request releases its check without recording a new
+host failure. Background hydration keeps its separate grouped attempt and can
+walk the home to completion without consuming a foreground request's budget.
+
+Homes hydrate on the first authorized catalog request, including explicitly
+configured homes. Plugin activation does not start catalog-only app-servers for
+the configured agent fleet. A home without a valid,
+complete saved snapshot walks native `thread/list` pages once, yielding between
+pages. Progressive lists serve resident rows immediately. If a local home is still
+loading after 250 ms, the list returns that host as pending, preserving previously
+displayed rows; the existing progress callback publishes its page or error when ready.
+The page producer and publication remain owned by the list's background completion.
+One-shot lists, host-specific lookups, and pagination wait for a usable native
+page or confirmed empty inventory for at most five seconds (or the configured
+app-server request timeout when shorter).
+That single request budget also covers loading saved state. Partial results carry an opaque continuation cursor;
+a continuation that catches up with discovery waits for the next page within its
+request budget. If discovery is still pending at the deadline, the host reports a
+loading error and asks the caller to retry. The shared hydration continues in the
+background. Partial or invalid saved caches are rebuilt before their rows are
+shown, and initial retries preserve positions already used in continuation cursors.
+The index persists reconstructible display rows and file fingerprints through
+plugin state in the OpenClaw SQLite database. A valid complete snapshot serves a
+recent unfiltered page without a native request, including on remote app-servers.
+Background work reconciles changed files and native metadata after snapshot restoration. A
+database-only native metadata walk recovers changes made while the Gateway was
+stopped. A full safety walk becomes due after 15 minutes and runs in the background on the next resident catalog read, including renames, Git branch and other displayed metadata, and the selected rollout
+path after a native revert. An idle catalog does not re-list native history, and the first resident read after an idle interval can return cached rows before the walk finishes. Metadata changes and explicit clears are applied even
+when native activity timestamps do not change. Overlapping events, snapshot restoration,
+and background pages are best effort: a later completion can temporarily replace
+newer display metadata until the next event or reconciliation. These coalesced background walks reuse previews for
+unchanged rows and do not ask Codex to scan or repair rollouts. Requests over a
+complete snapshot never wait for these refreshes. A local database-only response can omit existing files when
+indexing is incomplete or unavailable, so omission alone does not remove a local
+row; verified file disappearance and explicit lifecycle events own removal.
+Loaded/active status has a separate memory-only lifecycle. For each thread, at most
+64 native connections can support the same current status. Closing one connection
+or receiving its `notLoaded` status withdraws only that connection's observation;
+an unrelated helper cannot clear activity observed by another open connection.
+Status resets to **Stored / activity unknown** after restart or when its final
+observing connection closes, until fresh native events or metadata supply current
+status. Overflow pages use this same source-owned status.
+Late responses from a closed connection cannot restore its active status.
+No native rollouts or transcripts are copied into the state database.
+Live workspace and model-provider settings also stay in memory, with at most
+64 supporting native connections per row. Settings notifications and successful
+resume acknowledgements update this overlay immediately; both cwd filtering and
+display use it, including overflow pages. When live cwd settings are present,
+overflow discovery filters after applying them instead of relying on stored native
+cwd. Native metadata refreshes cannot overwrite the overlay, and closing its
+last supporting connection or receiving that connection's `notLoaded` event
+restores the stored metadata. Resume publication uses
+the response's current cwd, which can differ from the thread's persisted cwd.
+For remote app-servers without local filesystem access, the saved snapshot is
+available immediately and a background native walk reconciles changes made while
+the Gateway was stopped or its app-server connection was unavailable. A full safety walk becomes due after 15 minutes and reconciles remote membership and metadata on resident catalog demand.
+Unchanged display rows reuse their bounded resident previews before delivery.
+Unchanged rows are not rewritten to SQLite.
+
+Native starts, metadata refreshes, renames, archives, deletions, and changed file
+fingerprints coalesce an incremental native check on the next 30-second tick.
+It reads database-only pages in descending recency order and stops after a whole
+page leaves the resident metadata unchanged, or at the 20,000-row retained limit.
+The comparison includes timestamps, selected path, fingerprint, and bounded display
+metadata; exposed timestamp ties keep their existing ordering. An unvisited tail
+is never treated as deleted. With no activity, ticks issue no native requests; local file safety scans remain on their own 15-minute cycle. These checks reuse the existing preview cache
+after JSON decoding; they reduce wire parsing by requesting fewer pages.
+
+Silent changes outside the checked prefix, including timestamp-preserving metadata
+edits and remote deletions or archives, appear at the next successful full safety
+walk after resident catalog demand. Local file disappearance is checked on its independent
+15-minute cycle; native database omission alone still cannot delete a local row.
+Native walks become due 15 minutes after the previous walk attempt and start on a
+subsequent resident catalog read. Native-backed overflow requests do not
+start a second full walk. A failed native walk records its error and waits for
+the next safety interval and catalog demand, subject to source backoff; it does
+not retry on idle ticks or on every busy catalog read.
+File scans retain their independent deadline and failure handling.
+Notifications and acknowledged catalog actions continue to update rows immediately.
+
+Native lifecycle notifications update affected threads, and successful catalog
+archives immediately hide their rows. Turn starts and completions coalesce
+single-thread metadata refreshes, so a running turn advances recency before it
+finishes. When an observing client closes, queued reads against that client stop;
+an interrupted read logs that its metadata refresh is deferred for automatic
+recovery by the current catalog owner, retaining the original cause. Genuine read,
+reconciliation, and storage failures still log background update warnings.
+Observations do not keep retired clients alive. A startup scan and
+the 15-minute safety scan discover external rollout changes. Each resident home
+caches at most 20,000 fingerprints across 256 watched day directories. Directory
+identity and timestamps detect replacements and membership changes; file-change
+notifications invalidate the containing directory for in-place appends. Unchanged
+directories reuse their fingerprints without statting each rollout. Unwatchable
+directories, watcher failures, and directories beyond the cache bounds use a full
+stat scan. Restart rebuilds this memory-only cache, and retiring the home closes its
+watchers. On macOS, a full read after the watcher has armed closes its startup
+notification gap before fingerprints can be reused. Parent directories are still
+enumerated to discover new days.
+Scans, snapshot restoration, and reconciliation yield between bounded batches.
+The scan streams directory entries and retains at most 20,000 candidate fingerprints
+while separately checking the presence of resident paths. Only changed or
+new files are read: at most 128 KiB each from the head and tail of a plain rollout,
+or a bounded 128 KiB compressed head. A missing first-user preview stays missing
+until a later change makes it discoverable. Native titles are preserved when a
+rollout has no title. A bounded read that cannot reach the first user message
+preserves its previously known preview. Immutable, unmodified rollouts cause no content reads.
+File-only rows remain provisional until native metadata arrives. After native
+publication, changed rollout headers cannot replace the selected workspace or
+native display metadata and `updatedAt`. A changed selected file can refresh its
+bounded first-user preview; a bounded read that misses it retains the known preview.
+Explicit native empty previews clear the stored fallback. Empty/nonempty preview
+transitions remain visible even within one exposed timestamp second. Scans advance
+recency only from parsed turn-start facts. This authority flag survives SQLite restore;
+obsolete cached rows without it are discarded and pruned in the background before
+rehydration. Name, status, and live-settings observations are stored separately
+from file metadata. Overlapping updates are best effort; a native response can
+temporarily replace a newer file update or restore a removed display row until
+the next reconciliation.
+Interrupted updates and transient file-read failures remain eligible for the next scan, even when
+file size and modification time stay unchanged.
+Plain and compressed rollouts share the native logical `.jsonl` identity;
+the scanner prefers the plain file when both representations exist.
+Codex owns the selected rollout path. Retained files from an earlier revert
+cannot replace the current session's path or metadata during a filesystem scan.
+
+Each home retains at most 20,000 display rows, 20,000 live-status records,
+20,000 live-settings records, 20,000 name records, and 20,000 scan fingerprints, matching the existing Codex
+managed-thread ceiling; eviction drops the oldest archived rows first, then the
+oldest remaining rows. Row eviction preserves independently bounded live status and
+settings while their supporting native connections remain open. Eviction removes only cached metadata: older sessions remain
+discoverable through native paging/search and readable by ID. Initial and full safety walks finish pagination, but rows beyond the
+resident limit are discarded before native-response metadata projection or preview
+sanitization. The native page size stays 64, and pagination continues to completion.
+At most 20,000 detached native cursors are remembered during a walk.
+The same archived-oldest row limit applies when restoring a complete snapshot.
+Incomplete snapshots still cannot establish a pageable native prefix.
+Plugin state also has its shared capacity limit. Persistence failure
+leaves the live resident view available and is logged; a missing complete
+snapshot rebuilds on restart. The derived cache adds no database schema-version
+change. A snapshot read failure invalidates durable completeness for that index
+lifetime; native hydration remains available in memory, and the next successful
+restart enumerates and prunes unread stale keys. The cache does not
+alter native session files, update migrations, or rollback.
+Exact-thread requests use fresh native metadata. Every remote eligibility check,
+including a resident cache hit, verifies authoritative non-archived membership because native `thread/read` can return
+archived threads. These checks use the existing request deadline, without a retained-row
+or page-count cutoff; paired-node exact lookup follows continuations under its existing deadline.
+Gateway aggregation only coalesces concurrent requests, so completed aggregate
+responses cannot delay the next poll's view of resident changes.
+While delivery waits for fresh identity facts, progress keeps the latest update
+for each selected catalog and observed host. It emits separate one-host frames;
+retained progress scales with distinct hosts, not with the number of updates.
+
+The row and bookkeeping limits are independent per home. Thread identifiers are
+limited to 256 UTF-16 code units, paths and working directories to 4,096, display
+metadata and previews to 500, status to 64, and active flags to 16 entries of 128.
+Retained strings are detached from larger native input strings. Preview decoding
+keeps its existing UTF-8 replacement behavior. Event scheduling and concurrent
+single-thread projections each admit at most 20,000 operations; mutations,
+obsolete cleanup keys, and pending persistence writes also have 20,000-entry
+ceilings. Persistence reserves one additional complete-marker operation and one
+in-flight write. Overflow preserves already-admitted writes, invalidates the
+complete marker, and logs a warning; resident queries remain available. Periodic
+reconciliation continues to refresh native metadata after an overflow.
+
+These are payload limits, not a promise about total JavaScript heap or Gateway
+RSS. With every string at its maximum length and two bytes per UTF-16 code unit,
+the following conservative capacities apply. The 490 column assumes 490 occupied
+entries in each named structure; a home with 490 current rows can still have
+20,000 historical field or queue entries.
+With those independent field and scan-path indexes full, settled string payload is
+bounded by 473.566 MiB for 490 current rows, or 993.385 MiB for 20,000 rows. These
+figures exclude active work and object/engine overhead. The watched-directory cache
+can additionally retain 20,000 rollout paths (156.250 MiB at the maximum string
+length) and 256 directory keys (2 MiB). Unchanged generations share fingerprint
+objects with the scan result; these are conservative independent bounds.
+
+| Retained string payload                        | 490 entries | 20,000 entries |
+| ---------------------------------------------- | ----------: | -------------: |
+| Display rows (12,469 code units each)          |  11.654 MiB |    475.655 MiB |
+| Prepared title search (up to 1,500 code units) |   1.402 MiB |     57.220 MiB |
+| Name, status, and settings records together    |   7.454 MiB |    304.260 MiB |
+| One scan-path generation                       |   3.828 MiB |    156.250 MiB |
+| Native thread DTOs pending projection          |  13.569 MiB |    553.856 MiB |
+| Mutation identifiers                           |   0.239 MiB |      9.766 MiB |
+| Cleanup or persistence keys (512-byte ceiling) |   0.479 MiB |     19.531 MiB |
+
+The title-search bound allows locale case folding to expand a 500-code-unit
+display title. This derived text is memory-only and is replaced or removed with
+its resident row; it is never persisted in the catalog snapshot.
+
+A native walk and file scan can each retain an older row snapshot, adding at most
+two row generations. Pending persistence can retain another row generation plus
+one in-flight row. An active event projection can temporarily hold two bounded native DTO
+generations and one projected row. File currency retains the previous and
+new fingerprint generations plus presence keys; arrays and maps share their
+referenced row/string values. The native cursor set has its own 156.250 MiB
+maximum string capacity even in a home with fewer rows. Status and settings each
+retain at most 64 passive source references per entry (2,560,000 references across
+both full indexes). Object, map, array, promise, allocator, and engine overhead,
+transport buffers, and the separate managed-thread/provenance caches are outside
+these string-payload figures.
+
+The generic plugin-state `entries()` API decodes an entire namespace before the
+catalog can validate or limit its rows. Its 1 MiB generic value limit permits
+19.532 GiB of serialized values for 20,001 entries, before JavaScript expansion.
+The resident limiter bounds the admitted result, not this predecode peak. Normal
+catalog writes contain only the much smaller bounded row shape; resolving the
+generic peak requires a paged state API.
+
+Pasted text saved as a `.txt` attachment is extracted by OpenClaw and included in
+the current turn as untrusted external content, subject to the existing file
+extraction limits. Extracted attachments use the sender's filename in model context,
+even when the stored or staged copy has a generated name. This also applies to
+adopted and forked Codex sessions with locked model selection. Images continue
+through Codex's native image input.
+
+For an unsandboxed local Codex process with file-read permission, OpenClaw also
+supplies verified paths to saved documents. Codex can process the complete file
+when inline extraction is bounded. OpenClaw adds the paths to the admitted native
+input without changing its stored attachment references or transcript text.
+If the path note cannot fit the native input budget, OpenClaw omits it and retains
+the original request and inline attachment context.
+JSON escapes keep mention characters in attachment metadata from selecting skills
+or plugins while preserving the decoded filenames and paths.
+Codex retains that input in its own native conversation history. The path note
+identifies a file; later turns still use the existing execution and tool-policy
+admission. This does not expand workspace-only policies or expose Gateway paths
+to remote app-servers.
+
+Remote Codex app-servers can run on a different machine from the Gateway. Set
+`remoteWorkspaceRoot` to validate remote workspace attachment paths. OpenClaw
+transfers authoritative attachment bytes over the existing app-server connection
+using a fixed, no-shell `command/exec` reader. The reader rejects symlinks,
+enforces file and response size limits before allocation, and stages immutable
+Gateway-managed media before channel delivery without requiring a shared or
+synchronized filesystem. Codex images are materialized directly from typed
+app-server events. Saved-path-only images use the same bounded remote reader.
+Uploads always use the Gateway's configured channel identity and request timeout.
+
+Use standard OpenAI model refs such as `openai/gpt-6-astra`. Do not configure
+legacy Codex GPT refs. Put OpenAI agent auth order under `auth.order.openai`.
+Legacy Codex auth profile ids and legacy Codex auth order entries are
+repaired by `openclaw doctor --fix`.
+
+With provider/model runtime policy unset or `auto`, the `openai/*` prefix alone
+never selects this harness. OpenAI may select Codex implicitly only for an
+exact official HTTPS Platform Responses or ChatGPT Responses route with no
+authored provider request override. Valid model-scoped `params.fastMode` /
+`params.fast_mode` values and valid cutoff keys are typed agent-runtime
+controls, so they do not count as authored provider request params or select a
+runtime by themselves. See
+[OpenAI implicit agent runtime](/providers/openai/runtimes#implicit-agent-runtime).
+If Codex owns auth before Platform versus ChatGPT routing is known, OpenClaw
+still requires every candidate route to declare Codex compatibility. Native
+auth ownership alone never bypasses that route check.
+
+When no OpenClaw sandbox is active, OpenClaw starts Codex app-server threads
+with Codex native code mode enabled (code-mode-only stays off by default), so
+native workspace/code capabilities remain available alongside OpenClaw
+dynamic tools routed through the app-server `item/tool/call` bridge. An
+ordinary OpenClaw sandbox or restricted tool policy disables native code mode
+unless you opt into the experimental sandbox exec-server path. The effective
+tool profile must allow all native shell and filesystem capabilities: `coding`
+and `full` do, while `messaging` and `minimal` disable the native surface. Agent
+and provider profile overrides and explicit tool restrictions still apply.
+
+Selecting a managed GitHub Identity also uses OpenClaw's host-owned tools instead
+of native Code Mode. The same exec owner used by the built-in runtime binds the
+selected profile at child launch, preserves approval and caller lifetime checks,
+and reports an unavailable profile without falling back to native GitHub auth.
+Other tools and the conversation remain available; identity discovery does not
+block turn startup. Reconnect or change GitHub Identity in Settings to recover.
+With no managed identity selected, native Code Mode and shell defaults are unchanged.
+Ordinary paired-node exec keeps node-local authentication: a Gateway GitHub
+selection and command approval never export that credential to the node.
+
+When sandboxing disables the native surface, allowed shell commands remain available
+through `sandbox_exec`. Denying `process` removes `sandbox_process` and background
+continuation, while `sandbox_exec` runs to completion under the existing timeout,
+sandbox backend, and workspace-access policy.
+
+When deferred tools or native delegation are available, normal threads receive
+guidance to call listed tools directly and use `tool_search` for unlisted tools.
+They keep an `exec` / `ALL_TOOLS` fallback for the case where `tool_search` is
+not directly callable (for example a model whose metadata selects code-mode-only
+execution), but are told never to use `exec` to look up a listed tool or to
+repeat a completed call. Configured code-mode-only threads receive the original
+`exec` / `ALL_TOOLS` discovery guidance.
+
+Sandbox turns also use these tools when Codex allows only managed hooks and cannot
+install the native process-admission hook. OpenClaw selects this existing execution
+path before preparing the tool catalog and prompt. Existing policies that require
+other enforcing native hooks still require their normal preflight to pass.
+
+The sandbox exec-server option does not bypass those tool restrictions. Node-backed
+`remote-exec` on a paired device or cloud worker instead uses its
+placement-owned environment without that experimental flag. A dedicated cloud worker with a completed project preparation keeps the bound workspace and `HOME` paths, so native commands can reuse setup caches. The node exec-server still uses a separate temporary `CODEX_HOME` for each connection. Ending the connection removes that Codex state and preserves the prepared project home.
+
+Some placements require native execution. Node-backed `remote-exec` turns reject
+a limited profile when they cannot run without native tools. A native-owned
+attached Codex thread can also reject a restricted turn when applying the policy
+would require replacing that externally owned thread. This can interrupt an
+existing conversation after an upgrade. To retain a limited profile, use a
+Gateway-managed conversation or runtime with a compatible execution environment.
+If native shell and filesystem access is intended, the operator can choose
+`coding` or `full`. Other explicit tool and sandbox restrictions still apply;
+an explicit finite tool allowlist still blocks native execution. OpenClaw does
+not broaden tool access or replace externally owned threads automatically.
+
+Scheduled and other runtime tool allowlists use the same aliases, groups, and
+wildcards as the OpenClaw harness, including `cron`, `group:runtime`, and `web_*`.
+An explicit empty runtime allowlist disables tools. Independent restrictions
+must all permit a tool before OpenClaw registers it with Codex.
+
+Eligible native-shell turns also retain `gateway_exec` and `gateway_process`
+as a distinct OpenClaw execution path. Use `gateway_exec` only when a command
+needs OpenClaw-managed Gateway environment access, including Secret Store
+agent-readable environment values or protected egress sentinels. It is pinned
+to the Gateway host and follows OpenClaw exec policy. `gateway_process` uses the
+existing per-session OpenClaw process scope for background follow-up. Prefer
+Codex native shell for ordinary local work.
+
+A native shell command can yield a session handle before it exits. When a
+successful turn ends with that exact command still owned by the native thread,
+its tool row records **Outcome unknown** and explains that the process is still
+running. This is not command success or failure. Collect the retained handle
+with the native process-wait tool to obtain its output and exit code. The
+continuation records that result without rewriting the earlier turn's snapshot.
+Confirmed background commands keep their native thread subscribed until their
+matching completion or source closure, including when the sandbox exec-server
+is disabled. Idle conversation eviction does not interrupt that work.
+The existing unknown-outcome audit diagnostic remains; cancellation and a
+command with no confirmed live owner retain their failure handling.
+
+Stopping an active Codex run interrupts its turn. After a parent yields to native
+children, Stop waits for its admitted descendants to reach real terminal events
+and finish completion settlement. A child that completes successfully during
+Stop keeps its result. Stop does not cancel a sibling run or a replacement
+session generation. After Stop settles, you can send another message in the same
+chat without reconnecting.
+Stop also retires an already-interrupted child without interrupting its finished
+turn again, so that child cannot keep its parent session blocked.
+If its previous native process is already closing, Stop cancels the waiting run
+without waiting for physical exit. A replacement writer still waits for that exit.
+Session-wide Stop preserves the caller's request ownership, protected-run, and
+side-run restrictions. Native descendants retain host-captured request custody
+after their foreground parent finishes; restored observations without that
+custody cannot acquire cancellation authority from session or run IDs alone.
+
+With the OpenClaw sandbox
+exec-server, cleanup stops the concrete processes admitted by that turn and
+preserves independent background work in the same reused thread. Each process
+retains its original source until settlement, including after foreground
+completion. Visitor Access expiry and revocation stop the guest's retained
+processes without interrupting a later maintainer turn. Native command admission and subsequent
+process input recheck the original source; cleanup remains available after
+revocation.
+
+Other native execution modes retain thread-wide background-terminal cleanup.
+Other Codex threads and deliberately backgrounded `gateway_process` jobs are
+unaffected.
+If native terminal cleanup fails, the run reports an error instead of silently
+claiming cleanup succeeded. Inspect that thread's running terminals before
+starting more work. This uses Codex's terminal ownership. It does not guarantee
+cleanup of commands that deliberately detach from that ownership.
+
+With the default `tools.exec.host: "auto"` and no active OpenClaw sandbox,
+Codex also receives `node_exec` when a connected node supports `system.run`.
+Offline paired devices and devices without shell support do not expose this tool.
+When a node is configured, that binding must resolve to an eligible node. Native shell
+remains on the Codex app-server host and workspace
+(Gateway-local for the default stdio deployment). `node_exec` selects the sole
+connected node that supports `system.run`, or requires a name or id when several
+are eligible. It keeps OpenClaw's node approval policy in force and waits for the
+remote command to finish. Remote-node background follow-up is not available. If
+a finite runtime allowlist disables native Code Mode and leaves the turn without
+an execution environment, OpenClaw keeps its policy-filtered `exec` and
+`process` tools available instead for direct, unsandboxed execution.
+
+When `tools.exec.host: "node"` or `/exec host=node` makes the node the session
+default, OpenClaw hides the Codex-native shell and exposes `node_exec` only while
+the node target is eligible. If it is unavailable, reconnect the configured node
+or explicitly change the exec host. OpenClaw does not silently fall back to the
+app-server or Gateway machine.
+
+`gateway_exec` is not exposed when an active OpenClaw sandbox, a node-default
+execution policy, memory-flush restrictions, tool allow/deny policy, or
+`codexDynamicToolsExclude` would make Gateway host access a bypass. Secret
+Store environment values never enter the Codex app-server process, native
+shell, sandbox exec-server, ACP children, sandbox exec, or node exec.
+
+This Codex-native feature is separate from
+[OpenClaw Code Mode](/tools/code-mode), a separate JavaScript runtime with its
+own automatic per-model activation and explicit overrides. It has a different
+`exec` input shape. For the
+broader model/provider/runtime split, start with
+[Agent runtimes](/concepts/agent-runtimes): `openai/gpt-6-astra` is the model
+ref, `codex` is the runtime, and Telegram, Discord, Slack, or another
+channel is the communication surface.
+
+## Saved-account usage
+
+The plugin's `codex.accountUsage` Gateway method accepts `agentId` and `profileId`.
+It reuses `account/rateLimits/read` in a temporary local app-server with the
+selected login, even when the normal harness uses a native home or remote server.
+Each request fetches current quotas for the selected saved subscription login.
+The request requires `operator.admin` and rejects changed or removed credentials.
+Proxy launch arguments are rejected to avoid changing a shared daemon's login.
+
+## Native subagent status
+
+Native Codex subagents use Codex's execution and collaboration controls, not
+OpenClaw's retired Tasks view. Their current execution, assignment result, and
+result delivery remain separate facts.
+
+Retirement revokes captured requester authority immediately, then joins accepted
+native submission and assignment writes before releasing child subscriptions.
+Client disposal joins those writes before releasing retained owners.
+
+An approval or input request shows what needs attention. A native mailbox wait
+shows that the agent is waiting for messages; it does not invent a list of child
+dependencies. Idle, interrupted, or unloaded native threads do not prove that
+the delegated task succeeded. A resumed native turn clears the previous turn's
+current tool activity while retaining the native assignment identity.
+
+Follow-up work after a native child has finished creates a separate assignment
+on the same Codex thread. Earlier results and their delivery status remain intact.
+The native thread retains its conversation; there is no shared Tasks transcript
+viewer. Interrupted work keeps its assignment identity when the native turn resumes.
+If a recovered turn's end is still unknown, OpenClaw waits for native history or
+an end event before deciding whether later work resumes that assignment or starts
+a new one. Older assignments without enough native turn information remain
+unresolved instead of borrowing another turn's result.
+
+Pending native assignments retain their run, child-thread, native-parent, and
+known native-turn identities in metadata on the existing parent binding. This
+adds no SQL table and does not migrate old Tasks rows. On parent registration,
+OpenClaw can restore observation from those saved identities and native history
+only under fresh completion authority for the same requester session, lifecycle,
+and connection. Native-parent thread rotation can preserve those assignments;
+resetting the requester or changing the connection does not adopt them. Missing
+assignment metadata is not reconstructed from retired Tasks history.
+
+For Codex V1 follow-ups, OpenClaw retains a successful submission receipt with
+the parent binding until it records the matching native turn as an assignment.
+This allows recovery when the parent yields or the Gateway restarts before observing
+the child turn. A receipt alone does not keep an idle native connection alive.
+Observation follows the existing warm-thread lifetime; an unmatched receipt
+remains available for later recovery. Resetting the parent or replacing its native connection
+invalidates these receipts. Before downgrading OpenClaw, let pending native work
+settle: older versions can read the binding but may discard its recovery receipts
+when updating it.
+
+Closing a native child applies to the assignment selected when the close starts.
+OpenClaw waits for Codex to confirm that the child's runtime is absent before
+marking unfinished work canceled; a delayed close cannot cancel a later assignment.
+If confirmation is unavailable, the close remains unresolved; retry the close
+request rather than treating it as successful cancellation.
+Native result receipts do not identify the child's turn. If an earlier result
+is still being recovered or repeated identical results make a receipt ambiguous,
+OpenClaw preserves the later pending delivery instead of risking a lost result;
+this can cause an additional continuation.
+
+Codex owns native subagent execution and controls. Follow up through the parent
+session, which can use Codex's native collaboration tools. For an admitted native
+assignment, OpenClaw's harness observes the child and routes results after the
+parent yields. The native foreground parent already receives completion messages, so OpenClaw does not
+send another continuation for a result it has consumed. Explicit OpenClaw or ACP
+delegation continues to use `sessions_spawn`. Stored submission and result
+receipts are recovery evidence, not permission to adopt a child or deliver to a
+replacement parent.
+
+For native Codex V1 agents, a completed `wait` result also records delivery to
+the foreground parent. OpenClaw does not start another continuation for that
+same child result after the parent replies.
+
+## Requirements
+
+- The official `@openclaw/codex` plugin installed. Include `codex` in
+  `plugins.allow` if your config uses an allowlist.
+- Managed Codex app-server `0.160.0` or newer. The plugin ships
+  `@openai/codex` `0.160.1` and uses a newer stable `codex` from `PATH` only
+  after it passes a version check and an app-server handshake; see
+  [Newer installed Codex](/plugins/codex-harness-reference/app-server-transport#newer-installed-codex).
+  Explicit custom, remote, and macOS desktop-owned
+  app-servers must report a parseable semantic version of `0.149.0` or newer.
+  Newer versions continue with a compatibility warning and normal runtime
+  validation.
+- Node.js on the remote Codex app-server host when `remoteWorkspaceRoot` is set
+  and cross-machine workspace attachments must be transferred.
+- Codex auth through `openclaw models auth login --provider openai`, an
+  app-server account already present in the agent's Codex home, or an
+  explicit Codex API-key auth profile.
+
+For auth precedence, environment isolation, custom app-server commands,
+model discovery, and the full config field list, see
+[Codex harness reference](/plugins/codex-harness-reference).
+
+## Quickstart
+
+Install the official plugin, then sign in with Codex OAuth:
 
 ```bash
-openclaw models auth login --provider openai-codex
+openclaw plugins install @openclaw/codex
+openclaw models auth login --provider openai
 ```
 
-Then enable the bundled `codex` plugin and force the Codex runtime:
+Enable the `codex` plugin and select an OpenAI agent model:
 
 ```json5
 {
@@ -63,16 +631,13 @@ Then enable the bundled `codex` plugin and force the Codex runtime:
   },
   agents: {
     defaults: {
-      model: "openai/gpt-5.5",
-      agentRuntime: {
-        id: "codex",
-      },
+      model: "openai/gpt-6-astra",
     },
   },
 }
 ```
 
-If your config uses `plugins.allow`, include `codex` there too:
+If your config uses `plugins.allow`, add `codex` there too:
 
 ```json5
 {
@@ -87,1008 +652,166 @@ If your config uses `plugins.allow`, include `codex` there too:
 }
 ```
 
-Do not use `openai-codex/gpt-*` when you mean native Codex runtime. That prefix
-is the explicit "Codex OAuth through PI" route. Config changes apply to new or
-reset sessions; existing sessions keep their recorded runtime.
+Plugin config changes apply automatically in the default hybrid reload mode.
+See [Apply changes and inspect](/plugins/manage-plugins#apply-changes-and-inspect).
+If a chat already has a
+session, run `/new` or `/reset` first so the next turn resolves the harness
+from current config.
 
-## What this plugin changes
+## Verify Codex runtime
 
-The bundled `codex` plugin contributes several separate capabilities:
+Use `/status` in the chat where you expect Codex. A Codex-backed OpenAI
+agent turn shows:
 
-| Capability                        | How you use it                                      | What it does                                                                  |
-| --------------------------------- | --------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Native embedded runtime           | `agentRuntime.id: "codex"`                          | Runs OpenClaw embedded agent turns through Codex app-server.                  |
-| Native chat-control commands      | `/codex bind`, `/codex resume`, `/codex steer`, ... | Binds and controls Codex app-server threads from a messaging conversation.    |
-| Codex app-server provider/catalog | `codex` internals, surfaced through the harness     | Lets the runtime discover and validate app-server models.                     |
-| Codex media-understanding path    | `codex/*` image-model compatibility paths           | Runs bounded Codex app-server turns for supported image understanding models. |
-| Native hook relay                 | Plugin hooks around Codex-native events             | Lets OpenClaw observe/block supported Codex-native tool/finalization events.  |
-
-Enabling the plugin makes those capabilities available. It does **not**:
-
-- start using Codex for every OpenAI model
-- convert `openai-codex/*` model refs into the native runtime
-- make ACP/acpx the default Codex path
-- hot-switch existing sessions that already recorded a PI runtime
-- replace OpenClaw channel delivery, session files, auth-profile storage, or
-  message routing
-
-The same plugin also owns the native `/codex` chat-control command surface. If
-the plugin is enabled and the user asks to bind, resume, steer, stop, or inspect
-Codex threads from chat, agents should prefer `/codex ...` over ACP. ACP remains
-the explicit fallback when the user asks for ACP/acpx or is testing the ACP
-Codex adapter.
-
-Native Codex turns keep OpenClaw plugin hooks as the public compatibility layer.
-These are in-process OpenClaw hooks, not Codex `hooks.json` command hooks:
-
-- `before_prompt_build`
-- `before_compaction`, `after_compaction`
-- `llm_input`, `llm_output`
-- `before_tool_call`, `after_tool_call`
-- `before_message_write` for mirrored transcript records
-- `before_agent_finalize` through Codex `Stop` relay
-- `agent_end`
-
-Plugins can also register runtime-neutral tool-result middleware to rewrite
-OpenClaw dynamic tool results after OpenClaw executes the tool and before the
-result is returned to Codex. This is separate from the public
-`tool_result_persist` plugin hook, which transforms OpenClaw-owned transcript
-tool-result writes.
-
-For the plugin hook semantics themselves, see [Plugin hooks](/plugins/hooks)
-and [Plugin guard behavior](/tools/plugin).
-
-The harness is off by default. New configs should keep OpenAI model refs
-canonical as `openai/gpt-*` and explicitly force
-`agentRuntime.id: "codex"` or `OPENCLAW_AGENT_RUNTIME=codex` when they
-want native app-server execution. Legacy `codex/*` model refs still auto-select
-the harness for compatibility, but runtime-backed legacy provider prefixes are
-not shown as normal model/provider choices.
-
-If the `codex` plugin is enabled but the primary model is still
-`openai-codex/*`, `openclaw doctor` warns instead of changing the route. That is
-intentional: `openai-codex/*` remains the PI Codex OAuth/subscription path, and
-native app-server execution stays an explicit runtime choice.
-
-## Route map
-
-Use this table before changing config:
-
-| Desired behavior                                     | Model ref                  | Runtime config                         | Auth/profile route           | Expected status label          |
-| ---------------------------------------------------- | -------------------------- | -------------------------------------- | ---------------------------- | ------------------------------ |
-| ChatGPT/Codex subscription with native Codex runtime | `openai/gpt-*`             | `agentRuntime.id: "codex"`             | Codex OAuth or Codex account | `Runtime: OpenAI Codex`        |
-| OpenAI API through normal OpenClaw runner            | `openai/gpt-*`             | omitted or `runtime: "pi"`             | OpenAI API key               | `Runtime: OpenClaw Pi Default` |
-| ChatGPT/Codex subscription through PI                | `openai-codex/gpt-*`       | omitted or `runtime: "pi"`             | OpenAI Codex OAuth provider  | `Runtime: OpenClaw Pi Default` |
-| Mixed providers with conservative auto mode          | provider-specific refs     | `agentRuntime.id: "auto"`              | Per selected provider        | Depends on selected runtime    |
-| Explicit Codex ACP adapter session                   | ACP prompt/model dependent | `sessions_spawn` with `runtime: "acp"` | ACP backend auth             | ACP task/session status        |
-
-The important split is provider versus runtime:
-
-- `openai-codex/*` answers "which provider/auth route should PI use?"
-- `agentRuntime.id: "codex"` answers "which loop should execute this
-  embedded turn?"
-- `/codex ...` answers "which native Codex conversation should this chat bind
-  or control?"
-- ACP answers "which external harness process should acpx launch?"
-
-## Pick the right model prefix
-
-OpenAI-family routes are prefix-specific. For the common subscription plus
-native Codex runtime setup, use `openai/*` with `agentRuntime.id: "codex"`.
-Use `openai-codex/*` only when you intentionally want Codex OAuth through PI:
-
-| Model ref                                     | Runtime path                                 | Use when                                                                  |
-| --------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------- |
-| `openai/gpt-5.4`                              | OpenAI provider through OpenClaw/PI plumbing | You want current direct OpenAI Platform API access with `OPENAI_API_KEY`. |
-| `openai-codex/gpt-5.5`                        | OpenAI Codex OAuth through OpenClaw/PI       | You want ChatGPT/Codex subscription auth with the default PI runner.      |
-| `openai/gpt-5.5` + `agentRuntime.id: "codex"` | Codex app-server harness                     | You want ChatGPT/Codex subscription auth with native Codex execution.     |
-
-GPT-5.5 can appear on both direct OpenAI API-key and Codex subscription routes
-when your account exposes them. Use `openai/gpt-5.5` with the Codex app-server
-harness for native Codex runtime, `openai-codex/gpt-5.5` for PI OAuth, or
-`openai/gpt-5.5` without a Codex runtime override for direct API-key traffic.
-
-Legacy `codex/gpt-*` refs remain accepted as compatibility aliases. Doctor
-compatibility migration rewrites legacy primary runtime refs to canonical model
-refs and records the runtime policy separately, while fallback-only legacy refs
-are left unchanged because runtime is configured for the whole agent container.
-New PI Codex OAuth configs should use `openai-codex/gpt-*`; new native
-app-server harness configs should use `openai/gpt-*` plus
-`agentRuntime.id: "codex"`.
-
-`agents.defaults.imageModel` follows the same prefix split. Use
-`openai-codex/gpt-*` when image understanding should run through the OpenAI
-Codex OAuth provider path. Use `codex/gpt-*` when image understanding should run
-through a bounded Codex app-server turn. The Codex app-server model must
-advertise image input support; text-only Codex models fail before the media turn
-starts.
-
-Use `/status` to confirm the effective harness for the current session. If the
-selection is surprising, enable debug logging for the `agents/harness` subsystem
-and inspect the gateway's structured `agent harness selected` record. It
-includes the selected harness id, selection reason, runtime/fallback policy, and,
-in `auto` mode, each plugin candidate's support result.
-
-### What doctor warnings mean
-
-`openclaw doctor` warns when all of these are true:
-
-- the bundled `codex` plugin is enabled or allowed
-- an agent's primary model is `openai-codex/*`
-- that agent's effective runtime is not `codex`
-
-That warning exists because users often expect "Codex plugin enabled" to imply
-"native Codex app-server runtime." OpenClaw does not make that leap. The warning
-means:
-
-- **No change is required** if you intended ChatGPT/Codex OAuth through PI.
-- Change the model to `openai/<model>` and set
-  `agentRuntime.id: "codex"` if you intended native app-server
-  execution.
-- Existing sessions still need `/new` or `/reset` after a runtime change,
-  because session runtime pins are sticky.
-
-Harness selection is not a live session control. When an embedded turn runs,
-OpenClaw records the selected harness id on that session and keeps using it for
-later turns in the same session id. Change `agentRuntime` config or
-`OPENCLAW_AGENT_RUNTIME` when you want future sessions to use another harness;
-use `/new` or `/reset` to start a fresh session before switching an existing
-conversation between PI and Codex. This avoids replaying one transcript through
-two incompatible native session systems.
-
-Legacy sessions created before harness pins are treated as PI-pinned once they
-have transcript history. Use `/new` or `/reset` to opt that conversation into
-Codex after changing config.
-
-`/status` shows the effective model runtime. The default PI harness appears as
-`Runtime: OpenClaw Pi Default`, and the Codex app-server harness appears as
-`Runtime: OpenAI Codex`.
-
-## Requirements
-
-- OpenClaw with the bundled `codex` plugin available.
-- Codex app-server `0.125.0` or newer. The bundled plugin manages a compatible
-  Codex app-server binary by default, so local `codex` commands on `PATH` do
-  not affect normal harness startup.
-- Codex auth available to the app-server process or to OpenClaw's Codex auth
-  bridge. Local app-server launches use an OpenClaw-managed Codex home for each
-  agent and an isolated child `HOME`, so they do not read your personal
-  `~/.codex` account, skills, plugins, config, thread state, or native
-  `$HOME/.agents/skills` by default.
-
-The plugin blocks older or unversioned app-server handshakes. That keeps
-OpenClaw on the protocol surface it has been tested against.
-
-For live and Docker smoke tests, auth usually comes from the Codex CLI account
-or an OpenClaw `openai-codex` auth profile. Local stdio app-server launches can
-also fall back to `CODEX_API_KEY` / `OPENAI_API_KEY` when no account is present.
-
-## Workspace bootstrap files
-
-Codex handles `AGENTS.md` itself through native project-doc discovery. OpenClaw
-does not write synthetic Codex project-doc files or depend on Codex fallback
-filenames for persona files, because Codex fallbacks only apply when
-`AGENTS.md` is missing.
-
-For OpenClaw workspace parity, the Codex harness resolves the other bootstrap
-files (`SOUL.md`, `TOOLS.md`, `IDENTITY.md`, `USER.md`, `HEARTBEAT.md`,
-`BOOTSTRAP.md`, and `MEMORY.md` when present) and forwards them through Codex
-config instructions on `thread/start` and `thread/resume`. This keeps
-`SOUL.md` and related workspace persona/profile context visible without
-duplicating `AGENTS.md`.
-
-## Add Codex alongside other models
-
-Do not set `agentRuntime.id: "codex"` globally if the same agent should freely switch
-between Codex and non-Codex provider models. A forced runtime applies to every
-embedded turn for that agent or session. If you select an Anthropic model while
-that runtime is forced, OpenClaw still tries the Codex harness and fails closed
-instead of silently routing that turn through PI.
-
-Use one of these shapes instead:
-
-- Put Codex on a dedicated agent with `agentRuntime.id: "codex"`.
-- Keep the default agent on `agentRuntime.id: "auto"` and PI fallback for normal mixed
-  provider usage.
-- Use legacy `codex/*` refs only for compatibility. New configs should prefer
-  `openai/*` plus an explicit Codex runtime policy.
-
-For example, this keeps the default agent on normal automatic selection and
-adds a separate Codex agent:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-      },
-    },
-  },
-  agents: {
-    defaults: {
-      agentRuntime: {
-        id: "auto",
-      },
-    },
-    list: [
-      {
-        id: "main",
-        default: true,
-        model: "anthropic/claude-opus-4-6",
-      },
-      {
-        id: "codex",
-        name: "Codex",
-        model: "openai/gpt-5.5",
-        agentRuntime: {
-          id: "codex",
-        },
-      },
-    ],
-  },
-}
+```text
+Runtime: OpenAI Codex
 ```
 
-With this shape:
+Then check Codex app-server state:
 
-- The default `main` agent uses the normal provider path and PI compatibility fallback.
-- The `codex` agent uses the Codex app-server harness.
-- If Codex is missing or unsupported for the `codex` agent, the turn fails
-  instead of quietly using PI.
-
-## Agent command routing
-
-Agents should route user requests by intent, not by the word "Codex" alone:
-
-| User asks for...                                       | Agent should use...                              |
-| ------------------------------------------------------ | ------------------------------------------------ |
-| "Bind this chat to Codex"                              | `/codex bind`                                    |
-| "Resume Codex thread `<id>` here"                      | `/codex resume <id>`                             |
-| "Show Codex threads"                                   | `/codex threads`                                 |
-| "File a support report for a bad Codex run"            | `/diagnostics [note]`                            |
-| "Only send Codex feedback for this attached thread"    | `/codex diagnostics [note]`                      |
-| "Use my ChatGPT/Codex subscription with Codex runtime" | `openai/*` plus `agentRuntime.id: "codex"`       |
-| "Use my ChatGPT/Codex subscription through PI"         | `openai-codex/*` model refs                      |
-| "Run Codex through ACP/acpx"                           | ACP `sessions_spawn({ runtime: "acp", ... })`    |
-| "Start Claude Code/Gemini/OpenCode/Cursor in a thread" | ACP/acpx, not `/codex` and not native sub-agents |
-
-OpenClaw only advertises ACP spawn guidance to agents when ACP is enabled,
-dispatchable, and backed by a loaded runtime backend. If ACP is not available,
-the system prompt and plugin skills should not teach the agent about ACP
-routing.
-
-## Codex-only deployments
-
-Force the Codex harness when you need to prove that every embedded agent turn
-uses Codex. Explicit plugin runtimes fail closed and are never silently retried
-through PI:
-
-```json5
-{
-  agents: {
-    defaults: {
-      model: "openai/gpt-5.5",
-      agentRuntime: {
-        id: "codex",
-      },
-    },
-  },
-}
+```text
+/codex status
+/codex models
+/codex binding
 ```
 
-Environment override:
+After installing or updating OpenClaw, explicitly verify the managed package
+binary before cutover:
 
 ```bash
-OPENCLAW_AGENT_RUNTIME=codex openclaw gateway run
+openclaw doctor --lint --only codex/managed-app-server --json
 ```
 
-With Codex forced, OpenClaw fails early if the Codex plugin is disabled, the
-app-server is too old, or the app-server cannot start.
-
-## Per-agent Codex
-
-You can make one agent Codex-only while the default agent keeps normal
-auto-selection:
-
-```json5
-{
-  agents: {
-    defaults: {
-      agentRuntime: {
-        id: "auto",
-      },
-    },
-    list: [
-      {
-        id: "main",
-        default: true,
-        model: "anthropic/claude-opus-4-6",
-      },
-      {
-        id: "codex",
-        name: "Codex",
-        model: "openai/gpt-5.5",
-        agentRuntime: {
-          id: "codex",
-        },
-      },
-    ],
-  },
-}
-```
-
-Use normal session commands to switch agents and models. `/new` creates a fresh
-OpenClaw session and the Codex harness creates or resumes its sidecar app-server
-thread as needed. `/reset` clears the OpenClaw session binding for that thread
-and lets the next turn resolve the harness from current config again.
-
-## Model discovery
-
-By default, the Codex plugin asks the app-server for available models. If
-discovery fails or times out, it uses a bundled fallback catalog for:
-
-- GPT-5.5
-- GPT-5.4 mini
-- GPT-5.2
-
-You can tune discovery under `plugins.entries.codex.config.discovery`:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          discovery: {
-            enabled: true,
-            timeoutMs: 2500,
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-Disable discovery when you want startup to avoid probing Codex and stick to the
-fallback catalog:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          discovery: {
-            enabled: false,
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-## App-server connection and policy
-
-By default, the plugin starts OpenClaw's managed Codex binary locally with:
-
-```bash
-codex app-server --listen stdio://
-```
-
-The managed binary is shipped with the `codex` plugin package. This keeps the
-app-server version tied to the bundled plugin instead of whichever separate
-Codex CLI happens to be installed locally. Set `appServer.command` only when
-you intentionally want to run a different executable.
-
-By default, OpenClaw starts local Codex harness sessions in YOLO mode:
-`approvalPolicy: "never"`, `approvalsReviewer: "user"`, and
-`sandbox: "danger-full-access"`. This is the trusted local operator posture used
-for autonomous heartbeats: Codex can use shell and network tools without
-stopping on native approval prompts that nobody is around to answer.
-
-To opt in to Codex guardian-reviewed approvals, set `appServer.mode:
-"guardian"`:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          appServer: {
-            mode: "guardian",
-            serviceTier: "fast",
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-Guardian mode uses Codex's native auto-review approval path. When Codex asks to
-leave the sandbox, write outside the workspace, or add permissions like network
-access, Codex routes that approval request to the native reviewer instead of a
-human prompt. The reviewer applies Codex's risk framework and approves or denies
-the specific request. Use Guardian when you want more guardrails than YOLO mode
-but still need unattended agents to make progress.
-
-The `guardian` preset expands to `approvalPolicy: "on-request"`,
-`approvalsReviewer: "auto_review"`, and `sandbox: "workspace-write"`.
-Individual policy fields still override `mode`, so advanced deployments can mix
-the preset with explicit choices. The older `guardian_subagent` reviewer value is
-still accepted as a compatibility alias, but new configs should use
-`auto_review`.
-
-For an already-running app-server, use WebSocket transport:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          appServer: {
-            transport: "websocket",
-            url: "ws://127.0.0.1:39175",
-            authToken: "${CODEX_APP_SERVER_TOKEN}",
-            requestTimeoutMs: 60000,
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-Stdio app-server launches inherit OpenClaw's process environment by default,
-but OpenClaw owns the Codex app-server account bridge and sets both
-`CODEX_HOME` and `HOME` to per-agent directories under that agent's OpenClaw
-state. Codex's own skill loader reads `$CODEX_HOME/skills` and
-`$HOME/.agents/skills`, so both values are isolated for local app-server
-launches. That keeps Codex-native skills, plugins, config, accounts, and thread
-state scoped to the OpenClaw agent instead of leaking in from the operator's
-personal Codex CLI home.
-
-OpenClaw plugins and OpenClaw skill snapshots still flow through OpenClaw's own
-plugin registry and skill loader. Personal Codex CLI assets do not. If you have
-useful Codex CLI skills or plugins that should become part of an OpenClaw agent,
-inventory them explicitly:
-
-```bash
-openclaw migrate codex --dry-run
-openclaw migrate apply codex --yes
-```
-
-The Codex migration provider copies skills into the current OpenClaw agent
-workspace. Codex native plugins, hooks, and config files are reported or archived
-for manual review instead of being activated automatically, because they can
-execute commands, expose MCP servers, or carry credentials.
-
-Auth is selected in this order:
-
-1. An explicit OpenClaw Codex auth profile for the agent.
-2. The app-server's existing account in that agent's Codex home.
-3. For local stdio app-server launches only, `CODEX_API_KEY`, then
-   `OPENAI_API_KEY`, when no app-server account is present and OpenAI auth is
-   still required.
-
-When OpenClaw sees a ChatGPT subscription-style Codex auth profile, it removes
-`CODEX_API_KEY` and `OPENAI_API_KEY` from the spawned Codex child process. That
-keeps Gateway-level API keys available for embeddings or direct OpenAI models
-without making native Codex app-server turns bill through the API by accident.
-Explicit Codex API-key profiles and local stdio env-key fallback use app-server
-login instead of inherited child-process env. WebSocket app-server connections
-do not receive Gateway env API-key fallback; use an explicit auth profile or the
-remote app-server's own account.
-
-If a deployment needs additional environment isolation, add those variables to
-`appServer.clearEnv`:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          appServer: {
-            clearEnv: ["CODEX_API_KEY", "OPENAI_API_KEY"],
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-`appServer.clearEnv` only affects the spawned Codex app-server child process.
-
-Codex dynamic tools default to the `native-first` profile. In that mode,
-OpenClaw does not expose dynamic tools that duplicate Codex-native workspace
-operations: `read`, `write`, `edit`, `apply_patch`, `exec`, `process`, and
-`update_plan`. OpenClaw integration tools such as messaging, sessions, media,
-cron, browser, nodes, gateway, `heartbeat_respond`, and `web_search` remain
-available.
-
-Supported top-level Codex plugin fields:
-
-| Field                      | Default          | Meaning                                                                                   |
-| -------------------------- | ---------------- | ----------------------------------------------------------------------------------------- |
-| `codexDynamicToolsProfile` | `"native-first"` | Use `"openclaw-compat"` to expose the full OpenClaw dynamic tool set to Codex app-server. |
-| `codexDynamicToolsExclude` | `[]`             | Additional OpenClaw dynamic tool names to omit from Codex app-server turns.               |
-
-Supported `appServer` fields:
-
-| Field               | Default                                  | Meaning                                                                                                                                                                                                                              |
-| ------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `transport`         | `"stdio"`                                | `"stdio"` spawns Codex; `"websocket"` connects to `url`.                                                                                                                                                                             |
-| `command`           | managed Codex binary                     | Executable for stdio transport. Leave unset to use the managed binary; set it only for an explicit override.                                                                                                                         |
-| `args`              | `["app-server", "--listen", "stdio://"]` | Arguments for stdio transport.                                                                                                                                                                                                       |
-| `url`               | unset                                    | WebSocket app-server URL.                                                                                                                                                                                                            |
-| `authToken`         | unset                                    | Bearer token for WebSocket transport.                                                                                                                                                                                                |
-| `headers`           | `{}`                                     | Extra WebSocket headers.                                                                                                                                                                                                             |
-| `clearEnv`          | `[]`                                     | Extra environment variable names removed from the spawned stdio app-server process after OpenClaw builds its inherited environment. `CODEX_HOME` and `HOME` are reserved for OpenClaw's per-agent Codex isolation on local launches. |
-| `requestTimeoutMs`  | `60000`                                  | Timeout for app-server control-plane calls.                                                                                                                                                                                          |
-| `mode`              | `"yolo"`                                 | Preset for YOLO or guardian-reviewed execution.                                                                                                                                                                                      |
-| `approvalPolicy`    | `"never"`                                | Native Codex approval policy sent to thread start/resume/turn.                                                                                                                                                                       |
-| `sandbox`           | `"danger-full-access"`                   | Native Codex sandbox mode sent to thread start/resume.                                                                                                                                                                               |
-| `approvalsReviewer` | `"user"`                                 | Use `"auto_review"` to let Codex review native approval prompts. `guardian_subagent` remains a legacy alias.                                                                                                                         |
-| `serviceTier`       | unset                                    | Optional Codex app-server service tier: `"fast"`, `"flex"`, or `null`. Invalid legacy values are ignored.                                                                                                                            |
-
-OpenClaw-owned dynamic tool calls are bounded independently from
-`appServer.requestTimeoutMs`: each Codex `item/tool/call` request must receive
-an OpenClaw response within 30 seconds. On timeout, OpenClaw aborts the tool
-signal where supported and returns a failed dynamic-tool response to Codex so
-the turn can continue instead of leaving the session in `processing`.
-
-After OpenClaw responds to a Codex turn-scoped app-server request, the harness
-also expects Codex to finish the native turn with `turn/completed`. If the
-app-server goes quiet for 60 seconds after that response, OpenClaw best-effort
-interrupts the Codex turn, records a diagnostic timeout, and releases the
-OpenClaw session lane so follow-up chat messages are not queued behind a stale
-native turn.
-
-Environment overrides remain available for local testing:
-
-- `OPENCLAW_CODEX_APP_SERVER_BIN`
-- `OPENCLAW_CODEX_APP_SERVER_ARGS`
-- `OPENCLAW_CODEX_APP_SERVER_MODE=yolo|guardian`
-- `OPENCLAW_CODEX_APP_SERVER_APPROVAL_POLICY`
-- `OPENCLAW_CODEX_APP_SERVER_SANDBOX`
-
-`OPENCLAW_CODEX_APP_SERVER_BIN` bypasses the managed binary when
-`appServer.command` is unset.
-
-`OPENCLAW_CODEX_APP_SERVER_GUARDIAN=1` was removed. Use
-`plugins.entries.codex.config.appServer.mode: "guardian"` instead, or
-`OPENCLAW_CODEX_APP_SERVER_MODE=guardian` for one-off local testing. Config is
-preferred for repeatable deployments because it keeps the plugin behavior in the
-same reviewed file as the rest of the Codex harness setup.
-
-## Computer use
-
-Computer Use is covered in its own setup guide:
-[Codex Computer Use](/plugins/codex-computer-use).
-
-The short version: OpenClaw does not vendor the desktop-control app or execute
-desktop actions itself. It prepares Codex app-server, verifies that the
-`computer-use` MCP server is available, and then lets Codex handle the native
-MCP tool calls during Codex-mode turns.
-
-For direct TryCua driver access outside the Codex marketplace flow, register
-`cua-driver mcp` with `openclaw mcp set cua-driver '{"command":"cua-driver","args":["mcp"]}'`.
-See [Codex Computer Use](/plugins/codex-computer-use) for the distinction
-between Codex-owned Computer Use and direct MCP registration.
-
-Minimal config:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          computerUse: {
-            autoInstall: true,
-          },
-        },
-      },
-    },
-  },
-  agents: {
-    defaults: {
-      model: "openai/gpt-5.5",
-      agentRuntime: {
-        id: "codex",
-      },
-    },
-  },
-}
-```
-
-The setup can be checked or installed from the command surface:
-
-- `/codex computer-use status`
-- `/codex computer-use install`
-- `/codex computer-use install --source <marketplace-source>`
-- `/codex computer-use install --marketplace-path <path>`
-
-Computer Use is macOS-specific and may require local OS permissions before the
-Codex MCP server can control apps. If `computerUse.enabled` is true and the MCP
-server is unavailable, Codex-mode turns fail before the thread starts instead of
-silently running without the native Computer Use tools. See
-[Codex Computer Use](/plugins/codex-computer-use) for marketplace choices,
-remote catalog limits, status reasons, and troubleshooting.
-
-When `computerUse.autoInstall` is true, OpenClaw can register the standard
-bundled Codex Desktop marketplace from
-`/Applications/Codex.app/Contents/Resources/plugins/openai-bundled` if Codex
-has not discovered a local marketplace yet. Use `/new` or `/reset` after
-changing runtime or Computer Use config so existing sessions do not keep an old
-PI or Codex thread binding.
-
-## Common recipes
-
-Local Codex with default stdio transport:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-      },
-    },
-  },
-}
-```
-
-Codex-only harness validation:
-
-```json5
-{
-  agents: {
-    defaults: {
-      model: "openai/gpt-5.5",
-      agentRuntime: {
-        id: "codex",
-      },
-    },
-  },
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-      },
-    },
-  },
-}
-```
-
-Guardian-reviewed Codex approvals:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          appServer: {
-            mode: "guardian",
-            approvalPolicy: "on-request",
-            approvalsReviewer: "auto_review",
-            sandbox: "workspace-write",
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-Remote app-server with explicit headers:
-
-```json5
-{
-  plugins: {
-    entries: {
-      codex: {
-        enabled: true,
-        config: {
-          appServer: {
-            transport: "websocket",
-            url: "ws://gateway-host:39175",
-            headers: {
-              "X-OpenClaw-Agent": "main",
-            },
-          },
-        },
-      },
-    },
-  },
-}
-```
-
-Model switching stays OpenClaw-controlled. When an OpenClaw session is attached
-to an existing Codex thread, the next turn sends the currently selected
-OpenAI model, provider, approval policy, sandbox, and service tier to
-app-server again. Switching from `openai/gpt-5.5` to `openai/gpt-5.2` keeps the
-thread binding but asks Codex to continue with the newly selected model.
-
-## Codex command
-
-The bundled plugin registers `/codex` as an authorized slash command. It is
-generic and works on any channel that supports OpenClaw text commands.
-
-Common forms:
-
-- `/codex status` shows live app-server connectivity, models, account, rate limits, MCP servers, and skills.
-- `/codex models` lists live Codex app-server models.
-- `/codex threads [filter]` lists recent Codex threads.
-- `/codex resume <thread-id>` attaches the current OpenClaw session to an existing Codex thread.
-- `/codex compact` asks Codex app-server to compact the attached thread.
-- `/codex review` starts Codex native review for the attached thread.
-- `/codex diagnostics [note]` asks before sending Codex diagnostics feedback for the attached thread.
-- `/codex computer-use status` checks the configured Computer Use plugin and MCP server.
-- `/codex computer-use install` installs the configured Computer Use plugin and reloads MCP servers.
-- `/codex account` shows account and rate-limit status.
-- `/codex mcp` lists Codex app-server MCP server status.
-- `/codex skills` lists Codex app-server skills.
-
-### Common debugging workflow
-
-When a Codex-backed agent does something surprising in Telegram, Discord, Slack,
-or another channel, start with the conversation where the problem happened:
-
-1. Run `/diagnostics bad tool choice after image upload` or another short note
-   that describes what you saw.
-2. Approve the diagnostics request once. The approval creates the local Gateway
-   diagnostics zip and, because the session is using the Codex harness, also
-   sends the relevant Codex feedback bundle to OpenAI servers.
-3. Copy the completed diagnostics reply into the bug report or support thread.
-   It includes the local bundle path, privacy summary, OpenClaw session ids,
-   Codex thread ids, and an `Inspect locally` line for each Codex thread.
-4. If you want to debug the run yourself, run the printed `Inspect locally`
-   command in a terminal. It looks like `codex resume <thread-id>` and opens the
-   native Codex thread so you can inspect the conversation, continue it locally,
-   or ask Codex why it chose a particular tool or plan.
-
-Use `/codex diagnostics [note]` only when you specifically want the Codex
-feedback upload for the currently attached thread without the full OpenClaw
-Gateway diagnostics bundle. For most support reports, `/diagnostics [note]` is
-the better starting point because it ties the local Gateway state and Codex
-thread ids together in one reply. See [Diagnostics export](/gateway/diagnostics)
-for the full privacy model and group-chat behavior.
-
-Core OpenClaw also exposes owner-only `/diagnostics [note]` as the general
-Gateway diagnostics command. Its approval prompt shows the sensitive-data
-preamble, links to [Diagnostics Export](/gateway/diagnostics), and requests
-`openclaw gateway diagnostics export --json` through explicit exec approval
-every time. Do not approve diagnostics with an allow-all rule. After approval,
-OpenClaw sends a pasteable report with the local bundle path and manifest
-summary. When the active OpenClaw session is using the Codex harness, that
-same approval also authorizes sending the relevant Codex feedback bundles to
-OpenAI servers. The approval prompt says that Codex feedback will be sent, but
-it does not list Codex session or thread ids before approval.
-
-If `/diagnostics` is invoked by an owner in a group chat, OpenClaw keeps the
-shared channel clean: the group receives only a short notice, while the
-diagnostics preamble, approval prompts, and Codex session/thread ids are sent to
-the owner through the private approval route. If there is no private owner route,
-OpenClaw refuses the group request and asks the owner to run it from a DM.
-
-The approved Codex upload calls Codex app-server `feedback/upload` and asks
-app-server to include logs for each listed thread and spawned Codex subthreads
-when available. The upload goes through Codex's normal feedback path to OpenAI
-servers; if Codex feedback is disabled in that app-server, the command returns
-the app-server error. The completed diagnostics reply lists the channels,
-OpenClaw session ids, Codex thread ids, and local `codex resume <thread-id>`
-commands for the threads that were sent. If you deny or ignore the approval,
-OpenClaw does not print those Codex ids. This upload does not replace the local
-Gateway diagnostics export.
-
-`/codex resume` writes the same sidecar binding file that the harness uses for
-normal turns. On the next message, OpenClaw resumes that Codex thread, passes the
-currently selected OpenClaw model into app-server, and keeps extended history
-enabled.
-
-### Inspect a Codex thread from the CLI
-
-The fastest way to understand a bad Codex run is often to open the native Codex
-thread directly:
-
-```sh
-codex resume <thread-id>
-```
-
-Use this when you notice a bug in a channel conversation and want to inspect the
-problematic Codex session, continue it locally, or ask Codex why it made a
-particular tool or reasoning choice. The easiest path is usually to run
-`/diagnostics [note]` first: after you approve it, the completed report lists
-each Codex thread and prints an `Inspect locally` command, for example
-`codex resume <thread-id>`. You can copy that command directly into a terminal.
-
-You can also get a thread id from `/codex binding` for the current chat or
-`/codex threads [filter]` for recent Codex app-server threads, then run the same
-`codex resume` command in your shell.
-
-The command surface requires Codex app-server `0.125.0` or newer. Individual
-control methods are reported as `unsupported by this Codex app-server` if a
-future or custom app-server does not expose that JSON-RPC method.
-
-## Hook boundaries
-
-The Codex harness has three hook layers:
-
-| Layer                                 | Owner                    | Purpose                                                             |
-| ------------------------------------- | ------------------------ | ------------------------------------------------------------------- |
-| OpenClaw plugin hooks                 | OpenClaw                 | Product/plugin compatibility across PI and Codex harnesses.         |
-| Codex app-server extension middleware | OpenClaw bundled plugins | Per-turn adapter behavior around OpenClaw dynamic tools.            |
-| Codex native hooks                    | Codex                    | Low-level Codex lifecycle and native tool policy from Codex config. |
-
-OpenClaw does not use project or global Codex `hooks.json` files to route
-OpenClaw plugin behavior. For the supported native tool and permission bridge,
-OpenClaw injects per-thread Codex config for `PreToolUse`, `PostToolUse`,
-`PermissionRequest`, and `Stop`. Other Codex hooks such as `SessionStart` and
-`UserPromptSubmit` remain Codex-level controls; they are not exposed as
-OpenClaw plugin hooks in the v1 contract.
-
-For OpenClaw dynamic tools, OpenClaw executes the tool after Codex asks for the
-call, so OpenClaw fires the plugin and middleware behavior it owns in the
-harness adapter. For Codex-native tools, Codex owns the canonical tool record.
-OpenClaw can mirror selected events, but it cannot rewrite the native Codex
-thread unless Codex exposes that operation through app-server or native hook
-callbacks.
-
-Compaction and LLM lifecycle projections come from Codex app-server
-notifications and OpenClaw adapter state, not native Codex hook commands.
-OpenClaw's `before_compaction`, `after_compaction`, `llm_input`, and
-`llm_output` events are adapter-level observations, not byte-for-byte captures
-of Codex's internal request or compaction payloads.
-
-Codex native `hook/started` and `hook/completed` app-server notifications are
-projected as `codex_app_server.hook` agent events for trajectory and debugging.
-They do not invoke OpenClaw plugin hooks.
-
-## V1 support contract
-
-Codex mode is not PI with a different model call underneath. Codex owns more of
-the native model loop, and OpenClaw adapts its plugin and session surfaces
-around that boundary.
-
-Supported in Codex runtime v1:
-
-| Surface                                       | Support                                 | Why                                                                                                                                                                                                   |
-| --------------------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| OpenAI model loop through Codex               | Supported                               | Codex app-server owns the OpenAI turn, native thread resume, and native tool continuation.                                                                                                            |
-| OpenClaw channel routing and delivery         | Supported                               | Telegram, Discord, Slack, WhatsApp, iMessage, and other channels stay outside the model runtime.                                                                                                      |
-| OpenClaw dynamic tools                        | Supported                               | Codex asks OpenClaw to execute these tools, so OpenClaw stays in the execution path.                                                                                                                  |
-| Prompt and context plugins                    | Supported                               | OpenClaw builds prompt overlays and projects context into the Codex turn before starting or resuming the thread.                                                                                      |
-| Context engine lifecycle                      | Supported                               | Assemble, ingest or after-turn maintenance, and context-engine compaction coordination run for Codex turns.                                                                                           |
-| Dynamic tool hooks                            | Supported                               | `before_tool_call`, `after_tool_call`, and tool-result middleware run around OpenClaw-owned dynamic tools.                                                                                            |
-| Lifecycle hooks                               | Supported as adapter observations       | `llm_input`, `llm_output`, `agent_end`, `before_compaction`, and `after_compaction` fire with honest Codex-mode payloads.                                                                             |
-| Final-answer revision gate                    | Supported through the native hook relay | Codex `Stop` is relayed to `before_agent_finalize`; `revise` asks Codex for one more model pass before finalization.                                                                                  |
-| Native shell, patch, and MCP block or observe | Supported through the native hook relay | Codex `PreToolUse` and `PostToolUse` are relayed for committed native tool surfaces, including MCP payloads on Codex app-server `0.125.0` or newer. Blocking is supported; argument rewriting is not. |
-| Native permission policy                      | Supported through the native hook relay | Codex `PermissionRequest` can be routed through OpenClaw policy where the runtime exposes it. If OpenClaw returns no decision, Codex continues through its normal guardian or user approval path.     |
-| App-server trajectory capture                 | Supported                               | OpenClaw records the request it sent to app-server and the app-server notifications it receives.                                                                                                      |
-
-Not supported in Codex runtime v1:
-
-| Surface                                             | V1 boundary                                                                                                                                     | Future path                                                                               |
-| --------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Native tool argument mutation                       | Codex native pre-tool hooks can block, but OpenClaw does not rewrite Codex-native tool arguments.                                               | Requires Codex hook/schema support for replacement tool input.                            |
-| Editable Codex-native transcript history            | Codex owns canonical native thread history. OpenClaw owns a mirror and can project future context, but should not mutate unsupported internals. | Add explicit Codex app-server APIs if native thread surgery is needed.                    |
-| `tool_result_persist` for Codex-native tool records | That hook transforms OpenClaw-owned transcript writes, not Codex-native tool records.                                                           | Could mirror transformed records, but canonical rewrite needs Codex support.              |
-| Rich native compaction metadata                     | OpenClaw observes compaction start and completion, but does not receive a stable kept/dropped list, token delta, or summary payload.            | Needs richer Codex compaction events.                                                     |
-| Compaction intervention                             | Current OpenClaw compaction hooks are notification-level in Codex mode.                                                                         | Add Codex pre/post compaction hooks if plugins need to veto or rewrite native compaction. |
-| Byte-for-byte model API request capture             | OpenClaw can capture app-server requests and notifications, but Codex core builds the final OpenAI API request internally.                      | Needs a Codex model-request tracing event or debug API.                                   |
-
-## Tools, media, and compaction
-
-The Codex harness changes the low-level embedded agent executor only.
-
-OpenClaw still builds the tool list and receives dynamic tool results from the
-harness. Text, images, video, music, TTS, approvals, and messaging-tool output
-continue through the normal OpenClaw delivery path.
-
-The native hook relay is intentionally generic, but the v1 support contract is
-limited to the Codex-native tool and permission paths that OpenClaw tests. In
-the Codex runtime, that includes shell, patch, and MCP `PreToolUse`,
-`PostToolUse`, and `PermissionRequest` payloads. Do not assume every future
-Codex hook event is an OpenClaw plugin surface until the runtime contract names
-it.
-
-For `PermissionRequest`, OpenClaw only returns explicit allow or deny decisions
-when policy decides. A no-decision result is not an allow. Codex treats it as no
-hook decision and falls through to its own guardian or user approval path.
-
-Codex MCP tool approval elicitations are routed through OpenClaw's plugin
-approval flow when Codex marks `_meta.codex_approval_kind` as
-`"mcp_tool_call"`. Codex `request_user_input` prompts are sent back to the
-originating chat, and the next queued follow-up message answers that native
-server request instead of being steered as extra context. Other MCP elicitation
-requests still fail closed.
-
-Active-run queue steering maps onto Codex app-server `turn/steer`. With the
-default `messages.queue.mode: "steer"`, OpenClaw batches queued chat messages
-for the configured quiet window and sends them as one `turn/steer` request in
-arrival order. Legacy `queue` mode sends separate `turn/steer` requests. Codex
-review and manual compaction turns can reject same-turn steering, in which case
-OpenClaw uses the followup queue when the selected mode allows fallback. See
-[Steering queue](/concepts/queue-steering).
-
-When the selected model uses the Codex harness, native thread compaction is
-delegated to Codex app-server. OpenClaw keeps a transcript mirror for channel
-history, search, `/new`, `/reset`, and future model or harness switching. The
-mirror includes the user prompt, final assistant text, and lightweight Codex
-reasoning or plan records when the app-server emits them. Today, OpenClaw only
-records native compaction start and completion signals. It does not yet expose a
-human-readable compaction summary or an auditable list of which entries Codex
-kept after compaction.
-
-Because Codex owns the canonical native thread, `tool_result_persist` does not
-currently rewrite Codex-native tool result records. It only applies when
-OpenClaw is writing an OpenClaw-owned session transcript tool result.
-
-Media generation does not require PI. Image, video, music, PDF, TTS, and media
-understanding continue to use the matching provider/model settings such as
-`agents.defaults.imageGenerationModel`, `videoGenerationModel`, `pdfModel`, and
-`messages.tts`.
-
-## Troubleshooting
-
-**Codex does not appear as a normal `/model` provider:** that is expected for
-new configs. Select an `openai/gpt-*` model with
-`agentRuntime.id: "codex"` (or a legacy `codex/*` ref), enable
-`plugins.entries.codex.enabled`, and check whether `plugins.allow` excludes
-`codex`.
-
-**OpenClaw uses PI instead of Codex:** `agentRuntime.id: "auto"` can still use PI as the
-compatibility backend when no Codex harness claims the run. Set
-`agentRuntime.id: "codex"` to force Codex selection while testing. A
-forced Codex runtime fails instead of falling back to PI. Once Codex app-server
-is selected, its failures surface directly.
-
-**The app-server is rejected:** upgrade Codex so the app-server handshake
-reports version `0.125.0` or newer. Same-version prereleases or build-suffixed
-versions such as `0.125.0-alpha.2` or `0.125.0+custom` are rejected because the
-stable `0.125.0` protocol floor is what OpenClaw tests.
-
-**Model discovery is slow:** lower `plugins.entries.codex.config.discovery.timeoutMs`
-or disable discovery.
-
-**WebSocket transport fails immediately:** check `appServer.url`, `authToken`,
-and that the remote app-server speaks the same Codex app-server protocol version.
-
-**A non-Codex model uses PI:** that is expected unless you forced
-`agentRuntime.id: "codex"` for that agent or selected a legacy
-`codex/*` ref. Plain `openai/gpt-*` and other provider refs stay on their normal
-provider path in `auto` mode. If you force `agentRuntime.id: "codex"`, every embedded
-turn for that agent must be a Codex-supported OpenAI model.
-
-**Computer Use is installed but tools do not run:** check
-`/codex computer-use status` from a fresh session. If a tool reports
-`Native hook relay unavailable`, use `/new` or `/reset`; if it persists, restart
-the gateway to clear stale native hook registrations. If `computer-use.list_apps`
-times out, restart Codex Computer Use or Codex Desktop and retry.
+For an effective Codex route using the managed stdio app-server, this
+default-disabled check resolves the platform-native executable and requires the
+exact Codex version pinned by OpenClaw. It does not execute custom, remote, or
+macOS desktop-owned app-servers.
+
+`/status` reports the resolved OpenClaw Fast policy (`on`, `off`, or `auto`)
+and the selected runtime. It does not report the upstream service tier actually
+honored or returned for a completed request. `/codex binding` reports the
+attached native thread and current model settings. `/codex status` reports
+app-server connectivity, account, rate limits, MCP servers, and skills.
+Neither Codex command is provider-response telemetry. `/codex models` lists
+the live Codex app-server catalog for the harness and account. If `/status` is
+surprising, see
+[Troubleshooting](/plugins/codex-harness/troubleshooting).
+
+## Luna Reserve and credit usage
+
+Ordinary `gpt-5.6-luna` and Luna Reserve (`gpt-reserve`) are separate routes.
+Selecting ordinary Luna does not consume Reserve merely because its quota has
+capacity. Turning Fast off changes the requested service tier, not the model route.
+
+OpenClaw currently reports the Reserve bucket when Codex returns it, but does not
+implement the backend-authorized Reserve transition and recovery flow. Do not
+force the hidden Reserve model or treat an unused counter as authorization.
+Account and client eligibility remain backend decisions.
+
+After included usage is exhausted, ordinary requests may consume credits under
+your account settings. Check the provider’s usage and spending controls before
+continuing high-volume automation. Account balances and quota percentages are
+not per-request billing receipts; `/status` and `/codex binding` do not establish
+the service tier or charge actually applied to a completed request.
+
+## Where each section moved
+
+Every section of the single-page version now lives on this page or on one of the
+nine child pages below. The anchors from the single-page version still resolve here.
+
+### Run Codex on another machine
+
+[Run Codex on another machine](/plugins/codex-harness/placement) — Place Codex native execution on a paired device or a cloud worker.
+
+- <a id="run-codex-on-a-paired-device"></a>[Run Codex on a paired device](/plugins/codex-harness/placement#run-codex-on-a-paired-device)
+- <a id="run-codex-on-a-cloud-worker"></a>[Run Codex on a cloud worker](/plugins/codex-harness/placement#run-codex-on-a-cloud-worker)
+
+### Codex routing and deployment
+
+[Codex routing and deployment](/plugins/codex-harness/routing) — Choose which OpenAI routes select Codex and shape the deployment around them.
+
+- <a id="routing-and-model-selection"></a>[Routing and model selection](/plugins/codex-harness/routing#routing-and-model-selection)
+- <a id="deployment-patterns"></a>[Deployment patterns](/plugins/codex-harness/routing#deployment-patterns)
+- <a id="basic-codex-deployment"></a>[Basic Codex deployment](/plugins/codex-harness/routing#basic-codex-deployment)
+- <a id="mixed-provider-deployment"></a>[Mixed provider deployment](/plugins/codex-harness/routing#mixed-provider-deployment)
+- <a id="fail-closed-codex-deployment"></a>[Require Codex for deployment](/plugins/codex-harness/routing#fail-closed-codex-deployment)
+
+### Codex harness configuration
+
+[Codex harness configuration](/plugins/codex-harness/configuration) — Codex harness config map, restricted turns, project instructions, compaction, and long context.
+
+- <a id="configuration"></a>[Configuration](/plugins/codex-harness/configuration#configuration)
+- <a id="restricted-turns-and-ring-zero"></a>[Restricted turns and ring zero](/plugins/codex-harness/configuration#restricted-turns-and-ring-zero)
+- <a id="project-instructions"></a>[Project instructions](/plugins/codex-harness/configuration#project-instructions)
+- <a id="compaction"></a>[Compaction](/plugins/codex-harness/configuration#compaction)
+- <a id="direct-api-long-context"></a>[Direct API long context](/plugins/codex-harness/configuration#direct-api-long-context)
+
+### Codex app-server policy
+
+[Codex app-server policy](/plugins/codex-harness/app-server) — App-server transport, approval posture, auth order, and environment isolation.
+
+- <a id="app-server-policy"></a>[App-server policy](/plugins/codex-harness/app-server#app-server-policy)
+- <a id="native-approval-audit-evidence"></a>[Native approval audit evidence](/plugins/codex-harness/app-server#native-approval-audit-evidence)
+- <a id="auth-order"></a>[Auth order](/plugins/codex-harness/app-server#auth-order)
+- <a id="scheduled-app-authority"></a>[Scheduled app authority](/plugins/codex-harness/app-server#scheduled-app-authority)
+- <a id="environment-isolation"></a>[Environment isolation](/plugins/codex-harness/app-server#environment-isolation)
+- <a id="local-testing-env-overrides"></a>[Local testing env overrides](/plugins/codex-harness/app-server#local-testing-env-overrides)
+
+### Codex plugin config fields
+
+[Codex plugin config fields](/plugins/codex-harness/config-fields) — Top-level and appServer config fields for the Codex plugin.
+
+- <a id="config-fields"></a>[Config fields](/plugins/codex-harness/config-fields#config-fields)
+
+### Codex commands and diagnostics
+
+[Codex commands and diagnostics](/plugins/codex-harness/commands) — The /codex command surface, Fast mode controls, and local thread inspection.
+
+- <a id="commands-and-diagnostics"></a>[Commands and diagnostics](/plugins/codex-harness/commands#commands-and-diagnostics)
+- <a id="shared-fast-mode-and-codex-fast-mode"></a>[Shared Fast mode and Codex fast mode](/plugins/codex-harness/commands#shared-fast-mode-and-codex-fast-mode)
+- <a id="inspect-codex-threads-locally"></a>[Inspect Codex threads locally](/plugins/codex-harness/commands#inspect-codex-threads-locally)
+
+### Codex runtime behavior
+
+[Codex runtime behavior](/plugins/codex-harness/runtime-behavior) — Dynamic tools, web search, image loading, turn liveness, and runtime boundaries.
+
+- <a id="dynamic-tools-and-web-search"></a>[Dynamic tools and web search](/plugins/codex-harness/runtime-behavior#dynamic-tools-and-web-search)
+- <a id="image-loader-ownership"></a>[Image loader ownership](/plugins/codex-harness/runtime-behavior#image-loader-ownership)
+- <a id="turn-liveness-and-timeouts"></a>[Turn liveness and timeouts](/plugins/codex-harness/runtime-behavior#turn-liveness-and-timeouts)
+- <a id="parallel-chats-and-thread-ownership"></a>[Parallel chats and thread ownership](/plugins/codex-harness/runtime-behavior#parallel-chats-and-thread-ownership)
+- <a id="runtime-boundaries"></a>[Runtime boundaries](/plugins/codex-harness/runtime-behavior#runtime-boundaries)
+
+### Native Codex state and features
+
+[Native Codex state and features](/plugins/codex-harness/native-features) — Share native Codex threads, supervise sessions, and enable native plugins and Computer Use.
+
+- <a id="share-threads-with-codex-desktop-and-cli"></a>[Share threads with Codex Desktop and CLI](/plugins/codex-harness/native-features#share-threads-with-codex-desktop-and-cli)
+- <a id="supervise-codex-sessions"></a>[Supervise Codex sessions](/plugins/codex-harness/native-features#supervise-codex-sessions)
+- <a id="native-codex-plugins"></a>[Native Codex plugins](/plugins/codex-harness/native-features#native-codex-plugins)
+- <a id="computer-use"></a>[Computer Use](/plugins/codex-harness/native-features#computer-use)
+
+### Codex harness troubleshooting
+
+[Codex harness troubleshooting](/plugins/codex-harness/troubleshooting) — Symptoms and fixes for Codex harness selection, app-server, and memory problems.
+
+- <a id="troubleshooting"></a>[Troubleshooting](/plugins/codex-harness/troubleshooting#troubleshooting)
 
 ## Related
 
-- [Agent harness plugins](/plugins/sdk-agent-harness)
+- [Codex harness reference](/plugins/codex-harness-reference)
+- [Codex harness runtime](/plugins/codex-harness-runtime)
+- [Codex supervision](/plugins/codex-supervision)
+- [Native Codex plugins](/plugins/codex-native-plugins)
+- [Codex Computer Use](/plugins/codex-computer-use)
 - [Agent runtimes](/concepts/agent-runtimes)
 - [Model providers](/concepts/model-providers)
 - [OpenAI provider](/providers/openai)
-- [Status](/cli/status)
+- [OpenAI Codex help](https://help.openai.com/en/collections/14937394-codex)
+- [Agent harness plugins](/plugins/sdk-agent-harness)
+- [Copilot SDK harness](/plugins/copilot)
 - [Plugin hooks](/plugins/hooks)
-- [Configuration reference](/gateway/configuration-reference)
+- [Diagnostics export](/gateway/diagnostics)
+- [Status](/cli/status)
 - [Testing](/help/testing-live#live-codex-app-server-harness-smoke)
+- [ACP agents](/tools/acp-agents) — how ACP agents are configured and bound
+- [ACP agents — setup](/tools/acp-agents-setup) — configuring this harness as an ACP agent

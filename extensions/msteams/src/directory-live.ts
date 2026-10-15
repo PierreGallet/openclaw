@@ -1,4 +1,7 @@
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import {
+  normalizeLowercaseStringOrEmpty,
+  normalizeStringEntries,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { ChannelDirectoryEntry } from "../runtime-api.js";
 import { searchGraphUsers } from "./graph-users.js";
 import {
@@ -10,6 +13,7 @@ import {
 
 export async function listMSTeamsDirectoryPeersLive(params: {
   cfg: unknown;
+  accountId?: string | null;
   query?: string | null;
   limit?: number | null;
 }): Promise<ChannelDirectoryEntry[]> {
@@ -17,32 +21,35 @@ export async function listMSTeamsDirectoryPeersLive(params: {
   if (!query) {
     return [];
   }
-  const token = await resolveGraphToken(params.cfg);
+  const token = await resolveGraphToken(params.cfg, {
+    accountId: params.accountId,
+  });
   const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : 20;
 
   const users = await searchGraphUsers({ token, query, top: limit });
 
-  return users
-    .map((user) => {
-      const id = user.id?.trim();
-      if (!id) {
-        return null;
-      }
-      const name = user.displayName?.trim();
-      const handle = user.userPrincipalName?.trim() || user.mail?.trim();
-      return {
+  return users.flatMap((user): ChannelDirectoryEntry[] => {
+    const id = user.id?.trim();
+    if (!id) {
+      return [];
+    }
+    const name = user.displayName?.trim();
+    const handle = user.userPrincipalName?.trim() || user.mail?.trim();
+    return [
+      {
         kind: "user",
         id: `user:${id}`,
         name: name || undefined,
         handle: handle ? `@${handle}` : undefined,
         raw: user,
-      } satisfies ChannelDirectoryEntry;
-    })
-    .filter(Boolean) as ChannelDirectoryEntry[];
+      },
+    ];
+  });
 }
 
 export async function listMSTeamsDirectoryGroupsLive(params: {
   cfg: unknown;
+  accountId?: string | null;
   query?: string | null;
   limit?: number | null;
 }): Promise<ChannelDirectoryEntry[]> {
@@ -50,15 +57,15 @@ export async function listMSTeamsDirectoryGroupsLive(params: {
   if (!rawQuery) {
     return [];
   }
-  const token = await resolveGraphToken(params.cfg);
+  const token = await resolveGraphToken(params.cfg, {
+    accountId: params.accountId,
+  });
   const limit = typeof params.limit === "number" && params.limit > 0 ? params.limit : 20;
   const [teamQuery, channelQuery] = rawQuery.includes("/")
-    ? rawQuery
-        .split("/", 2)
-        .map((part) => part.trim())
-        .filter(Boolean)
+    ? normalizeStringEntries(rawQuery.split("/", 2))
     : [rawQuery, null];
 
+  const normalizedChannelQuery = normalizeLowercaseStringOrEmpty(channelQuery);
   const teams = await listTeamsByName(token, teamQuery);
   const results: ChannelDirectoryEntry[] = [];
 
@@ -87,11 +94,7 @@ export async function listMSTeamsDirectoryGroupsLive(params: {
       if (!name) {
         continue;
       }
-      if (
-        !normalizeLowercaseStringOrEmpty(name).includes(
-          normalizeLowercaseStringOrEmpty(channelQuery),
-        )
-      ) {
+      if (!normalizeLowercaseStringOrEmpty(name).includes(normalizedChannelQuery)) {
         continue;
       }
       results.push({

@@ -1,229 +1,134 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createScriptTestHarness } from "./test-helpers";
+import { extractFunctionBody } from "./install-ps1.test-support.js";
+import { createScriptTestHarness } from "./test-helpers.js";
 
 const SCRIPT_PATH = "scripts/install.ps1";
-const ENTRYPOINT_RE =
-  /\r?\n\$mainResults = @\(Main\)\r?\n\$installSucceeded = \$mainResults\.Count -gt 0 -and \$mainResults\[-1\] -eq \$true\r?\nComplete-Install -Succeeded:\$installSucceeded\s*$/m;
 
-function extractFunctionBody(source: string, name: string): string {
-  const match = source.match(
-    new RegExp(`^function ${name} \\{\\r?\\n([\\s\\S]*?)^\\}\\r?\\n`, "m"),
-  );
-  expect(match?.[1]).toBeDefined();
-  return match![1];
-}
-
-function findPowerShell(): string | undefined {
-  for (const candidate of ["pwsh", "powershell"]) {
-    const result = spawnSync(
-      candidate,
-      ["-NoLogo", "-NoProfile", "-Command", "$PSVersionTable.PSVersion"],
-      {
-        encoding: "utf8",
-      },
-    );
-    if (result.status === 0) {
-      return candidate;
-    }
-  }
-  return undefined;
-}
-
-function toPowerShellSingleQuotedLiteral(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-function createFailingNodeFixture(source: string): string {
-  const scriptWithoutEntryPoint = source.replace(ENTRYPOINT_RE, "");
-  expect(scriptWithoutEntryPoint).not.toBe(source);
-
-  return [
-    scriptWithoutEntryPoint,
-    "",
-    "function Write-Banner { }",
-    "function Ensure-ExecutionPolicy { return $true }",
-    "function Ensure-Node { return $false }",
-    "",
-    "$mainResults = @(Main)",
-    "$installSucceeded = $mainResults.Count -gt 0 -and $mainResults[-1] -eq $true",
-    "Complete-Install -Succeeded:$installSucceeded",
-    "",
-  ].join("\n");
-}
-
-describe("install.ps1 failure handling", () => {
-  const harness = createScriptTestHarness();
+describe("install.ps1 source contracts", () => {
   const source = readFileSync(SCRIPT_PATH, "utf8");
-  const powershell = findPowerShell();
-  const runIfPowerShell = powershell ? it : it.skip;
 
-  it("does not exit directly from inside Main", () => {
+  it("pipes the SQLite probe to an application Node executable", () => {
+    const checkNodeBody = extractFunctionBody(source, "Check-Node");
+    expect(checkNodeBody).toContain("Get-Command node -CommandType Application");
+    expect(checkNodeBody).toContain("SELECT sqlite_version() AS version");
+    expect(checkNodeBody).toContain("$sqliteProbe | & $nodePath -");
+    expect(checkNodeBody).not.toContain("& $nodePath -e");
+  });
+
+  const harness = createScriptTestHarness();
+  const powershell = process.platform === "win32" ? "powershell" : "pwsh";
+  const available =
+    spawnSync(powershell, ["-NoLogo", "-NoProfile", "-Command", "exit 0"]).status === 0;
+  const runWithPowerShell = available ? it : it.skip;
+
+  runWithPowerShell.each(["valid", "missing-head", "broken-gitfile", "subdirectory"])(
+    "preserves real Git checkout boundaries before package setup: %s",
+    (scenario) => {
+      const root = join(harness.createTempDir("openclaw-install-worktree-"), "fixture");
+      const result = spawnSync(
+        powershell,
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          "test/scripts/install-git-worktree.ps1",
+          "-InstallerPath",
+          join(process.cwd(), SCRIPT_PATH),
+          "-FixtureRoot",
+          root,
+          "-Scenario",
+          scenario,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+    },
+  );
+
+  it("runs Windows command shims from a Windows-local cwd", () => {
+    const commandSafeBody = extractFunctionBody(source, "Invoke-CommandFromWindowsSafeDirectory");
+    const npmCommandBody = extractFunctionBody(source, "Invoke-NpmCommand");
+    const openClawPathBody = extractFunctionBody(source, "Ensure-OpenClawOnPath");
+    const ensurePnpmBody = extractFunctionBody(source, "Ensure-Pnpm");
     const mainBody = extractFunctionBody(source, "Main");
-    expect(mainBody).not.toMatch(/\bexit\b/i);
-    expect(mainBody).toContain("return (Fail-Install)");
+
+    expect(commandSafeBody).toContain("Get-WindowsCommandSafeDirectory");
+    expect(commandSafeBody).toContain("$WorkingDirectory");
+    expect(commandSafeBody).toContain("Push-Location -LiteralPath $safeDir");
+    expect(commandSafeBody).toContain("& $CommandPath @Arguments");
+    expect(commandSafeBody).toContain("Pop-Location");
+    expect(npmCommandBody).toContain("Invoke-CommandFromWindowsSafeDirectory");
+    expect(openClawPathBody).toContain('Invoke-NpmCommand -Arguments @("config", "get", "prefix")');
+    expect(ensurePnpmBody).toContain(
+      '@("enable", "--install-directory", $InstallDirectory, "pnpm")',
+    );
+    expect(ensurePnpmBody).toContain(
+      "Invoke-NpmCommand -CommandPath $npmCommand -Arguments $installArgs",
+    );
+    expect(mainBody).toContain("Remove-PreviousNpmOwner");
+    expect(mainBody).toContain("Remove-PreviousGitWrapper");
+    expect(mainBody).toContain("Start-NpmShimBackup");
+    expect(mainBody).toContain("Restore-NpmShimBackup");
+    expect(mainBody).toContain("Complete-NpmShimBackup");
+    expect(mainBody).toContain(
+      'Invoke-NpmCommand -Arguments @("list", "-g", "--depth", "0", "--json")',
+    );
   });
 
-  it("keeps failure termination in the top-level completion handler", () => {
-    const completeInstallBody = extractFunctionBody(source, "Complete-Install");
-    expect(completeInstallBody).toMatch(/\$PSCommandPath/);
-    expect(completeInstallBody).toMatch(/\bexit \$script:InstallExitCode\b/);
-    expect(completeInstallBody).toMatch(/\bthrow "OpenClaw installation failed with exit code/);
+  it("rejects OpenClaw GitHub source targets for npm installs", () => {
+    const npmInstallBody = extractFunctionBody(source, "Install-OpenClaw");
+    const sourceTargetBody = extractFunctionBody(source, "Test-OpenClawSourcePackageInstallSpec");
+    expect(sourceTargetBody).toContain('$normalizedTag -eq "main"');
+    expect(sourceTargetBody).toContain("^github:openclaw/openclaw");
+    expect(npmInstallBody).toContain("Test-OpenClawSourcePackageInstallSpec -RequestedTag $Tag");
+    expect(npmInstallBody).toContain("npm installs do not support OpenClaw GitHub source targets");
+    expect(npmInstallBody).toContain("-InstallMethod git -Tag main");
   });
 
-  it("runs npm capture commands from a writable installer temp directory", () => {
-    const nativeCaptureBody = extractFunctionBody(source, "Invoke-NativeCommandCapture");
-    const npmInstallBody = extractFunctionBody(source, "Install-OpenClawNpm");
-    const mainBody = extractFunctionBody(source, "Main");
-    expect(source).toContain("function Get-NpmWorkingDirectory {");
-    expect(nativeCaptureBody).toContain('[string]$WorkingDirectory = ""');
-    expect(nativeCaptureBody).toContain("$startProcessArgs.WorkingDirectory = $WorkingDirectory");
-    expect(npmInstallBody).toContain("-WorkingDirectory (Get-NpmWorkingDirectory)");
-    expect(mainBody).toContain("-WorkingDirectory (Get-NpmWorkingDirectory)");
+  it("does not read project npmrc when choosing global install freshness args", () => {
+    const rawKeyBody = extractFunctionBody(source, "Test-NpmConfigRawKey");
+    expect(rawKeyBody).not.toContain("Get-Location");
+    expect(rawKeyBody).not.toContain('Join-Path (Get-Location) ".npmrc"');
   });
 
-  runIfPowerShell("creates a temp npm working directory", () => {
-    const tempDir = harness.createTempDir("openclaw-install-ps1-");
-    const scriptPath = join(tempDir, "install.ps1");
-    const scriptWithoutEntryPoint = source.replace(ENTRYPOINT_RE, "");
-    writeFileSync(
-      scriptPath,
-      [
-        scriptWithoutEntryPoint,
-        "",
-        "$result = Get-NpmWorkingDirectory",
-        'if (!(Test-Path -LiteralPath $result)) { throw "missing $result" }',
-        'if ($result -notmatch "openclaw-installer") { throw "unexpected $result" }',
-        "",
-      ].join("\n"),
+  it("preserves the min-release-age probe status before raw npmrc detection", () => {
+    const npmInstallBody = extractFunctionBody(source, "Install-OpenClaw");
+    const probeStatusCapture = npmInstallBody.indexOf("$minReleaseAgeStatus = $LASTEXITCODE");
+    const rawKeyProbe = npmInstallBody.indexOf("Test-NpmConfigRawKey -Key");
+    expect(probeStatusCapture).toBeGreaterThan(-1);
+    expect(rawKeyProbe).toBeGreaterThan(-1);
+    expect(probeStatusCapture).toBeLessThan(rawKeyProbe);
+    expect(npmInstallBody).toContain(
+      "} elseif ($minReleaseAgeStatus -ne 0 -or -not $minReleaseAge",
     );
-    chmodSync(scriptPath, 0o755);
-
-    const result = spawnSync(
-      powershell!,
-      ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-      { encoding: "utf8" },
+    expect(npmInstallBody).toContain(
+      'Invoke-NpmCommand -CommandPath $npmCommand -WorkingDirectory $npmCwd -Arguments @("config", "get", "min-release-age", "--global")',
     );
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
+    expect(npmInstallBody).toContain(
+      'Invoke-NpmCommand -CommandPath $npmCommand -WorkingDirectory $npmCwd -Arguments @("config", "get", "before", "--global")',
+    );
   });
 
-  runIfPowerShell("exits non-zero when run as a script file", () => {
-    const tempDir = harness.createTempDir("openclaw-install-ps1-");
-    const scriptPath = join(tempDir, "install.ps1");
-    writeFileSync(scriptPath, createFailingNodeFixture(source));
-    chmodSync(scriptPath, 0o755);
+  it("preserves caller-relative local tarball install specs before safe-cwd npm calls", () => {
+    const resolveSpecBody = extractFunctionBody(source, "Resolve-NpmOpenClawInstallSpec");
+    const localSpecBody = extractFunctionBody(source, "Resolve-LocalNpmPackageInstallSpec");
+    const localPathBody = extractFunctionBody(source, "Resolve-LocalNpmPackagePath");
 
-    const result = spawnSync(
-      powershell!,
-      ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-      { encoding: "utf8" },
+    expect(resolveSpecBody).toContain(
+      "Resolve-LocalNpmPackageInstallSpec -InstallSpec $trimmedTag",
     );
-
-    expect(result.status).toBe(1);
-  });
-
-  runIfPowerShell("throws without killing the caller when run as a scriptblock", () => {
-    const tempDir = harness.createTempDir("openclaw-install-ps1-");
-    const scriptPath = join(tempDir, "install.ps1");
-    writeFileSync(scriptPath, createFailingNodeFixture(source));
-    chmodSync(scriptPath, 0o755);
-
-    const command = [
-      "try {",
-      `  & ([scriptblock]::Create((Get-Content -LiteralPath ${toPowerShellSingleQuotedLiteral(scriptPath)} -Raw)))`,
-      "} catch {",
-      '  Write-Output "caught=$($_.Exception.Message)"',
-      "}",
-      'Write-Output "alive-after-install"',
-    ].join("\n");
-    const result = spawnSync(powershell!, ["-NoLogo", "-NoProfile", "-Command", command], {
-      encoding: "utf8",
-    });
-
-    expect(result.status).toBe(0);
-    expect(result.stdout).toContain("caught=OpenClaw installation failed with exit code 1.");
-    expect(result.stdout).toContain("alive-after-install");
-  });
-
-  runIfPowerShell("keeps npm chatter out of Main's success return value", () => {
-    const tempDir = harness.createTempDir("openclaw-install-ps1-");
-    const scriptPath = join(tempDir, "install.ps1");
-    const scriptWithoutEntryPoint = source.replace(ENTRYPOINT_RE, "");
-    writeFileSync(
-      scriptPath,
-      [
-        scriptWithoutEntryPoint,
-        "",
-        "function Write-Banner { }",
-        "function Ensure-ExecutionPolicy { return $true }",
-        "function Ensure-Node { return $true }",
-        "function Add-ToPath { param([string]$Path) }",
-        "function Invoke-NativeCommandCapture {",
-        "  param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory = '')",
-        "  return @{ ExitCode = 0; Stdout = 'npm stdout'; Stderr = 'npm stderr' }",
-        "}",
-        "$NoOnboard = $true",
-        "$result = Main",
-        "if ($result -is [array]) { throw 'Main returned an array' }",
-        'if ($result -ne $true) { throw "Main returned $result" }',
-        "",
-      ].join("\n"),
-    );
-    chmodSync(scriptPath, 0o755);
-
-    const result = spawnSync(
-      powershell!,
-      ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-      { encoding: "utf8" },
-    );
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-  });
-
-  runIfPowerShell("uses Main's final boolean result when helper output precedes success", () => {
-    const tempDir = harness.createTempDir("openclaw-install-ps1-");
-    const scriptPath = join(tempDir, "install.ps1");
-    const scriptWithoutEntryPoint = source.replace(ENTRYPOINT_RE, "");
-    writeFileSync(
-      scriptPath,
-      [
-        scriptWithoutEntryPoint,
-        "",
-        "function Write-Banner { }",
-        "function Ensure-ExecutionPolicy { return $true }",
-        "function Ensure-Node { return $true }",
-        "function Ensure-Git { return $true }",
-        "function Add-ToPath { param([string]$Path) }",
-        "function Install-OpenClawNpm {",
-        "  param([string]$Target = 'latest')",
-        "  Write-Output 'native chatter'",
-        "  return $true",
-        "}",
-        "function Invoke-NativeCommandCapture {",
-        "  param([string]$FilePath, [string[]]$Arguments, [string]$WorkingDirectory = '')",
-        "  return @{ ExitCode = 0; Stdout = 'npm prefix'; Stderr = '' }",
-        "}",
-        "$NoOnboard = $true",
-        "$mainResults = @(Main)",
-        "$installSucceeded = $mainResults.Count -gt 0 -and $mainResults[-1] -eq $true",
-        "Complete-Install -Succeeded:$installSucceeded",
-        "",
-      ].join("\n"),
-    );
-    chmodSync(scriptPath, 0o755);
-
-    const result = spawnSync(
-      powershell!,
-      ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath],
-      { encoding: "utf8" },
-    );
-
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
+    expect(localSpecBody).toContain("$InstallSpec -match '^file:(?<path>.+)$'");
+    expect(localSpecBody).toContain("Resolve-LocalNpmPackagePath -PackagePath $filePath");
+    expect(localSpecBody).toContain(").AbsoluteUri");
+    expect(localSpecBody).toContain("$InstallSpec -notmatch '^\\.\\.?[\\\\/]'");
+    expect(localSpecBody).toContain("$InstallSpec -notmatch '\\.tgz$'");
+    expect(localPathBody).toContain("Resolve-Path -LiteralPath $PackagePath");
+    expect(localPathBody).toContain("[System.IO.Path]::GetFullPath($PackagePath)");
   });
 });

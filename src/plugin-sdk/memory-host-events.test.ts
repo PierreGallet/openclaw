@@ -1,10 +1,23 @@
+/**
+ * Tests memory host event log helpers and persisted event behavior.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
+import * as eventStore from "../memory-host-sdk/event-store.js";
+import {
+  listStoredMemoryHostEvents,
+  setMaxMemoryHostEventsForTests,
+} from "../memory-host-sdk/event-store.js";
+import { resetPluginStateStoreForTests } from "../plugin-state/plugin-state-store.js";
+import * as pluginStateStore from "../plugin-state/plugin-state-store.js";
+import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db-cache.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import {
   appendMemoryHostEvent,
+  readMemoryHostEventRecords,
   readMemoryHostEvents,
-  resolveMemoryHostEventLogPath,
 } from "./memory-host-events.js";
 import { createClaimableDedupe, createPersistentDedupe } from "./persistent-dedupe.js";
 import { createPluginSdkTestHarness } from "./test-helpers.js";
@@ -15,52 +28,290 @@ function createDedupe(root: string, overrides?: { ttlMs?: number }) {
   return createPersistentDedupe({
     ttlMs: overrides?.ttlMs ?? 24 * 60 * 60 * 1000,
     memoryMaxSize: 100,
-    fileMaxEntries: 1000,
-    resolveFilePath: (namespace) => path.join(root, `${namespace}.json`),
+    pluginId: "test-persistent-dedupe",
+    namespacePrefix: "test-dedupe",
+    stateMaxEntries: 1000,
+    env: { ...process.env, OPENCLAW_STATE_DIR: root },
   });
 }
 
+afterEach(async () => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  setMaxMemoryHostEventsForTests(undefined);
+  await closeOpenClawStateDatabaseAsync();
+  resetPluginStateStoreForTests();
+});
+
 describe("memory host event journal helpers", () => {
-  it("appends and reads typed workspace events", async () => {
-    const workspaceDir = await createTempDir("memory-host-events-");
-
-    await appendMemoryHostEvent(workspaceDir, {
-      type: "memory.recall.recorded",
-      timestamp: "2026-04-05T12:00:00.000Z",
-      query: "glacier backup",
-      resultCount: 1,
-      results: [
+  it("uses the retained tail when a cursor retires during a delayed append", async () => {
+    const workspaceDir = await createTempDir("memory-host-events-retired-cursor-");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: workspaceDir };
+    const append = (query: string) =>
+      appendMemoryHostEvent(
+        workspaceDir,
         {
-          path: "memory/2026-04-05.md",
-          startLine: 1,
-          endLine: 3,
-          score: 0.9,
+          type: "memory.recall.recorded",
+          timestamp: "2026-09-10T12:00:00.000Z",
+          query,
+          resultCount: 0,
+          results: [],
         },
-      ],
-    });
-    await appendMemoryHostEvent(workspaceDir, {
-      type: "memory.dream.completed",
-      timestamp: "2026-04-05T13:00:00.000Z",
-      phase: "light",
-      lineCount: 4,
-      storageMode: "both",
-      inlinePath: path.join(workspaceDir, "memory", "2026-04-05.md"),
-      reportPath: path.join(workspaceDir, "memory", "dreaming", "light", "2026-04-05.md"),
-    });
+        { env },
+      );
+    for (let index = 1; index <= 9; index++) {
+      await append(`event-${index}`);
+    }
+    const entered = createDeferred();
+    const release = createDeferred();
+    const register = pluginStateStore.registerPluginStateSequencedJournalEntry;
+    vi.spyOn(pluginStateStore, "registerPluginStateSequencedJournalEntry").mockImplementationOnce(
+      async (params) => {
+        entered.resolve();
+        await release.promise;
+        return await register(params);
+      },
+    );
+    const pending = append("delayed").catch((error: unknown) => error);
+    try {
+      await entered.promise;
+      await append("intervening");
+      const cursors = pluginStateStore.createPluginStateKeyedStore("memory-core", {
+        namespace: "memory-host.event-cursors",
+        maxEntries: 1_000,
+        env,
+      });
+      expect(await cursors.entries()).toMatchObject([{ value: { lastSequence: 10 } }]);
+      await cursors.clear();
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect(await pending).toBeUndefined();
+    expect(
+      (await listStoredMemoryHostEvents({ workspaceDir, env })).map(
+        (entry) => entry.value.sequence,
+      ),
+    ).toEqual(Array.from({ length: 11 }, (_, index) => index + 1));
+  });
 
-    const eventLogPath = resolveMemoryHostEventLogPath(workspaceDir);
-    await expect(fs.readFile(eventLogPath, "utf8")).resolves.toContain(
-      '"type":"memory.recall.recorded"',
+  it("waits for the journal commit before completing an append", async () => {
+    const workspaceDir = await createTempDir("memory-host-events-delayed-commit-");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: workspaceDir };
+    const entered = createDeferred();
+    const release = createDeferred();
+    const register = pluginStateStore.registerPluginStateSequencedJournalEntry;
+    vi.spyOn(pluginStateStore, "registerPluginStateSequencedJournalEntry").mockImplementationOnce(
+      async (params) => {
+        entered.resolve();
+        await release.promise;
+        return await register(params);
+      },
+    );
+    const completed = vi.fn();
+    const pending = appendMemoryHostEvent(
+      workspaceDir,
+      {
+        type: "memory.recall.recorded",
+        timestamp: "2026-09-10T12:00:00.000Z",
+        query: "delayed commit",
+        resultCount: 0,
+        results: [],
+      },
+      { env },
+    ).then(completed);
+    try {
+      await entered.promise;
+      expect(completed).not.toHaveBeenCalled();
+      expect(await readMemoryHostEventRecords({ workspaceDir, env })).toEqual([]);
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect(await readMemoryHostEventRecords({ workspaceDir, env })).toMatchObject([
+      { query: "delayed commit" },
+    ]);
+  });
+
+  it("awaits event reads and propagates read rejection through the public helpers", async () => {
+    const workspaceDir = await createTempDir("memory-host-events-delayed-read-");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: workspaceDir };
+    await appendMemoryHostEvent(
+      workspaceDir,
+      {
+        type: "memory.recall.recorded",
+        timestamp: "2026-09-10T12:00:00.000Z",
+        query: "delayed read",
+        resultCount: 0,
+        results: [],
+      },
+      { env },
+    );
+    const entered = createDeferred();
+    const release = createDeferred();
+    const list = eventStore.listStoredMemoryHostEvents;
+    const reader = vi
+      .spyOn(eventStore, "listStoredMemoryHostEvents")
+      .mockImplementationOnce(async (params) => {
+        entered.resolve();
+        await release.promise;
+        return await list(params);
+      });
+    const completed = vi.fn();
+    const pending = readMemoryHostEventRecords({ workspaceDir, env }).then(completed);
+    try {
+      await entered.promise;
+      expect(completed).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await pending;
+    }
+    expect(completed).toHaveBeenCalledWith([expect.objectContaining({ query: "delayed read" })]);
+    const failure = new Error("journal read failed");
+    reader.mockRejectedValueOnce(failure);
+    await expect(readMemoryHostEvents({ workspaceDir, env })).rejects.toBe(failure);
+  });
+
+  it("allocates unique sequences for concurrent appends and continues after reopen", async () => {
+    const workspaceDir = await createTempDir("memory-host-events-concurrent-");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: workspaceDir };
+    const append = (index: number) =>
+      appendMemoryHostEvent(
+        workspaceDir,
+        {
+          type: "memory.recall.recorded",
+          timestamp: "2026-09-10T12:00:00.000Z",
+          query: `event-${index}`,
+          resultCount: 0,
+          results: [],
+        },
+        { env },
+      );
+    await Promise.all(Array.from({ length: 24 }, (_, index) => append(index + 1)));
+    await closeOpenClawStateDatabaseAsync();
+    resetPluginStateStoreForTests();
+    const stored = await listStoredMemoryHostEvents({ workspaceDir, env });
+    expect(stored.map((entry) => entry.value.sequence)).toEqual(
+      Array.from({ length: 24 }, (_, index) => index + 1),
+    );
+    expect(new Set(stored.map((entry) => entry.key)).size).toBe(24);
+    await append(25);
+    expect(
+      (await listStoredMemoryHostEvents({ workspaceDir, env, limit: 1 }))[0]?.value.sequence,
+    ).toBe(25);
+  });
+
+  it("rolls back cursor allocation and retention when journal insertion fails", async () => {
+    const workspaceDir = await createTempDir("memory-host-events-rollback-");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: workspaceDir };
+    setMaxMemoryHostEventsForTests(1);
+    const append = (query: string) =>
+      appendMemoryHostEvent(
+        workspaceDir,
+        {
+          type: "memory.recall.recorded",
+          timestamp: "2026-09-10T12:00:00.000Z",
+          query,
+          resultCount: 0,
+          results: [],
+        },
+        { env },
+      );
+    await append("retained");
+    const before = await listStoredMemoryHostEvents({ workspaceDir, env });
+    const { db } = openOpenClawStateDatabase({ env });
+    db.exec(`CREATE TRIGGER fail_memory_journal BEFORE INSERT ON plugin_state_entries
+      WHEN NEW.namespace = 'memory-host.events'
+      BEGIN SELECT RAISE(ABORT, 'injected journal write failure'); END`);
+    try {
+      await expect(append("refused")).rejects.toMatchObject({ code: "PLUGIN_STATE_WRITE_FAILED" });
+      expect(await listStoredMemoryHostEvents({ workspaceDir, env })).toEqual(before);
+    } finally {
+      db.exec("DROP TRIGGER fail_memory_journal");
+    }
+    await append("accepted");
+    expect(await listStoredMemoryHostEvents({ workspaceDir, env })).toMatchObject([
+      { value: { sequence: 2, event: { query: "accepted" } } },
+    ]);
+  });
+
+  it("keeps legacy event readers stable when diagnostic records are present", async () => {
+    const workspaceDir = await createTempDir("memory-host-events-diagnostics-");
+    const env = { ...process.env, OPENCLAW_STATE_DIR: workspaceDir };
+
+    await appendMemoryHostEvent(
+      workspaceDir,
+      {
+        type: "memory.recall.skipped",
+        timestamp: "2026-04-05T12:00:00.000Z",
+        query: "durable memory",
+        reason: "non-short-term-memory-path",
+        eligibleResultCount: 0,
+        skippedResultCount: 1,
+        results: [
+          {
+            path: "MEMORY.md",
+            startLine: 3,
+            endLine: 3,
+            score: 0.9,
+            reason: "non-short-term-memory-path",
+          },
+        ],
+      },
+      { env },
     );
 
-    const events = await readMemoryHostEvents({ workspaceDir });
-    const tail = await readMemoryHostEvents({ workspaceDir, limit: 1 });
+    await appendMemoryHostEvent(
+      workspaceDir,
+      {
+        type: "memory.recall.recorded",
+        timestamp: "2026-04-05T12:05:00.000Z",
+        query: "daily memory",
+        resultCount: 1,
+        results: [
+          {
+            path: "memory/2026-04-05.md",
+            startLine: 1,
+            endLine: 3,
+            score: 0.95,
+          },
+        ],
+      },
+      { env },
+    );
+    await appendMemoryHostEvent(
+      workspaceDir,
+      {
+        type: "memory.recall.skipped",
+        timestamp: "2026-04-05T12:10:00.000Z",
+        query: "durable memory again",
+        reason: "non-short-term-memory-path",
+        eligibleResultCount: 1,
+        skippedResultCount: 1,
+        results: [
+          {
+            path: "MEMORY.md",
+            startLine: 4,
+            endLine: 4,
+            score: 0.8,
+            reason: "non-short-term-memory-path",
+          },
+        ],
+      },
+      { env },
+    );
 
-    expect(events).toHaveLength(2);
-    expect(events[0]?.type).toBe("memory.recall.recorded");
-    expect(events[1]?.type).toBe("memory.dream.completed");
-    expect(tail).toHaveLength(1);
-    expect(tail[0]?.type).toBe("memory.dream.completed");
+    const legacyEvents = await readMemoryHostEvents({ workspaceDir, env });
+    const legacyTail = await readMemoryHostEvents({ workspaceDir, limit: 1, env });
+    const records = await readMemoryHostEventRecords({ workspaceDir, env });
+
+    expect(legacyEvents.map((event) => event.type)).toEqual(["memory.recall.recorded"]);
+    expect(legacyTail.map((event) => event.type)).toEqual(["memory.recall.recorded"]);
+    expect(records.map((event) => event.type)).toEqual([
+      "memory.recall.skipped",
+      "memory.recall.recorded",
+      "memory.recall.skipped",
+    ]);
   });
 });
 
@@ -86,57 +337,52 @@ describe("createPersistentDedupe", () => {
     expect(raceSecond).toBe(false);
   });
 
-  it("falls back to memory-only behavior on disk errors", async () => {
+  it("bounds non-finite persistent dedupe options", async () => {
+    const root = await createTempDir("openclaw-dedupe-");
+    const dedupe = createPersistentDedupe({
+      ttlMs: Number.NaN,
+      memoryMaxSize: Number.NaN,
+      pluginId: "test-persistent-dedupe",
+      namespacePrefix: "test-bounds",
+      stateMaxEntries: Number.NaN,
+      env: { ...process.env, OPENCLAW_STATE_DIR: root },
+    });
+
+    expect(await dedupe.checkAndRecord("m1", { namespace: "a", now: 100 })).toBe(true);
+    expect(await dedupe.hasRecent("m1", { namespace: "a", now: 100 })).toBe(true);
+    expect(await dedupe.checkAndRecord("m1", { namespace: "a", now: 100 })).toBe(false);
+    expect(dedupe.memorySize()).toBe(0);
+  });
+
+  it("uses legacy JSON paths only as SQLite namespace identifiers", async () => {
+    const root = await createTempDir("openclaw-legacy-dedupe-");
+    const legacyPath = path.join(root, "legacy.json");
     const dedupe = createPersistentDedupe({
       ttlMs: 10_000,
       memoryMaxSize: 100,
       fileMaxEntries: 1000,
-      resolveFilePath: () => path.join("/dev/null", "dedupe.json"),
+      resolveFilePath: () => legacyPath,
+      env: { ...process.env, OPENCLAW_STATE_DIR: root },
     });
 
-    expect(await dedupe.checkAndRecord("memory-only", { namespace: "x" })).toBe(true);
-    expect(await dedupe.checkAndRecord("memory-only", { namespace: "x" })).toBe(false);
-  });
-
-  it("warms empty namespaces and skips expired disk entries", async () => {
-    const root = await createTempDir("openclaw-dedupe-");
-    const emptyReader = createDedupe(root, { ttlMs: 10_000 });
-    expect(await emptyReader.warmup("nonexistent")).toBe(0);
-
-    const oldNow = Date.now() - 2000;
-    await fs.writeFile(
-      path.join(root, "acct.json"),
-      JSON.stringify({ "old-msg": oldNow, "new-msg": Date.now() }),
-    );
-
-    const reader = createDedupe(root, { ttlMs: 1000 });
-    expect(await reader.warmup("acct")).toBe(1);
-    expect(await reader.checkAndRecord("old-msg", { namespace: "acct" })).toBe(true);
-    expect(await reader.checkAndRecord("new-msg", { namespace: "acct" })).toBe(false);
+    expect(await dedupe.checkAndRecord("sqlite-only", { namespace: "x" })).toBe(true);
+    expect(await dedupe.checkAndRecord("sqlite-only", { namespace: "x" })).toBe(false);
+    await expect(fs.access(legacyPath)).rejects.toThrow();
   });
 });
 
 describe("createClaimableDedupe", () => {
-  it("mirrors in-flight duplicates, serializes races, and records on commit", async () => {
+  it("serializes concurrent claims and records on commit", async () => {
     const dedupe = createClaimableDedupe({
       ttlMs: 10_000,
       memoryMaxSize: 100,
     });
 
-    await expect(dedupe.claim("line:evt-1")).resolves.toEqual({ kind: "claimed" });
-    const duplicate = await dedupe.claim("line:evt-1");
-    expect(duplicate.kind).toBe("inflight");
-
-    const commit = dedupe.commit("line:evt-1");
-    await expect(commit).resolves.toBe(true);
-    if (duplicate.kind === "inflight") {
-      await expect(duplicate.pending).resolves.toBe(true);
-    }
-    await expect(dedupe.claim("line:evt-1")).resolves.toEqual({ kind: "duplicate" });
-
     const claims = await Promise.all([dedupe.claim("line:race-1"), dedupe.claim("line:race-1")]);
-    expect(claims.filter((claim) => claim.kind === "claimed")).toHaveLength(1);
-    expect(claims.filter((claim) => claim.kind === "inflight")).toHaveLength(1);
+    const countClaimKind = (kind: (typeof claims)[number]["kind"]) =>
+      claims.reduce((count, claim) => count + (claim.kind === kind ? 1 : 0), 0);
+    expect(countClaimKind("claimed")).toBe(1);
+    expect(countClaimKind("inflight")).toBe(1);
 
     const waitingClaim = claims.find((claim) => claim.kind === "inflight");
     await expect(dedupe.commit("line:race-1")).resolves.toBe(true);
@@ -146,47 +392,15 @@ describe("createClaimableDedupe", () => {
     await expect(dedupe.claim("line:race-1")).resolves.toEqual({ kind: "duplicate" });
   });
 
-  it("rejects waiting duplicates when the active claim releases with an error", async () => {
+  it("bounds non-finite claimable dedupe options", async () => {
     const dedupe = createClaimableDedupe({
-      ttlMs: 10_000,
-      memoryMaxSize: 100,
+      ttlMs: Number.NaN,
+      memoryMaxSize: Number.NaN,
     });
 
-    await expect(dedupe.claim("line:evt-2")).resolves.toEqual({ kind: "claimed" });
-    const duplicate = await dedupe.claim("line:evt-2");
-    expect(duplicate.kind).toBe("inflight");
-
-    const failure = new Error("transient failure");
-    dedupe.release("line:evt-2", { error: failure });
-    if (duplicate.kind === "inflight") {
-      await expect(duplicate.pending).rejects.toThrow("transient failure");
-    }
-    await expect(dedupe.claim("line:evt-2")).resolves.toEqual({ kind: "claimed" });
-  });
-
-  it("supports persistent-backed recent checks and warmup", async () => {
-    const root = await createTempDir("openclaw-claimable-dedupe-");
-    const writer = createClaimableDedupe({
-      ttlMs: 10_000,
-      memoryMaxSize: 100,
-      fileMaxEntries: 1000,
-      resolveFilePath: (namespace) => path.join(root, `${namespace}.json`),
-    });
-
-    await expect(writer.claim("m1", { namespace: "acct" })).resolves.toEqual({ kind: "claimed" });
-    await expect(writer.commit("m1", { namespace: "acct" })).resolves.toBe(true);
-
-    const reader = createClaimableDedupe({
-      ttlMs: 10_000,
-      memoryMaxSize: 100,
-      fileMaxEntries: 1000,
-      resolveFilePath: (namespace) => path.join(root, `${namespace}.json`),
-    });
-
-    expect(await reader.hasRecent("m1", { namespace: "acct" })).toBe(true);
-    expect(await reader.warmup("acct")).toBe(1);
-    await expect(reader.claim("m1", { namespace: "acct" })).resolves.toEqual({
-      kind: "duplicate",
-    });
+    await expect(dedupe.claim("m1", { now: 100 })).resolves.toEqual({ kind: "claimed" });
+    await expect(dedupe.commit("m1", { now: 100 })).resolves.toBe(true);
+    await expect(dedupe.claim("m1", { now: 100 })).resolves.toEqual({ kind: "claimed" });
+    expect(dedupe.memorySize()).toBe(0);
   });
 });

@@ -1,3 +1,4 @@
+// Qa Lab tests cover discord smoke plugin behavior.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -24,9 +25,31 @@ function emptyResponse(status = 204) {
   return new Response(null, { status });
 }
 
+function fetchGuardCallsWithMethod(method: string) {
+  return fetchWithSsrFGuard.mock.calls.filter(([request]) => {
+    const init =
+      typeof request === "object" && request !== null
+        ? (request as { init?: RequestInit }).init
+        : undefined;
+    return init?.method === method;
+  });
+}
+
 describe("mantis discord smoke runtime", () => {
   let repoRoot: string;
   let tokenFile: string;
+
+  function runSmoke(options: NonNullable<Parameters<typeof runMantisDiscordSmoke>[0]>) {
+    return runMantisDiscordSmoke({
+      repoRoot,
+      tokenFile,
+      env: {
+        OPENCLAW_QA_DISCORD_GUILD_ID: "1456350064065904867",
+        OPENCLAW_QA_DISCORD_CHANNEL_ID: "1456744319972282449",
+      },
+      ...options,
+    });
+  }
 
   beforeEach(async () => {
     repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mantis-discord-smoke-"));
@@ -91,67 +114,33 @@ describe("mantis discord smoke runtime", () => {
     await fs.rm(repoRoot, { recursive: true, force: true });
   });
 
-  it("writes pass artifacts without leaking the bot token", async () => {
-    const result = await runMantisDiscordSmoke({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/mantis/test",
-      tokenFile,
-      env: {
-        OPENCLAW_QA_DISCORD_GUILD_ID: "1456350064065904867",
-        OPENCLAW_QA_DISCORD_CHANNEL_ID: "1456744319972282449",
-      },
-      now: () => new Date("2026-05-03T12:00:00.000Z"),
-    });
-
-    expect(result.status).toBe("pass");
-    const summary = JSON.parse(await fs.readFile(result.summaryPath, "utf8")) as {
-      status: string;
-      tokenSource: string;
-      message: { id: string; posted: boolean; reactionAdded: boolean };
-    };
-    expect(summary).toMatchObject({
-      status: "pass",
-      tokenSource: "file",
-      message: {
-        id: "1500000000000000001",
-        posted: true,
-        reactionAdded: true,
-      },
-    });
-    expect(await fs.readFile(result.summaryPath, "utf8")).not.toContain("test-token");
-    expect(await fs.readFile(result.reportPath, "utf8")).not.toContain("test-token");
-  });
-
-  it("supports visibility-only smoke runs", async () => {
-    const result = await runMantisDiscordSmoke({
-      repoRoot,
-      outputDir: ".artifacts/qa-e2e/mantis/visibility",
-      tokenFile,
+  it("bounds Mantis Discord token files", async () => {
+    await fs.writeFile(tokenFile, "x".repeat(4 * 1024), "utf8");
+    const boundaryResult = await runSmoke({
+      outputDir: ".artifacts/qa-e2e/mantis/token-boundary",
       skipPost: true,
-      env: {
-        OPENCLAW_QA_DISCORD_GUILD_ID: "1456350064065904867",
-        OPENCLAW_QA_DISCORD_CHANNEL_ID: "1456744319972282449",
-      },
+    });
+    expect(boundaryResult.status).toBe("pass");
+    expect(fetchGuardCallsWithMethod("POST")).toHaveLength(0);
+    const fetchCallsAtBoundary = fetchWithSsrFGuard.mock.calls.length;
+
+    await fs.writeFile(tokenFile, "x".repeat(4 * 1024 + 1), "utf8");
+    const oversizedResult = await runSmoke({
+      outputDir: ".artifacts/qa-e2e/mantis/token-oversized",
+      skipPost: true,
     });
 
-    expect(result.status).toBe("pass");
-    expect(fetchWithSsrFGuard).not.toHaveBeenCalledWith(
-      expect.objectContaining({
-        init: expect.objectContaining({ method: "POST" }),
-      }),
+    expect(oversizedResult.status).toBe("fail");
+    expect(fetchWithSsrFGuard.mock.calls).toHaveLength(fetchCallsAtBoundary);
+    expect(await fs.readFile(path.join(oversizedResult.outputDir, "error.txt"), "utf8")).toContain(
+      `Mantis Discord token file at ${tokenFile} exceeds 4096 bytes.`,
     );
   });
 
   it("redacts Discord target metadata in public artifacts", async () => {
-    const result = await runMantisDiscordSmoke({
-      repoRoot,
+    const result = await runSmoke({
       outputDir: ".artifacts/qa-e2e/mantis/redacted",
-      tokenFile,
       redactPublicMetadata: true,
-      env: {
-        OPENCLAW_QA_DISCORD_GUILD_ID: "1456350064065904867",
-        OPENCLAW_QA_DISCORD_CHANNEL_ID: "1456744319972282449",
-      },
     });
 
     expect(result.status).toBe("pass");
@@ -162,6 +151,7 @@ describe("mantis discord smoke runtime", () => {
     expect(reportText).toContain("- Guild: <redacted> (<redacted>)");
     expect(reportText).toContain("- Channel: #<redacted> (<redacted>)");
     for (const text of [summaryText, reportText]) {
+      expect(text).not.toContain("test-token");
       expect(text).toContain("<redacted>");
       expect(text).not.toContain("1489650053747314748");
       expect(text).not.toContain("1456350064065904867");
@@ -171,20 +161,23 @@ describe("mantis discord smoke runtime", () => {
       expect(text).not.toContain("1500000000000000001");
     }
     expect(summaryText).not.toContain("Mantis");
-    expect(JSON.parse(summaryText)).toMatchObject({
-      metadataRedaction: true,
-      bot: { id: "<redacted>", username: "<redacted>" },
-      guild: { id: "<redacted>", name: "<redacted>" },
-      channel: { id: "<redacted>", name: "<redacted>" },
-      message: { id: "<redacted>" },
-    });
+    const summary = JSON.parse(summaryText) as {
+      bot?: { id: string; username?: string };
+      channel?: { id: string; name?: string; type?: number };
+      guild?: { id: string; name?: string };
+      message?: { id: string };
+      metadataRedaction: boolean;
+    };
+    expect(summary.metadataRedaction).toBe(true);
+    expect(summary.bot).toEqual({ id: "<redacted>", username: "<redacted>" });
+    expect(summary.guild).toEqual({ id: "<redacted>", name: "<redacted>" });
+    expect(summary.channel).toEqual({ id: "<redacted>", name: "<redacted>", type: 0 });
+    expect(summary.message?.id).toBe("<redacted>");
   });
 
   it("fails before calling Discord when required ids are missing", async () => {
-    const result = await runMantisDiscordSmoke({
-      repoRoot,
+    const result = await runSmoke({
       outputDir: ".artifacts/qa-e2e/mantis/missing",
-      tokenFile,
       env: {},
     });
 
@@ -231,24 +224,48 @@ describe("mantis discord smoke runtime", () => {
       },
     );
 
-    const result = await runMantisDiscordSmoke({
-      repoRoot,
+    const result = await runSmoke({
       outputDir: ".artifacts/qa-e2e/mantis/wrong-guild",
-      tokenFile,
-      env: {
-        OPENCLAW_QA_DISCORD_GUILD_ID: "1456350064065904867",
-        OPENCLAW_QA_DISCORD_CHANNEL_ID: "1456744319972282449",
-      },
     });
 
     expect(result.status).toBe("fail");
     const errorText = await fs.readFile(path.join(result.outputDir, "error.txt"), "utf8");
     expect(errorText).toContain("is not in guild");
-    expect(fetchWithSsrFGuard).not.toHaveBeenCalledWith(
-      expect.objectContaining({
-        init: expect.objectContaining({ method: "POST" }),
-      }),
-    );
+    expect(fetchGuardCallsWithMethod("POST")).toHaveLength(0);
+  });
+
+  it("fails closed when a Discord API response exceeds the byte cap", async () => {
+    const oversizedBody = "x".repeat(16 * 1024 * 1024 + 1);
+    const release = vi.fn();
+    fetchWithSsrFGuard.mockImplementation(async ({ url }: { url: string }) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === "/api/v10/users/@me") {
+        return {
+          response: new Response(oversizedBody, {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+          release,
+        };
+      }
+      return {
+        response: jsonResponse({ message: `unexpected ${pathname}` }, 404),
+        release: vi.fn(),
+      };
+    });
+
+    const result = await runSmoke({
+      outputDir: ".artifacts/qa-e2e/mantis/oversized",
+    });
+
+    expect(result.status).toBe("fail");
+    const errorText = await fs.readFile(path.join(result.outputDir, "error.txt"), "utf8");
+    expect(errorText).toContain("/users/@me response exceeds");
+    expect(errorText).toContain(`${16 * 1024 * 1024} bytes`);
+    // The byte cap trips on the first call, so the post step never runs.
+    expect(fetchGuardCallsWithMethod("POST")).toHaveLength(0);
+    // The connection is still released on the fail-closed path.
+    expect(release).toHaveBeenCalled();
   });
 
   it("redacts response guild ids in mismatch failure artifacts", async () => {
@@ -289,15 +306,9 @@ describe("mantis discord smoke runtime", () => {
       },
     );
 
-    const result = await runMantisDiscordSmoke({
-      repoRoot,
+    const result = await runSmoke({
       outputDir: ".artifacts/qa-e2e/mantis/wrong-guild-redacted",
-      tokenFile,
       redactPublicMetadata: true,
-      env: {
-        OPENCLAW_QA_DISCORD_GUILD_ID: "1456350064065904867",
-        OPENCLAW_QA_DISCORD_CHANNEL_ID: "1456744319972282449",
-      },
     });
 
     expect(result.status).toBe("fail");

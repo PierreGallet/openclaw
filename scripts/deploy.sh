@@ -43,6 +43,9 @@ if [ -n "$GHP_TOKEN" ]; then
   fi
 fi
 
+# Pre-create bind-mount sources so Docker doesn't create them root-owned
+mkdir -p "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-$HOME/.openclaw-auth-profile-secrets}"
+
 # Rebuild Docker images
 echo "Building base Docker image..."
 docker build -t openclaw:local .

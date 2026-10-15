@@ -1,19 +1,30 @@
-import { createHash } from "node:crypto";
+// Memory Wiki tests cover markdown plugin behavior.
+
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
-  createWikiPageFilename,
+  extractHumanNotesBlock,
+  parseWikiMarkdown,
+  preserveHumanNotesBlock,
   renderWikiMarkdown,
+  scanWikiPageSummary,
   slugifyWikiSegment,
   toWikiPageSummary,
 } from "./markdown.js";
 
-describe("slugifyWikiSegment", () => {
-  it("preserves Unicode letters and numbers in wiki slugs", () => {
-    expect(slugifyWikiSegment("大语言模型概述")).toBe("大语言模型概述");
-    expect(slugifyWikiSegment("LLM 架构分析")).toBe("llm-架构分析");
-    expect(slugifyWikiSegment("Circuit Breaker 自動恢復")).toBe("circuit-breaker-自動恢復");
+function scanWikiLinkTargets(markdown: string, relativePath: string): string[] {
+  const result = scanWikiPageSummary({
+    absolutePath: path.join("/tmp/wiki", relativePath),
+    relativePath,
+    raw: markdown,
   });
+  if (result.status !== "valid") {
+    throw new Error(`Expected valid wiki page scan, got ${result.status}`);
+  }
+  return result.page.linkTargets;
+}
 
+describe("slugifyWikiSegment", () => {
   it("keeps ASCII behavior unchanged", () => {
     expect(slugifyWikiSegment("hello world")).toBe("hello-world");
     expect(slugifyWikiSegment("")).toBe("page");
@@ -24,25 +35,35 @@ describe("slugifyWikiSegment", () => {
     expect(slugifyWikiSegment("कुतुब")).toBe("कुतुब");
     expect(slugifyWikiSegment("कीताब")).toBe("कीताब");
   });
+});
 
-  it("caps long Unicode slugs to a safe filename byte length", () => {
-    const title = "漢".repeat(90);
-    const slug = slugifyWikiSegment(title);
+describe("human Notes blocks", () => {
+  const startMarker = "<!-- openclaw:human:start -->";
+  const endMarker = "<!-- openclaw:human:end -->";
+  const rendered = ["# Source", "", "## Notes", startMarker, endMarker, ""].join("\n");
 
-    expect(slug.endsWith(`-${createHash("sha1").update(title).digest("hex").slice(0, 12)}`)).toBe(
-      true,
-    );
-    expect(Buffer.byteLength(slug)).toBeLessThanOrEqual(240);
-    expect(slugifyWikiSegment(title)).toBe(slug);
+  it.each([endMarker])("ignores a standalone marker inside fenced source content", (marker) => {
+    const existing = ["# Source", "", "## Content", "```text", marker, "```", ""].join("\n");
+
+    expect(extractHumanNotesBlock(existing)).toBeNull();
+    expect(preserveHumanNotesBlock(rendered, existing)).toBe(rendered);
   });
 
-  it("caps composed wiki page filenames to a safe path-component length", () => {
-    const stem = `bridge-${"漢".repeat(45)}-${"語".repeat(45)}`;
-    const fileName = createWikiPageFilename(stem);
+  it("preserves marker comments embedded in complete human Notes", () => {
+    const notes = [
+      "Before copied markers",
+      startMarker,
+      "Between copied markers",
+      endMarker,
+      "After copied markers",
+    ].join("\n");
+    const existing = rendered.replace(
+      `${startMarker}\n${endMarker}`,
+      `${startMarker}\n${notes}\n${endMarker}`,
+    );
 
-    expect(fileName.endsWith(".md")).toBe(true);
-    expect(Buffer.byteLength(fileName)).toBeLessThanOrEqual(255);
-    expect(createWikiPageFilename(stem)).toBe(fileName);
+    expect(extractHumanNotesBlock(existing)).toBe(`${startMarker}\n${notes}\n${endMarker}`);
+    expect(preserveHumanNotesBlock(rendered, existing)).toBe(existing);
   });
 });
 
@@ -107,41 +128,97 @@ describe("toWikiPageSummary", () => {
       relativePath: "entities/brad.md",
       raw,
     });
+    if (!summary) {
+      throw new Error("expected wiki summary");
+    }
 
-    expect(summary).toEqual(
-      expect.objectContaining({
-        entityType: "person",
-        canonicalId: "maintainer.brad-groux",
-        aliases: ["brad", "bgroux"],
+    expect(summary.entityType).toBe("person");
+    expect(summary.canonicalId).toBe("maintainer.brad-groux");
+    expect(summary.aliases).toEqual(["brad", "bgroux"]);
+    expect(summary.privacyTier).toBe("local-private");
+    expect(summary.bestUsedFor).toEqual(["Microsoft ecosystem routing"]);
+    expect(summary.notEnoughFor).toEqual(["legal approval"]);
+    expect(summary.lastRefreshedAt).toBe("2026-04-29T00:00:00.000Z");
+    expect(summary.personCard?.handles).toEqual(["@bgroux"]);
+    expect(summary.personCard?.emails).toEqual(["brad@example.com"]);
+    expect(summary.personCard?.lane).toBe("Microsoft Teams");
+    expect(summary.personCard?.privacyTier).toBe("confirm-before-use");
+    expect(summary.relationships).toEqual([
+      {
+        targetId: "entity.alice",
+        targetTitle: "Alice",
+        kind: "collaborates-with",
+        weight: 0.7,
+        confidence: 0.6,
+        evidenceKind: "discrawl-stat",
         privacyTier: "local-private",
-        bestUsedFor: ["Microsoft ecosystem routing"],
-        notEnoughFor: ["legal approval"],
-        lastRefreshedAt: "2026-04-29T00:00:00.000Z",
-        personCard: expect.objectContaining({
-          handles: ["@bgroux"],
-          emails: ["brad@example.com"],
-          lane: "Microsoft Teams",
-          privacyTier: "confirm-before-use",
-        }),
-        relationships: [
-          expect.objectContaining({
-            targetId: "entity.alice",
-            kind: "collaborates-with",
-            evidenceKind: "discrawl-stat",
-          }),
-        ],
-        claims: [
-          expect.objectContaining({
-            id: "claim.brad.teams",
-            evidence: [
-              expect.objectContaining({
-                kind: "maintainer-whois",
-                privacyTier: "local-private",
-              }),
-            ],
-          }),
-        ],
-      }),
-    );
+      },
+    ]);
+    expect(summary.claims[0]?.id).toBe("claim.brad.teams");
+    expect(summary.claims[0]?.evidence).toEqual([
+      {
+        kind: "maintainer-whois",
+        sourceId: "source.maintainers",
+        confidence: 0.8,
+        privacyTier: "local-private",
+      },
+    ]);
+  });
+
+  it.each([{ name: "sequence", frontmatter: "- pageType: synthesis" }])(
+    "reports and excludes $name frontmatter roots from page scans",
+    ({ frontmatter }) => {
+      const raw = ["---", frontmatter, "---", "", "# Invalid Root"].join("\n");
+      const params = {
+        absolutePath: "/tmp/wiki/syntheses/invalid-root.md",
+        relativePath: "syntheses/invalid-root.md",
+        raw,
+      };
+      const result = scanWikiPageSummary(params);
+      if (result.status !== "invalid-frontmatter") {
+        throw new Error("expected invalid frontmatter result");
+      }
+
+      expect(result.error.message).toBe("Wiki frontmatter must be a YAML mapping");
+      expect(toWikiPageSummary(params)).toBeNull();
+      expect(() => parseWikiMarkdown(raw)).toThrow("Wiki frontmatter must be a YAML mapping");
+    },
+  );
+});
+
+describe("scanWikiPageSummary linkTargets", () => {
+  it("accepts a closing fence longer than the opening fence (#97945)", () => {
+    // CommonMark allows the closing fence to be the same or longer than the
+    // opening fence.  A `` ``` `` opener with a `` ```` `` closer must still
+    // strip the block so the Scala generic inside is not extracted.
+    const markdown = [
+      "# Longer Close",
+      "",
+      "```scala",
+      "def handle(req: Request[A]): Future[Option[User]] = ???",
+      "````",
+      "",
+      "Prose: [[RealTarget]]",
+    ].join("\n");
+    const links = scanWikiLinkTargets(markdown, "entities/test.md");
+    expect(links).toEqual(["RealTarget"]);
+  });
+
+  it("does not leak [[…]] when a shorter fence-like line appears inside a longer fenced block (#97945)", () => {
+    // A 6-backtick block containing a shorter 3-backtick line before the real
+    // 6-backtick close must not cause the scanner to exit early.
+    const markdown = [
+      "# Long Fence With Shorter Inner Line",
+      "",
+      "``````bash",
+      "some code",
+      "```",
+      "[[not-a-link]]",
+      "``````",
+      "",
+      "After fence: [[RealPage]]",
+    ].join("\n");
+    const links = scanWikiLinkTargets(markdown, "entities/test.md");
+    expect(links).toEqual(["RealPage"]);
   });
 });

@@ -1,24 +1,26 @@
+// Covers host hook cleanup behavior controlled by plugin config.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { runPluginHostCleanup } from "./host-hook-cleanup.js";
 import { createEmptyPluginRegistry } from "./registry-empty.js";
 
 const mocks = vi.hoisted(() => ({
-  getRuntimeConfig: vi.fn(),
+  readRuntimeConfig: vi.fn(),
 }));
 
-vi.mock("../config/config.js", () => ({
-  getRuntimeConfig: mocks.getRuntimeConfig,
+vi.mock("../config/io.runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../config/io.runtime.js")>()),
+  captureRuntimeConfigAsyncReader: () =>
+    Object.assign(mocks.readRuntimeConfig, { assertCurrent() {} }),
 }));
 
 describe("plugin host cleanup config fallback", () => {
   afterEach(() => {
-    mocks.getRuntimeConfig.mockReset();
+    mocks.readRuntimeConfig.mockReset();
   });
 
   it("records session store config failures while continuing runtime cleanup", async () => {
     const registry = createEmptyPluginRegistry();
     const cleanup = vi.fn();
-    registry.runtimeLifecycles ??= [];
     registry.runtimeLifecycles.push({
       pluginId: "cleanup-plugin",
       pluginName: "Cleanup Plugin",
@@ -28,9 +30,8 @@ describe("plugin host cleanup config fallback", () => {
         cleanup,
       },
     });
-    mocks.getRuntimeConfig.mockImplementation(() => {
-      throw new Error("invalid config");
-    });
+    const configError = new Error("invalid config");
+    mocks.readRuntimeConfig.mockRejectedValue(configError);
 
     const result = await runPluginHostCleanup({
       registry,
@@ -38,17 +39,22 @@ describe("plugin host cleanup config fallback", () => {
       reason: "disable",
     });
 
-    expect(cleanup).toHaveBeenCalledWith(
-      expect.objectContaining({
-        reason: "disable",
-      }),
-    );
+    expect(cleanup.mock.calls).toEqual([
+      [
+        {
+          runId: undefined,
+          reason: "disable",
+          sessionKey: undefined,
+        },
+      ],
+    ]);
     expect(result.cleanupCount).toBe(1);
     expect(result.failures).toEqual([
-      expect.objectContaining({
+      {
+        error: configError,
         pluginId: "cleanup-plugin",
         hookId: "session-store",
-      }),
+      },
     ]);
   });
 });

@@ -1,9 +1,15 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
-import type { CommandArgValues } from "openclaw/plugin-sdk/native-command-registry";
+import type {
+  BuildChannelInboundEventContextParams,
+  BuiltChannelInboundEventContext,
+  ChannelInboundTurnPlan,
+} from "openclaw/plugin-sdk/channel-inbound";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 
 export type DiscordConfig = NonNullable<OpenClawConfig["channels"]>["discord"];
+export type DiscordDispatchReplyFromConfig = NonNullable<
+  ChannelInboundTurnPlan["dispatchReplyFromConfig"]
+>;
 
-export type DiscordCommandArgs = {
-  raw?: string;
-  values?: CommandArgValues;
-};
+export type DiscordBuildInboundContext = (
+  params: BuildChannelInboundEventContextParams,
+) => BuiltChannelInboundEventContext | Promise<BuiltChannelInboundEventContext>;

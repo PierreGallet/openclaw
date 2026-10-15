@@ -1,28 +1,13 @@
+// Media load option tests cover normalized media load policy.
 import { describe, expect, it } from "vitest";
 import { buildOutboundMediaLoadOptions, resolveOutboundMediaLocalRoots } from "./load-options.js";
 
+const readMediaAccessFile = async () => Buffer.from("media-access");
+const readLegacyMediaFile = async () => Buffer.from("legacy-media");
+
 describe("media load options", () => {
-  function expectResolvedOutboundMediaRoots(
-    mediaLocalRoots: readonly string[] | "any" | undefined,
-    expectedLocalRoots: readonly string[] | "any" | undefined,
-  ) {
-    expect(resolveOutboundMediaLocalRoots(mediaLocalRoots)).toEqual(expectedLocalRoots);
-  }
-
-  function expectBuiltOutboundMediaLoadOptions(
-    params: Parameters<typeof buildOutboundMediaLoadOptions>[0],
-    expected: ReturnType<typeof buildOutboundMediaLoadOptions>,
-  ) {
-    expect(buildOutboundMediaLoadOptions(params)).toEqual(expected);
-  }
-
-  it.each([
-    { mediaLocalRoots: undefined, expectedLocalRoots: undefined },
-    { mediaLocalRoots: [], expectedLocalRoots: undefined },
-    { mediaLocalRoots: ["/tmp/workspace"], expectedLocalRoots: ["/tmp/workspace"] },
-    { mediaLocalRoots: "any", expectedLocalRoots: "any" },
-  ] as const)("resolves outbound local roots %#", ({ mediaLocalRoots, expectedLocalRoots }) => {
-    expectResolvedOutboundMediaRoots(mediaLocalRoots, expectedLocalRoots);
+  it("normalizes an empty local root list", () => {
+    expect(resolveOutboundMediaLocalRoots([])).toBeUndefined();
   });
 
   it.each([
@@ -39,13 +24,13 @@ describe("media load options", () => {
         maxBytes: 4096,
         mediaAccess: {
           localRoots: ["/tmp/workspace"],
-          readFile: async () => Buffer.from("x"),
+          readFile: readMediaAccessFile,
         },
       },
       expected: {
         maxBytes: 4096,
         localRoots: ["/tmp/workspace"],
-        readFile: expect.any(Function),
+        readFile: readMediaAccessFile,
         hostReadCapability: true,
       },
     },
@@ -53,17 +38,17 @@ describe("media load options", () => {
       params: {
         maxBytes: 4096,
         mediaLocalRoots: "any",
-        mediaReadFile: async () => Buffer.from("x"),
+        mediaReadFile: readLegacyMediaFile,
       },
       expected: {
         maxBytes: 4096,
         localRoots: "any",
-        readFile: expect.any(Function),
+        readFile: readLegacyMediaFile,
         hostReadCapability: true,
       },
     },
   ] as const)("builds outbound media load options %#", ({ params, expected }) => {
-    expectBuiltOutboundMediaLoadOptions(params, expected);
+    expect(buildOutboundMediaLoadOptions(params)).toEqual(expected);
   });
 
   it("rejects host read capability without explicit local roots", () => {

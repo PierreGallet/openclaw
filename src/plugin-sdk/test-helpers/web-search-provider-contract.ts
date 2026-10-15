@@ -1,9 +1,12 @@
-import { describe, expect, it } from "vitest";
+/**
+ * Contract suite for bundled web search provider registration and runtime behavior.
+ */
+import { beforeAll, describe, expect, it } from "vitest";
 import {
   pluginRegistrationContractRegistry,
-  resolveBundledExplicitWebSearchProvidersFromPublicArtifacts,
   resolveWebSearchProviderContractEntriesForPluginId,
-} from "../testing.js";
+} from "../../plugins/contracts/registry.js";
+import { resolveBundledExplicitWebSearchProvidersFromPublicArtifacts } from "../../plugins/web-provider-public-artifacts.explicit.js";
 import { installWebSearchProviderContractSuite } from "./provider-contract-suites.js";
 
 type WebSearchContractEntry = ReturnType<
@@ -33,21 +36,24 @@ export function describeWebSearchProviderContracts(pluginId: string) {
     pluginRegistrationContractRegistry.find((entry) => entry.pluginId === pluginId)
       ?.webSearchProviderIds ?? [];
 
-  const resolveProviders = (): WebSearchContractEntry[] => {
-    const publicArtifactProviders = resolveBundledExplicitWebSearchProvidersFromPublicArtifacts({
-      onlyPluginIds: [pluginId],
-    });
-    if (publicArtifactProviders) {
-      return publicArtifactProviders.map((provider) => ({
+  let providerEntries: WebSearchContractEntry[] | undefined;
+  const resolveProviders = (): WebSearchContractEntry[] =>
+    (providerEntries ??=
+      resolveBundledExplicitWebSearchProvidersFromPublicArtifacts({
+        onlyPluginIds: [pluginId],
+      })?.map((provider) => ({
         pluginId: provider.pluginId,
         provider,
         credentialValue: resolveWebSearchCredentialValue(provider),
-      }));
-    }
-    return resolveWebSearchProviderContractEntriesForPluginId(pluginId);
-  };
+      })) ?? resolveWebSearchProviderContractEntriesForPluginId(pluginId));
 
   describe(`${pluginId} web search provider contract registry load`, () => {
+    beforeAll(() => {
+      // Public-artifact loading is suite setup shared by every provider
+      // assertion; keep its cold module cost out of an arbitrary first test.
+      resolveProviders();
+    });
+
     it("loads bundled web search providers", () => {
       expect(resolveProviders().length).toBeGreaterThan(0);
     });
@@ -55,25 +61,18 @@ export function describeWebSearchProviderContracts(pluginId: string) {
 
   for (const providerId of providerIds) {
     describe(`${pluginId}:${providerId} web search contract`, () => {
+      const resolveEntry = () => {
+        const entry = resolveProviders().find((candidate) => candidate.provider.id === providerId);
+        if (!entry) {
+          throw new Error(
+            `web search provider contract entry missing for ${pluginId}:${providerId}`,
+          );
+        }
+        return entry;
+      };
       installWebSearchProviderContractSuite({
-        provider: () => {
-          const entry = resolveProviders().find((entry) => entry.provider.id === providerId);
-          if (!entry) {
-            throw new Error(
-              `web search provider contract entry missing for ${pluginId}:${providerId}`,
-            );
-          }
-          return entry.provider;
-        },
-        credentialValue: () => {
-          const entry = resolveProviders().find((entry) => entry.provider.id === providerId);
-          if (!entry) {
-            throw new Error(
-              `web search provider contract entry missing for ${pluginId}:${providerId}`,
-            );
-          }
-          return entry.credentialValue;
-        },
+        provider: () => resolveEntry().provider,
+        credentialValue: () => resolveEntry().credentialValue,
       });
     });
   }

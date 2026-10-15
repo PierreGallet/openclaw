@@ -1,3 +1,5 @@
+import { raceWithTimeout } from "openclaw/plugin-sdk/time-runtime";
+
 export type DiscordEventQueueOptions = {
   maxQueueSize?: number;
   maxConcurrency?: number;
@@ -13,15 +15,7 @@ type DiscordEventQueueJob = {
   reject: (error: unknown) => void;
 };
 
-type DiscordEventQueueMetrics = {
-  queueSize: number;
-  processing: number;
-  processed: number;
-  dropped: number;
-  timeouts: number;
-  maxQueueSize: number;
-  maxConcurrency: number;
-};
+type DiscordEventQueueDispatchOutcome = "completed" | "failed" | "timed-out";
 
 const DEFAULT_MAX_QUEUE_SIZE = 10_000;
 const DEFAULT_MAX_CONCURRENCY = 50;
@@ -31,6 +25,7 @@ const DEFAULT_SLOW_LISTENER_THRESHOLD_MS = 30_000;
 export class DiscordEventQueue {
   private readonly options: Required<DiscordEventQueueOptions>;
   private readonly queue: DiscordEventQueueJob[] = [];
+  private queueHead = 0;
   private processing = 0;
   private processedCount = 0;
   private droppedCount = 0;
@@ -52,7 +47,7 @@ export class DiscordEventQueue {
   }
 
   enqueue(params: Omit<DiscordEventQueueJob, "resolve" | "reject">): Promise<void> {
-    if (this.queue.length >= this.options.maxQueueSize) {
+    if (this.pendingQueueSize >= this.options.maxQueueSize) {
       this.droppedCount += 1;
       return Promise.reject(
         new Error(
@@ -66,9 +61,9 @@ export class DiscordEventQueue {
     });
   }
 
-  getMetrics(): DiscordEventQueueMetrics {
+  getMetrics() {
     return {
-      queueSize: this.queue.length,
+      queueSize: this.pendingQueueSize,
       processing: this.processing,
       processed: this.processedCount,
       dropped: this.droppedCount,
@@ -78,59 +73,89 @@ export class DiscordEventQueue {
     };
   }
 
+  private get pendingQueueSize(): number {
+    return Math.max(0, this.queue.length - this.queueHead);
+  }
+
+  private takeNextJob(): DiscordEventQueueJob | undefined {
+    const job = this.queue[this.queueHead];
+    this.queueHead += 1;
+    if (this.queueHead >= this.queue.length) {
+      this.queue.length = 0;
+      this.queueHead = 0;
+    } else if (this.queueHead > 256 && this.queueHead * 2 > this.queue.length) {
+      this.queue.splice(0, this.queueHead);
+      this.queueHead = 0;
+    }
+    return job;
+  }
+
   private processNext(): void {
-    while (this.processing < this.options.maxConcurrency && this.queue.length > 0) {
-      const job = this.queue.shift();
+    while (this.processing < this.options.maxConcurrency && this.pendingQueueSize > 0) {
+      const job = this.takeNextJob();
       if (!job) {
         return;
       }
       this.processing += 1;
-      void this.runJob(job)
-        .then(job.resolve, job.reject)
-        .finally(() => {
+      const listenerPromise = Promise.resolve().then(() => job.run());
+      const runJobPromise = this.runJob(job, listenerPromise);
+      void runJobPromise.then(job.resolve, job.reject).finally(() => {
+        // Processed counts externally settled dispatches; a timed-out listener
+        // can still retain its concurrency slot until its own settlement.
+        this.processedCount += 1;
+      });
+      // A timeout settles enqueue but cannot cancel the listener. Hold its slot
+      // until actual settlement or late listeners can exceed maxConcurrency.
+      void Promise.allSettled([runJobPromise, listenerPromise]).then(
+        ([dispatchResult, listenerResult]) => {
+          if (
+            dispatchResult.status === "fulfilled" &&
+            dispatchResult.value === "timed-out" &&
+            listenerResult.status === "rejected"
+          ) {
+            console.error(
+              `[EventQueue] Listener ${job.listenerName} failed after timeout for event ${job.eventType}:`,
+              listenerResult.reason,
+            );
+          }
           this.processing -= 1;
-          this.processedCount += 1;
           this.processNext();
-        });
+        },
+      );
     }
   }
 
-  private async runJob(job: DiscordEventQueueJob): Promise<void> {
+  private async runJob(
+    job: DiscordEventQueueJob,
+    listenerPromise: Promise<void>,
+  ): Promise<DiscordEventQueueDispatchOutcome> {
     const startedAt = Date.now();
     try {
-      await this.runWithTimeout(job);
+      await raceWithTimeout(
+        listenerPromise,
+        this.options.listenerTimeout,
+        () => {
+          const error = new Error(`Listener timeout after ${this.options.listenerTimeout}ms`);
+          error.name = "DiscordEventQueueListenerTimeoutError";
+          throw error;
+        },
+        { ref: false },
+      );
       this.logSlowListener(job, Date.now() - startedAt);
+      return "completed";
     } catch (error) {
-      if (isListenerTimeoutError(error)) {
+      if (error instanceof Error && error.name === "DiscordEventQueueListenerTimeoutError") {
         this.timeoutCount += 1;
         console.error(
           `[EventQueue] Listener ${job.listenerName} timed out after ${this.options.listenerTimeout}ms for event ${job.eventType}`,
         );
-        return;
+        return "timed-out";
       }
       console.error(
         `[EventQueue] Listener ${job.listenerName} failed for event ${job.eventType}:`,
         error,
       );
-    }
-  }
-
-  private async runWithTimeout(job: DiscordEventQueueJob): Promise<void> {
-    let timeout: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        job.run(),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => {
-            reject(createListenerTimeoutError(this.options.listenerTimeout));
-          }, this.options.listenerTimeout);
-          timeout.unref?.();
-        }),
-      ]);
-    } finally {
-      if (timeout) {
-        clearTimeout(timeout);
-      }
+      return "failed";
     }
   }
 
@@ -149,14 +174,4 @@ function normalizePositiveInteger(value: number | undefined, fallback: number): 
     return fallback;
   }
   return Math.max(1, Math.floor(value));
-}
-
-function createListenerTimeoutError(timeoutMs: number): Error {
-  const error = new Error(`Listener timeout after ${timeoutMs}ms`);
-  error.name = "DiscordEventQueueListenerTimeoutError";
-  return error;
-}
-
-function isListenerTimeoutError(error: unknown): boolean {
-  return error instanceof Error && error.name === "DiscordEventQueueListenerTimeoutError";
 }

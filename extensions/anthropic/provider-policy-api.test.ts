@@ -1,7 +1,10 @@
+// Anthropic tests cover provider policy api plugin behavior.
 import type { ModelDefinitionConfig } from "openclaw/plugin-sdk/provider-model-types";
 import { describe, expect, it } from "vitest";
+import { parseAnthropicModelRef } from "./claude-model-refs.js";
 import {
   applyConfigDefaults,
+  deprecatedProfileIds,
   normalizeConfig,
   resolveThinkingProfile,
 } from "./provider-policy-api.js";
@@ -23,34 +26,36 @@ function createModel(id: string, name: string): ModelDefinitionConfig {
   };
 }
 
+const modelRefCases: Array<[string, string | null, string | null, boolean | null]> = [
+  ["", null, null, null],
+  ["claude-test", "anthropic", "claude-test", false],
+  ["anthropic/", null, null, null],
+  ["AWS-BEDROCK/anthropic.claude-test", "amazon-bedrock", "anthropic.claude-test", true],
+];
+
 describe("anthropic provider policy public artifact", () => {
-  it("normalizes Anthropic provider config", () => {
-    expect(
-      normalizeConfig({
-        provider: "anthropic",
-        providerConfig: {
-          baseUrl: "https://api.anthropic.com",
-          models: [createModel("claude-sonnet-4-6", "Claude Sonnet 4.6")],
-        },
-      }),
-    ).toMatchObject({
-      api: "anthropic-messages",
-      baseUrl: "https://api.anthropic.com",
-    });
+  it.each(modelRefCases)(
+    "parses Anthropic model ref %s",
+    (raw, provider, model, explicitProvider) => {
+      expect(parseAnthropicModelRef(raw)).toEqual(
+        provider === null ? null : { provider, model, explicitProvider },
+      );
+    },
+  );
+
+  it("publishes native Claude profiles retired from generic auth", () => {
+    expect(deprecatedProfileIds).toEqual(["anthropic:claude-cli"]);
   });
 
   it("normalizes Claude CLI provider config", () => {
-    expect(
-      normalizeConfig({
-        provider: "claude-cli",
-        providerConfig: {
-          baseUrl: "https://api.anthropic.com",
-          models: [createModel("claude-sonnet-4-6", "Claude Sonnet 4.6")],
-        },
-      }),
-    ).toMatchObject({
-      api: "anthropic-messages",
+    const normalized = normalizeConfig({
+      provider: "claude-cli",
+      providerConfig: {
+        baseUrl: "https://api.anthropic.com",
+        models: [createModel("claude-sonnet-4-6", "Claude Sonnet 4.6")],
+      },
     });
+    expect(normalized.api).toBe("anthropic-messages");
   });
 
   it("does not normalize non-Anthropic provider config", () => {
@@ -61,7 +66,7 @@ describe("anthropic provider policy public artifact", () => {
 
     expect(
       normalizeConfig({
-        provider: "openai-codex",
+        provider: "openai",
         providerConfig,
       }),
     ).toBe(providerConfig);
@@ -86,38 +91,49 @@ describe("anthropic provider policy public artifact", () => {
       env: {},
     });
 
-    expect(nextConfig.agents?.defaults?.contextPruning).toMatchObject({
-      mode: "cache-ttl",
-      ttl: "1h",
-    });
+    expect(nextConfig.agents?.defaults?.contextPruning?.mode).toBe("cache-ttl");
+    expect(nextConfig.agents?.defaults?.contextPruning?.ttl).toBe("1h");
   });
 
-  it("exposes Claude Opus 4.7 thinking levels without loading the full provider plugin", () => {
+  it("adds cacheRetention defaults for dated Anthropic primary model refs", () => {
+    const nextConfig = applyConfigDefaults({
+      config: {
+        auth: {
+          profiles: {
+            "anthropic:default": {
+              provider: "anthropic",
+              mode: "api_key",
+            },
+          },
+        },
+        agents: {
+          defaults: {
+            model: { primary: "anthropic/claude-sonnet-4-20250514" },
+          },
+        },
+      },
+      env: {},
+    });
+
     expect(
-      resolveThinkingProfile({
-        provider: "anthropic",
-        modelId: "claude-opus-4-7",
-      }),
-    ).toMatchObject({
-      levels: expect.arrayContaining([{ id: "xhigh" }, { id: "adaptive" }, { id: "max" }]),
+      nextConfig.agents?.defaults?.models?.["anthropic/claude-sonnet-4-6"]?.params?.cacheRetention,
+    ).toBe("short");
+  });
+
+  it.each(["claude-sonnet-5-5"])(
+    "keeps the %s thinking profile identical across API and CLI routes",
+    (modelId) => {
+      expect(resolveThinkingProfile({ provider: "claude-cli", modelId })).toEqual(
+        resolveThinkingProfile({ provider: "anthropic", modelId }),
+      );
+    },
+  );
+
+  it("keeps direct-only Mythos thinking disabled on the CLI route", () => {
+    expect(resolveThinkingProfile({ provider: "claude-cli", modelId: "claude-mythos-5" })).toEqual({
+      levels: [{ id: "off" }],
       defaultLevel: "off",
     });
-  });
-
-  it("keeps adaptive-only Claude profiles aligned with the runtime provider", () => {
-    const profile = resolveThinkingProfile({
-      provider: "anthropic",
-      modelId: "claude-opus-4-6",
-    });
-
-    expect(profile).toMatchObject({
-      levels: expect.arrayContaining([{ id: "adaptive" }]),
-      defaultLevel: "adaptive",
-    });
-    if (!profile) {
-      throw new Error("Expected Anthropic policy profile");
-    }
-    expect(profile.levels.some((level) => level.id === "xhigh" || level.id === "max")).toBe(false);
   });
 
   it("does not expose Anthropic thinking profiles for unrelated providers", () => {

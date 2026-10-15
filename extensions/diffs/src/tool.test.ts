@@ -1,78 +1,153 @@
+// Diffs tests cover tool plugin behavior.
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import type {
+  OpenClawPluginApi,
+  OpenClawPluginToolContext,
+} from "openclaw/plugin-sdk/plugin-entry";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { OpenClawPluginApi, OpenClawPluginToolContext } from "../api.js";
-import type { DiffScreenshotter } from "./browser.js";
-import { DEFAULT_DIFFS_TOOL_DEFAULTS } from "./config.js";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PlaywrightDiffScreenshotter } from "./browser.runtime.js";
+import { resolveDiffsPluginDefaults } from "./config.js";
+import { registerDiffsPlugin } from "./plugin.js";
 import { DiffArtifactStore } from "./store.js";
-import { createDiffStoreHarness } from "./test-helpers.js";
-import { createDiffsTool } from "./tool.js";
+import { createDiffStoreHarness, expireDiffArtifactForTest } from "./test-helpers.js";
 import type { DiffRenderOptions } from "./types.js";
 
+let createDiffsTool: typeof import("./tool.js").createDiffsTool;
+type DiffScreenshotter = Pick<PlaywrightDiffScreenshotter, "screenshotHtml">;
+
+const { resolvePreferredOpenClawTmpDir, browserRuntime } = vi.hoisted(() => ({
+  resolvePreferredOpenClawTmpDir: vi.fn(),
+  browserRuntime: { screenshotter: undefined as DiffScreenshotter | undefined },
+}));
+
+vi.mock("openclaw/plugin-sdk/temp-path", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/temp-path")>()),
+  resolvePreferredOpenClawTmpDir,
+}));
+
+afterAll(() => {
+  vi.doUnmock("./browser.runtime.js");
+  vi.resetModules();
+});
+
+const DEFAULT_DIFFS_TOOL_DEFAULTS = resolveDiffsPluginDefaults(undefined);
+
 describe("diffs tool", () => {
+  let rootDir: string;
   let store: DiffArtifactStore;
   let cleanupRootDir: () => Promise<void>;
+  let blobStore: Awaited<ReturnType<typeof createDiffStoreHarness>>["blobStore"];
 
   beforeEach(async () => {
-    ({ store, cleanup: cleanupRootDir } = await createDiffStoreHarness("openclaw-diffs-tool-"));
+    vi.resetModules();
+    browserRuntime.screenshotter = undefined;
+    vi.doMock("./browser.runtime.js", async (importOriginal) => {
+      if (!browserRuntime.screenshotter) {
+        throw new Error("viewer-only rendering must not load the Playwright renderer");
+      }
+      return {
+        ...(await importOriginal<typeof import("./browser.runtime.js")>()),
+        PlaywrightDiffScreenshotter: vi.fn(function () {
+          return browserRuntime.screenshotter;
+        }),
+      };
+    });
+    ({ createDiffsTool } = await import("./tool.js"));
+    resolvePreferredOpenClawTmpDir.mockReturnValue(os.tmpdir());
+    ({
+      rootDir,
+      store,
+      blobStore,
+      cleanup: cleanupRootDir,
+    } = await createDiffStoreHarness("openclaw-diffs-tool-"));
+    resolvePreferredOpenClawTmpDir.mockReturnValue(rootDir);
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await cleanupRootDir();
   });
 
-  it("returns a viewer URL in view mode", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
+  function createTool(overrides: Partial<Parameters<typeof createDiffsTool>[0]> = {}) {
+    return createDiffsTool({
+      getConfig: () => ({}),
       store,
       defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
+      ...overrides,
     });
+  }
 
-    const result = await tool.execute?.("tool-1", {
-      before: "one\n",
-      after: "two\n",
-      path: "README.md",
-      mode: "view",
+  it("uses current public origin for retained tools after config reload", async () => {
+    let config: OpenClawConfig = { gateway: { publicOrigin: "https://first.example" } };
+    const registerTool = vi.fn<OpenClawPluginApi["registerTool"]>();
+    const api = createTestPluginApi({
+      id: "diffs",
+      config,
+      registerTool,
+      runtime: createPluginRuntimeMock({ config: { current: () => config } }),
     });
-
-    const text = readTextContent(result, 0);
-    expect(text).toContain("http://127.0.0.1:18789/plugins/diffs/view/");
-    expect((result?.details as Record<string, unknown>).viewerUrl).toBeDefined();
+    api.runtime.state = {
+      ...api.runtime.state,
+      openBlobStore: vi.fn().mockReturnValue(blobStore),
+    };
+    registerDiffsPlugin(api);
+    const factory = registerTool.mock.calls[0]?.[0];
+    if (typeof factory !== "function") {
+      throw new Error("Diffs did not register a tool factory");
+    }
+    const getRuntimeConfig = vi.fn(() => config);
+    const tool = factory({
+      config: { gateway: { publicOrigin: "https://authored.example" } },
+      runtimeConfig: { gateway: { publicOrigin: "https://initial.example" } },
+      getRuntimeConfig,
+    });
+    if (!tool || Array.isArray(tool)) {
+      throw new Error("Diffs did not return a tool");
+    }
+    for (const origin of ["https://first.example", "https://second.example"]) {
+      config = { gateway: { publicOrigin: origin } };
+      const result = await tool.execute("reload-origin", {
+        before: "one\n",
+        after: "two\n",
+        mode: "view",
+      });
+      expect(String(readDetails(result).viewerUrl)).toMatch(`${origin}/plugins/diffs/view/`);
+    }
+    expect(getRuntimeConfig).toHaveBeenCalledTimes(2);
   });
 
-  it("uses configured viewerBaseUrl when tool input omits baseUrl", async () => {
-    const tool = createDiffsTool({
-      api: createApi({
-        viewerBaseUrl: "https://example.com/openclaw/",
-      }),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-      viewerBaseUrl: "https://example.com/openclaw",
+  it("short-circuits identical before/after input without creating an artifact", async () => {
+    const screenshotHtml = vi.fn<DiffScreenshotter["screenshotHtml"]>();
+    const tool = createToolWithScreenshotter(store, { screenshotHtml });
+
+    const result = await tool.execute?.("tool-identical", {
+      before: "same\n",
+      after: "same\n",
     });
 
-    const result = await tool.execute?.("tool-viewer-config", {
-      before: "one\n",
-      after: "two\n",
-      path: "README.md",
-      mode: "view",
+    expect(readTextContent(result, 0)).toBe(
+      "Before and after are identical — no changes to render.",
+    );
+    expect(readDetails(result)).toEqual({
+      changed: false,
+      context: {
+        agentId: "main",
+        sessionId: "session-123",
+        messageChannel: "discord",
+        agentAccountId: "default",
+      },
     });
-
-    expect(readTextContent(result, 0)).toContain(
-      "https://example.com/openclaw/plugins/diffs/view/",
-    );
-    expect((result?.details as Record<string, unknown>).viewerUrl).toEqual(
-      expect.stringContaining("https://example.com/openclaw/plugins/diffs/view/"),
-    );
+    expect(screenshotHtml).not.toHaveBeenCalled();
+    await expect(fs.stat(rootDir)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("prefers per-call baseUrl over configured viewerBaseUrl", async () => {
-    const tool = createDiffsTool({
-      api: createApi({
-        viewerBaseUrl: "https://example.com/openclaw",
-      }),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
+    const tool = createTool({
       viewerBaseUrl: "https://example.com/openclaw",
     });
 
@@ -87,62 +162,9 @@ describe("diffs tool", () => {
     expect(readTextContent(result, 0)).toContain(
       "https://preview.example.com/review/plugins/diffs/view/",
     );
-    expect((result?.details as Record<string, unknown>).viewerUrl).toEqual(
-      expect.stringContaining("https://preview.example.com/review/plugins/diffs/view/"),
+    expect(String(readDetails(result).viewerUrl)).toContain(
+      "https://preview.example.com/review/plugins/diffs/view/",
     );
-  });
-
-  it("does not expose reserved format in the tool schema", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-    });
-
-    const parameters = tool.parameters as { properties?: Record<string, unknown> };
-    expect(parameters.properties).toBeDefined();
-    expect(parameters.properties).not.toHaveProperty("format");
-  });
-
-  it("returns an image artifact in image mode", async () => {
-    const cleanupSpy = vi.spyOn(store, "scheduleCleanup");
-    const screenshotter = createPngScreenshotter({
-      assertHtml: (html) => {
-        expect(html).toContain("../../assets/viewer.js");
-      },
-      assertImage: (image) => {
-        expect(image).toMatchObject({
-          format: "png",
-          qualityPreset: "standard",
-          scale: 2,
-          maxWidth: 960,
-        });
-      },
-    });
-
-    const tool = createToolWithScreenshotter(store, screenshotter);
-
-    const result = await tool.execute?.("tool-2", {
-      before: "one\n",
-      after: "two\n",
-      mode: "image",
-    });
-
-    expect(screenshotter.screenshotHtml).toHaveBeenCalledTimes(1);
-    expect(readTextContent(result, 0)).toContain("Diff PNG generated at:");
-    expect(readTextContent(result, 0)).toContain("Use the `message` tool");
-    expect(result?.content).toHaveLength(1);
-    expect((result?.details as Record<string, unknown>).filePath).toBeDefined();
-    expect((result?.details as Record<string, unknown>).imagePath).toBeDefined();
-    expect((result?.details as Record<string, unknown>).format).toBe("png");
-    expect((result?.details as Record<string, unknown>).fileQuality).toBe("standard");
-    expect((result?.details as Record<string, unknown>).imageQuality).toBe("standard");
-    expect((result?.details as Record<string, unknown>).fileScale).toBe(2);
-    expect((result?.details as Record<string, unknown>).imageScale).toBe(2);
-    expect((result?.details as Record<string, unknown>).fileMaxWidth).toBe(960);
-    expect((result?.details as Record<string, unknown>).imageMaxWidth).toBe(960);
-    expect((result?.details as Record<string, unknown>).viewerUrl).toBeUndefined();
-    expect(cleanupSpy).toHaveBeenCalledTimes(1);
   });
 
   it("renders PDF output when fileFormat is pdf", async () => {
@@ -152,12 +174,8 @@ describe("diffs tool", () => {
       },
     });
 
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-      screenshotter,
-    });
+    browserRuntime.screenshotter = screenshotter;
+    const tool = createTool();
 
     const result = await tool.execute?.("tool-2b", {
       before: "one\n",
@@ -166,133 +184,52 @@ describe("diffs tool", () => {
       fileFormat: "pdf",
     });
 
-    expect(screenshotter.screenshotHtml).toHaveBeenCalledTimes(1);
+    expect(screenshotter["screenshotHtml"]).toHaveBeenCalledTimes(1);
     expect(readTextContent(result, 0)).toContain("Diff PDF generated at:");
-    expect((result?.details as Record<string, unknown>).format).toBe("pdf");
-    expect((result?.details as Record<string, unknown>).filePath).toMatch(/preview\.pdf$/);
-  });
-
-  it("accepts mode=file as an alias for file artifact rendering", async () => {
-    const screenshotter = createPngScreenshotter({
-      assertOutputPath: (outputPath) => {
-        expect(outputPath).toMatch(/preview\.png$/);
-      },
-    });
-
-    const tool = createToolWithScreenshotter(store, screenshotter);
-
-    const result = await tool.execute?.("tool-2c", {
-      before: "one\n",
-      after: "two\n",
-      mode: "file",
-    });
-
-    expectArtifactOnlyFileResult(screenshotter, result);
-    expect((result?.details as Record<string, unknown>).artifactId).toEqual(expect.any(String));
-    expect((result?.details as Record<string, unknown>).expiresAt).toEqual(expect.any(String));
+    expect(readTextContent(result, 0)).toContain("use an available file-sending tool");
+    expect(readTextContent(result, 0)).not.toMatch(/`message`|\bmessage tool\b/);
+    expect(readDetails(result).fileFormat).toBe("pdf");
+    expect(readDetails(result).filePath).toMatch(/preview\.pdf$/);
   });
 
   it("honors ttlSeconds for artifact-only file output", async () => {
-    vi.useFakeTimers();
-    const now = new Date("2026-02-27T16:00:00Z");
-    vi.setSystemTime(now);
+    await fs.mkdir(rootDir, { recursive: true });
+    const fixture = await createDiffStoreHarness("openclaw-diffs-tool-ttl-", {
+      nativeKernel: true,
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const screenshotter = createPngScreenshotter();
-      const tool = createToolWithScreenshotter(store, screenshotter);
-
+      const tool = createToolWithScreenshotter(fixture.store, screenshotter);
       const result = await tool.execute?.("tool-2c-ttl", {
         before: "one\n",
         after: "two\n",
         mode: "file",
-        ttlSeconds: 1,
+        ttlSeconds: "1",
       });
-      const filePath = (result?.details as Record<string, unknown>).filePath as string;
-      await expect(fs.stat(filePath)).resolves.toBeDefined();
-
-      vi.setSystemTime(new Date(now.getTime() + 2_000));
-      await store.cleanupExpired();
-      await expect(fs.stat(filePath)).rejects.toMatchObject({
-        code: "ENOENT",
-      });
+      const filePath = requireString(readDetails(result).filePath, "filePath");
+      await fs.access(filePath);
+      await fixture.store.stopCleanup();
+      await expireDiffArtifactForTest(
+        fixture.rootDir,
+        requireString(readDetails(result).artifactId, "artifactId"),
+        1000,
+      );
+      await fixture.store.cleanupExpired();
+      await expectFsEnoent(fs.stat(filePath));
     } finally {
       vi.useRealTimers();
+      await fixture.cleanup();
     }
   });
 
-  it("accepts image* tool options for backward compatibility", async () => {
-    const screenshotter = createPngScreenshotter({
-      assertImage: (image) => {
-        expect(image).toMatchObject({
-          qualityPreset: "hq",
-          scale: 2.4,
-          maxWidth: 1100,
-        });
-      },
-    });
-
-    const tool = createToolWithScreenshotter(store, screenshotter);
-
-    const result = await tool.execute?.("tool-2legacy", {
-      before: "one\n",
-      after: "two\n",
-      mode: "file",
-      imageQuality: "hq",
-      imageScale: 2.4,
-      imageMaxWidth: 1100,
-    });
-
-    expect((result?.details as Record<string, unknown>).fileQuality).toBe("hq");
-    expect((result?.details as Record<string, unknown>).fileScale).toBe(2.4);
-    expect((result?.details as Record<string, unknown>).fileMaxWidth).toBe(1100);
-  });
-
-  it("accepts deprecated format alias for fileFormat", async () => {
-    const screenshotter = createPdfScreenshotter();
-
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-      screenshotter,
-    });
-
-    const result = await tool.execute?.("tool-2format", {
-      before: "one\n",
-      after: "two\n",
-      mode: "file",
-      format: "pdf",
-    });
-
-    expect((result?.details as Record<string, unknown>).fileFormat).toBe("pdf");
-    expect((result?.details as Record<string, unknown>).filePath).toMatch(/preview\.pdf$/);
-  });
-
-  it("honors defaults.mode=file when mode is omitted", async () => {
-    const screenshotter = createPngScreenshotter();
-    const tool = createToolWithScreenshotter(store, screenshotter, {
-      ...DEFAULT_DIFFS_TOOL_DEFAULTS,
-      mode: "file",
-    });
-
-    const result = await tool.execute?.("tool-2d", {
-      before: "one\n",
-      after: "two\n",
-    });
-
-    expectArtifactOnlyFileResult(screenshotter, result);
-  });
-
   it("falls back to view output when both mode cannot render an image", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-      screenshotter: {
-        screenshotHtml: vi.fn(async () => {
-          throw new Error("browser missing");
-        }),
-      },
-    });
+    browserRuntime.screenshotter = {
+      screenshotHtml: vi.fn(async () => {
+        throw new Error("browser missing");
+      }),
+    };
+    const tool = createTool();
 
     const result = await tool.execute?.("tool-3", {
       before: "one\n",
@@ -302,16 +239,28 @@ describe("diffs tool", () => {
 
     expect(result?.content).toHaveLength(1);
     expect(readTextContent(result, 0)).toContain("File rendering failed");
-    expect((result?.details as Record<string, unknown>).fileError).toBe("browser missing");
-    expect((result?.details as Record<string, unknown>).imageError).toBe("browser missing");
+    expect(readDetails(result).fileError).toBe("browser missing");
+    await expect(fs.readdir(rootDir)).resolves.toEqual([]);
+  });
+
+  it("falls back to view output when the default image renderer cannot load", async () => {
+    const tool = createTool();
+
+    const result = await tool.execute?.("tool-3b", {
+      before: "one\n",
+      after: "two\n",
+      mode: "both",
+    });
+
+    expect(readTextContent(result, 0)).toContain("Diff viewer ready.");
+    expect(readDetails(result).viewerUrl).toEqual(expect.any(String));
+    expect(readDetails(result).fileError).toContain(
+      "viewer-only rendering must not load the Playwright renderer",
+    );
   });
 
   it("rejects invalid base URLs as tool input errors", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-    });
+    const tool = createTool();
 
     await expect(
       tool.execute?.("tool-4", {
@@ -323,12 +272,19 @@ describe("diffs tool", () => {
     ).rejects.toThrow("Invalid baseUrl");
   });
 
+  it("returns a tool input error for malformed raw arguments", async () => {
+    const tool = createTool();
+
+    await expect(tool.execute?.("tool-malformed-null", null)).rejects.toThrow(
+      "Provide patch or both before and after text.",
+    );
+    await expect(tool.execute?.("tool-malformed-undefined", undefined)).rejects.toThrow(
+      "Provide patch or both before and after text.",
+    );
+  });
+
   it("rejects oversized patch payloads", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
-    });
+    const tool = createTool();
 
     await expect(
       tool.execute?.("tool-oversize-patch", {
@@ -338,12 +294,27 @@ describe("diffs tool", () => {
     ).rejects.toThrow("patch exceeds maximum size");
   });
 
-  it("rejects oversized before/after payloads", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
-      defaults: DEFAULT_DIFFS_TOOL_DEFAULTS,
+  it("classifies patch render validation failures as tool input errors", async () => {
+    const tool = createTool();
+
+    const error = await tool
+      .execute?.("tool-invalid-patch", {
+        patch: "not a unified patch",
+        mode: "view",
+      })
+      .then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+
+    expect(error).toMatchObject({
+      name: "ToolInputError",
+      message: "Patch input did not contain any file diffs.",
     });
+  });
+
+  it("rejects oversized before/after payloads", async () => {
+    const tool = createTool();
 
     const large = "x".repeat(600_000);
     await expect(
@@ -356,9 +327,7 @@ describe("diffs tool", () => {
   });
 
   it("uses configured defaults when tool params omit them", async () => {
-    const tool = createDiffsTool({
-      api: createApi(),
-      store,
+    const tool = createTool({
       defaults: {
         ...DEFAULT_DIFFS_TOOL_DEFAULTS,
         mode: "view",
@@ -384,17 +353,18 @@ describe("diffs tool", () => {
     });
 
     expect(readTextContent(result, 0)).toContain("Diff viewer ready.");
-    expect((result?.details as Record<string, unknown>).mode).toBe("view");
-    expect((result?.details as Record<string, unknown>).context).toEqual({
+    expect(readDetails(result).mode).toBe("view");
+    expect(readDetails(result).context).toEqual({
       agentId: "main",
       sessionId: "session-123",
       messageChannel: "discord",
       agentAccountId: "default",
     });
 
-    const viewerPath = String((result?.details as Record<string, unknown>).viewerPath);
-    const [id] = viewerPath.split("/").filter(Boolean).slice(-2);
-    const html = await store.readHtml(id);
+    const viewerPath = String(readDetails(result).viewerPath);
+    const id = extractViewerArtifactId(viewerPath);
+    const viewer = await store.readAuthorizedViewer(id, extractViewerArtifactToken(viewerPath));
+    const html = Buffer.from(viewer!.html).toString("utf8");
     expect(html).toContain('body data-theme="light"');
     expect(html).toContain("--diffs-font-size: 17px;");
     expect(html).toContain("JetBrains Mono");
@@ -406,12 +376,10 @@ describe("diffs tool", () => {
         expect(html).toContain("../../assets/viewer.js");
       },
       assertImage: (image) => {
-        expect(image).toMatchObject({
-          format: "png",
-          qualityPreset: "print",
-          scale: 2.75,
-          maxWidth: 1320,
-        });
+        expect(image.format).toBe("png");
+        expect(image.qualityPreset).toBe("print");
+        expect(image.scale).toBe(2.75);
+        expect(image.maxWidth).toBe(1320);
       },
     });
     const tool = createToolWithScreenshotter(store, screenshotter, {
@@ -435,58 +403,19 @@ describe("diffs tool", () => {
       fileMaxWidth: 1320,
     });
 
-    expect((result?.details as Record<string, unknown>).mode).toBe("both");
-    expect(screenshotter.screenshotHtml).toHaveBeenCalledTimes(1);
-    expect((result?.details as Record<string, unknown>).format).toBe("png");
-    expect((result?.details as Record<string, unknown>).fileQuality).toBe("print");
-    expect((result?.details as Record<string, unknown>).fileScale).toBe(2.75);
-    expect((result?.details as Record<string, unknown>).fileMaxWidth).toBe(1320);
-    const viewerPath = String((result?.details as Record<string, unknown>).viewerPath);
-    const [id] = viewerPath.split("/").filter(Boolean).slice(-2);
-    const html = await store.readHtml(id);
+    expect(readDetails(result).mode).toBe("both");
+    expect(screenshotter["screenshotHtml"]).toHaveBeenCalledTimes(1);
+    expect(readDetails(result).fileFormat).toBe("png");
+    expect(readDetails(result).fileQuality).toBe("print");
+    expect(readDetails(result).fileScale).toBe(2.75);
+    expect(readDetails(result).fileMaxWidth).toBe(1320);
+    const viewerPath = String(readDetails(result).viewerPath);
+    const id = extractViewerArtifactId(viewerPath);
+    const viewer = await store.readAuthorizedViewer(id, extractViewerArtifactToken(viewerPath));
+    const html = Buffer.from(viewer!.html).toString("utf8");
     expect(html).toContain('body data-theme="dark"');
   });
-
-  it("routes tool context into artifact details for file mode", async () => {
-    const screenshotter = createPngScreenshotter();
-    const tool = createToolWithScreenshotter(store, screenshotter, DEFAULT_DIFFS_TOOL_DEFAULTS, {
-      agentId: "reviewer",
-      sessionId: "session-456",
-      messageChannel: "telegram",
-      agentAccountId: "work",
-    });
-
-    const result = await tool.execute?.("tool-context-file", {
-      before: "one\n",
-      after: "two\n",
-      mode: "file",
-    });
-
-    expect((result?.details as Record<string, unknown>).context).toEqual({
-      agentId: "reviewer",
-      sessionId: "session-456",
-      messageChannel: "telegram",
-      agentAccountId: "work",
-    });
-  });
 });
-
-function createApi(pluginConfig?: Record<string, unknown>): OpenClawPluginApi {
-  return createTestPluginApi({
-    id: "diffs",
-    name: "Diffs",
-    description: "Diffs",
-    source: "test",
-    config: {
-      gateway: {
-        port: 18789,
-        bind: "loopback",
-      },
-    },
-    pluginConfig,
-    runtime: {} as OpenClawPluginApi["runtime"],
-  });
-}
 
 function createToolWithScreenshotter(
   store: DiffArtifactStore,
@@ -499,22 +428,13 @@ function createToolWithScreenshotter(
     agentAccountId: "default",
   },
 ) {
+  browserRuntime.screenshotter = screenshotter;
   return createDiffsTool({
-    api: createApi(),
+    getConfig: () => ({}),
     store,
     defaults,
-    screenshotter,
     context,
   });
-}
-
-function expectArtifactOnlyFileResult(
-  screenshotter: DiffScreenshotter,
-  result: { details?: unknown } | null | undefined,
-) {
-  expect(screenshotter.screenshotHtml).toHaveBeenCalledTimes(1);
-  expect((result?.details as Record<string, unknown>).mode).toBe("file");
-  expect((result?.details as Record<string, unknown>).viewerUrl).toBeUndefined();
 }
 
 function createPngScreenshotter(
@@ -562,6 +482,51 @@ function createPdfScreenshotter(
     },
   );
   return { screenshotHtml };
+}
+
+function isObjectValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function readDetails(result: unknown): Record<string, unknown> {
+  const details = (result as { details?: unknown } | null | undefined)?.details;
+  if (!isObjectValue(details)) {
+    throw new Error("expected diffs tool result details");
+  }
+  return details;
+}
+
+function extractViewerArtifactId(viewerPath: string): string {
+  const id = viewerPath.split("/").at(-2);
+  if (!id) {
+    throw new Error(`Missing artifact id in viewer path: ${viewerPath}`);
+  }
+  return id;
+}
+
+function extractViewerArtifactToken(viewerPath: string): string {
+  const token = viewerPath.split("/").findLast((segment) => segment.length > 0);
+  if (!token) {
+    throw new Error("expected viewer artifact token");
+  }
+  return token;
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`expected ${label}`);
+  }
+  return value;
+}
+
+async function expectFsEnoent(promise: Promise<unknown>): Promise<void> {
+  try {
+    await promise;
+  } catch (error) {
+    expect((error as { code?: unknown }).code).toBe("ENOENT");
+    return;
+  }
+  throw new Error("expected ENOENT");
 }
 
 function readTextContent(result: unknown, index: number): string {

@@ -1,8 +1,8 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { inspectDiscordAccount } from "./account-inspect.js";
 import {
   auditDiscordChannelPermissionsWithFetcher,
-  collectDiscordAuditChannelIdsForGuilds,
+  collectDiscordAuditChannelIdsForAccount,
   type DiscordChannelPermissionsAudit,
 } from "./audit-core.js";
 import { fetchChannelPermissionsDiscord } from "./send.js";
@@ -11,11 +11,8 @@ export function collectDiscordAuditChannelIds(params: {
   cfg: OpenClawConfig;
   accountId?: string | null;
 }) {
-  const account = inspectDiscordAccount({
-    cfg: params.cfg,
-    accountId: params.accountId,
-  });
-  return collectDiscordAuditChannelIdsForGuilds(account.config.guilds);
+  const account = inspectDiscordAccount(params);
+  return collectDiscordAuditChannelIdsForAccount(account.config);
 }
 
 export async function auditDiscordChannelPermissions(params: {

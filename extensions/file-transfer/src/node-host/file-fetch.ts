@@ -1,76 +1,58 @@
-import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
 import path from "node:path";
-import { EXTENSION_MIME } from "../shared/mime.js";
+import { readFileHandleBounded } from "openclaw/plugin-sdk/file-access-runtime";
+import { detectMime } from "openclaw/plugin-sdk/media-mime";
+import type { OpenClawPluginNodeHostCommandIo } from "openclaw/plugin-sdk/node-host";
+import { asPositiveFiniteNumber } from "openclaw/plugin-sdk/number-runtime";
+import { FsSafeError, root } from "openclaw/plugin-sdk/security-runtime";
+import {
+  FILE_FETCH_DEFAULT_MAX_BYTES,
+  FILE_FETCH_HARD_MAX_BYTES,
+  readFileFetchBinaryMaxBytes,
+} from "../shared/file-fetch-protocol.js";
+import {
+  fileIdentity,
+  matchesFileIdentity,
+  readPathBinding,
+  type PathBinding,
+} from "../shared/path-binding.js";
+import { streamFetchedFile } from "./file-fetch-stream.js";
+import {
+  classifyFsSafeReadError,
+  readAbsolutePath,
+  rejectCanonicalPathChange,
+  resolveCanonicalReadPath,
+} from "./path-errors.js";
 
-export const FILE_FETCH_HARD_MAX_BYTES = 16 * 1024 * 1024;
-export const FILE_FETCH_DEFAULT_MAX_BYTES = 8 * 1024 * 1024;
+const TEXT_SNIFF_MAX_BYTES = 8192;
 
 type FileFetchParams = {
   path?: unknown;
+  /** Optional canonical root: follow parent aliases within it, never the final file. */
+  rootPath?: unknown;
   maxBytes?: unknown;
+  transport?: unknown;
   followSymlinks?: unknown;
   preflightOnly?: unknown;
+  expectedCanonicalPath?: unknown;
+  expectedBinding?: unknown;
 };
 
-type FileFetchOk = {
-  ok: true;
-  path: string;
-  size: number;
-  mimeType: string;
-  base64: string;
-  sha256: string;
-  preflightOnly?: boolean;
-};
-
-type FileFetchErrCode =
-  | "INVALID_PATH"
-  | "NOT_FOUND"
-  | "PERMISSION_DENIED"
-  | "IS_DIRECTORY"
-  | "FILE_TOO_LARGE"
-  | "PATH_TRAVERSAL"
-  | "SYMLINK_REDIRECT"
-  | "READ_ERROR";
-
-type FileFetchErr = {
-  ok: false;
-  code: FileFetchErrCode;
-  message: string;
-  canonicalPath?: string;
-};
-
-type FileFetchResult = FileFetchOk | FileFetchErr;
-
-function detectMimeType(filePath: string): string {
-  if (process.platform !== "win32") {
-    try {
-      const result = spawnSync("file", ["-b", "--mime-type", filePath], {
-        encoding: "utf-8",
-        timeout: 2000,
-      });
-      const stdout = result.stdout?.trim();
-      if (result.status === 0 && stdout) {
-        return stdout;
-      }
-    } catch {
-      // fall through to extension fallback
-    }
+function classifyFsError(err: unknown) {
+  if (err instanceof FsSafeError && err.code === "too-large") {
+    return "FILE_TOO_LARGE";
   }
-  const ext = path.extname(filePath).toLowerCase();
-  return EXTENSION_MIME[ext] ?? "application/octet-stream";
-}
-
-function clampMaxBytes(input: unknown): number {
-  if (typeof input !== "number" || !Number.isFinite(input) || input <= 0) {
-    return FILE_FETCH_DEFAULT_MAX_BYTES;
+  const safeCode = classifyFsSafeReadError(err);
+  if (safeCode) {
+    return safeCode;
   }
-  return Math.min(Math.floor(input), FILE_FETCH_HARD_MAX_BYTES);
-}
-
-function classifyFsError(err: unknown): FileFetchErrCode {
   const code = (err as { code?: string } | null)?.code;
+  if (code === "FILE_TOO_LARGE") {
+    return code;
+  }
+  if (code === "not-file") {
+    return "IS_DIRECTORY";
+  }
   if (code === "ENOENT") {
     return "NOT_FOUND";
   }
@@ -83,121 +65,189 @@ function classifyFsError(err: unknown): FileFetchErrCode {
   return "READ_ERROR";
 }
 
-export async function handleFileFetch(params: FileFetchParams): Promise<FileFetchResult> {
-  const requestedPath = params.path;
-  if (typeof requestedPath !== "string" || requestedPath.length === 0) {
-    return { ok: false, code: "INVALID_PATH", message: "path required" };
+function isLikelyPlainText(buffer: Buffer): boolean {
+  if (buffer.byteLength === 0) {
+    return true;
   }
-  if (requestedPath.includes("\0")) {
-    return { ok: false, code: "INVALID_PATH", message: "path contains NUL byte" };
+  const sample = buffer.subarray(0, TEXT_SNIFF_MAX_BYTES);
+  if (sample.includes(0)) {
+    return false;
   }
-  if (!path.isAbsolute(requestedPath)) {
-    return { ok: false, code: "INVALID_PATH", message: "path must be absolute" };
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(sample);
+  } catch {
+    return false;
+  }
+  let controlBytes = 0;
+  for (const byte of sample) {
+    if (byte < 0x20 && byte !== 0x09 && byte !== 0x0a && byte !== 0x0d) {
+      controlBytes += 1;
+    }
+  }
+  return controlBytes / sample.byteLength < 0.01;
+}
+
+async function detectFetchedFileMime(params: {
+  buffer: Buffer;
+  filePath: string;
+}): Promise<string> {
+  const detected = await detectMime(params);
+  if (detected) {
+    return detected;
+  }
+  return isLikelyPlainText(params.buffer) ? "text/plain" : "application/octet-stream";
+}
+
+export async function handleFileFetch(
+  params: FileFetchParams,
+  io?: OpenClawPluginNodeHostCommandIo,
+) {
+  const requestedPath = readAbsolutePath(params.path);
+  if (typeof requestedPath !== "string") {
+    return requestedPath;
   }
 
-  const maxBytes = clampMaxBytes(params.maxBytes);
+  let binaryMax: number | undefined;
+  try {
+    binaryMax = readFileFetchBinaryMaxBytes(params);
+  } catch (error) {
+    return { ok: false as const, code: "INVALID_PARAMS", message: String(error) };
+  }
+  const maxBytes =
+    binaryMax ??
+    Math.min(
+      Math.floor(asPositiveFiniteNumber(params.maxBytes) ?? FILE_FETCH_DEFAULT_MAX_BYTES),
+      FILE_FETCH_HARD_MAX_BYTES,
+    );
   const followSymlinks = params.followSymlinks === true;
   const preflightOnly = params.preflightOnly === true;
 
-  let canonical: string;
+  const requestedRoot =
+    params.rootPath === undefined ? undefined : readAbsolutePath(params.rootPath);
+  if (requestedRoot !== undefined && typeof requestedRoot !== "string") {
+    return requestedRoot;
+  }
+
+  const canonical = await resolveCanonicalReadPath({
+    requestedPath: requestedRoot ?? requestedPath,
+    followSymlinks: requestedRoot === undefined && followSymlinks,
+    classifyError: classifyFsError,
+    notFoundMessage: "file not found",
+  });
+  if (typeof canonical !== "string") {
+    return canonical;
+  }
+
+  let opened: Awaited<ReturnType<Awaited<ReturnType<typeof root>>["open"]>>;
   try {
-    canonical = await fs.realpath(requestedPath);
+    if (requestedRoot !== undefined) {
+      const readRoot = await root(canonical);
+      opened = await readRoot.open(path.relative(canonical, requestedPath), {
+        symlinks: followSymlinks ? "follow-parents-within-root" : "reject",
+      });
+    } else {
+      const parentRoot = await root(path.dirname(canonical));
+      opened = await parentRoot.open(path.basename(canonical));
+    }
   } catch (err) {
     const code = classifyFsError(err);
     return {
-      ok: false,
+      ok: false as const,
       code,
-      message: code === "NOT_FOUND" ? "file not found" : `realpath failed: ${String(err)}`,
-    };
-  }
-
-  // Refuse to follow symlinks anywhere in the path unless the operator
-  // has explicitly opted in. A symlink in user-controlled territory
-  // (e.g. ~/Downloads/evil → /etc) could redirect an allowed-looking
-  // request to a disallowed canonical target. The error includes the
-  // canonical path so the operator can either update their allowlist
-  // to the canonical form or set followSymlinks=true on this node.
-  if (!followSymlinks && canonical !== requestedPath) {
-    return {
-      ok: false,
-      code: "SYMLINK_REDIRECT",
-      message: `path traverses a symlink; refusing because followSymlinks=false (set plugins.entries.file-transfer.config.nodes.<node>.followSymlinks=true to allow, or update allowReadPaths to the canonical path)`,
+      message: code === "IS_DIRECTORY" ? "path is a directory" : `open failed: ${String(err)}`,
       canonicalPath: canonical,
     };
   }
 
-  let stats: Awaited<ReturnType<typeof fs.stat>>;
   try {
-    stats = await fs.stat(canonical);
+    const canonicalPathChange = rejectCanonicalPathChange(
+      params.expectedCanonicalPath,
+      opened.realPath,
+    );
+    if (canonicalPathChange) {
+      return canonicalPathChange;
+    }
+    const stats = opened.stat;
+    const identityStats = await opened.handle.stat({ bigint: true });
+    const identity = fileIdentity(identityStats);
+    const expectedBinding = readPathBinding(params.expectedBinding);
+    if (
+      (params.expectedBinding !== undefined && expectedBinding?.kind !== "existing") ||
+      (expectedBinding?.kind === "existing" && !matchesFileIdentity(identityStats, expectedBinding))
+    ) {
+      return {
+        ok: false as const,
+        code: "CANONICAL_PATH_CHANGED",
+        message: "filesystem identity differs from the authorized target",
+        canonicalPath: opened.realPath,
+      };
+    }
+    if (stats.size > maxBytes) {
+      return {
+        ok: false as const,
+        code: "FILE_TOO_LARGE",
+        message: `file size ${stats.size} exceeds limit ${maxBytes}`,
+        canonicalPath: opened.realPath,
+      };
+    }
+
+    if (preflightOnly) {
+      return {
+        ok: true as const,
+        path: opened.realPath,
+        size: stats.size,
+        mimeType: "",
+        base64: "",
+        sha256: "",
+        preflightOnly: true,
+        binding: { kind: "existing", ...identity } satisfies PathBinding,
+      };
+    }
+
+    if (binaryMax !== undefined) {
+      if (!io?.frames || expectedBinding?.kind !== "existing") {
+        return {
+          ok: false as const,
+          code: "INVALID_PARAMS",
+          message: "binary file.fetch requires duplex IO and an authorized filesystem binding",
+        };
+      }
+      const receipt = await streamFetchedFile(opened.handle, maxBytes, io);
+      return {
+        ok: true as const,
+        path: opened.realPath,
+        ...receipt,
+        transport: "binary" as const,
+        mimeType: "",
+        base64: "",
+        binding: { kind: "existing", ...identity } satisfies PathBinding,
+      };
+    }
+
+    const buffer = await readFileHandleBounded(opened.handle, maxBytes);
+
+    const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
+    const base64 = buffer.toString("base64");
+    const mimeType = await detectFetchedFileMime({ buffer, filePath: opened.realPath });
+
+    return {
+      ok: true as const,
+      path: opened.realPath,
+      size: buffer.byteLength,
+      mimeType,
+      base64,
+      sha256,
+      binding: { kind: "existing", ...identity } satisfies PathBinding,
+    };
   } catch (err) {
     const code = classifyFsError(err);
-    return { ok: false, code, message: `stat failed: ${String(err)}`, canonicalPath: canonical };
-  }
-
-  if (stats.isDirectory()) {
     return {
-      ok: false,
-      code: "IS_DIRECTORY",
-      message: "path is a directory",
-      canonicalPath: canonical,
+      ok: false as const,
+      code,
+      message: `read failed: ${String(err)}`,
+      canonicalPath: opened.realPath,
     };
+  } finally {
+    await opened.handle.close().catch(() => undefined);
   }
-  if (!stats.isFile()) {
-    return {
-      ok: false,
-      code: "READ_ERROR",
-      message: "path is not a regular file",
-      canonicalPath: canonical,
-    };
-  }
-  if (stats.size > maxBytes) {
-    return {
-      ok: false,
-      code: "FILE_TOO_LARGE",
-      message: `file size ${stats.size} exceeds limit ${maxBytes}`,
-      canonicalPath: canonical,
-    };
-  }
-
-  if (preflightOnly) {
-    return {
-      ok: true,
-      path: canonical,
-      size: stats.size,
-      mimeType: "",
-      base64: "",
-      sha256: "",
-      preflightOnly: true,
-    };
-  }
-
-  let buffer: Buffer;
-  try {
-    buffer = await fs.readFile(canonical);
-  } catch (err) {
-    const code = classifyFsError(err);
-    return { ok: false, code, message: `read failed: ${String(err)}`, canonicalPath: canonical };
-  }
-
-  if (buffer.byteLength > maxBytes) {
-    return {
-      ok: false,
-      code: "FILE_TOO_LARGE",
-      message: `read ${buffer.byteLength} bytes exceeds limit ${maxBytes}`,
-      canonicalPath: canonical,
-    };
-  }
-
-  const sha256 = crypto.createHash("sha256").update(buffer).digest("hex");
-  const base64 = buffer.toString("base64");
-  const mimeType = detectMimeType(canonical);
-
-  return {
-    ok: true,
-    path: canonical,
-    size: buffer.byteLength,
-    mimeType,
-    base64,
-    sha256,
-  };
 }

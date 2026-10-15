@@ -1,6 +1,6 @@
+// Matrix tests cover index plugin behavior.
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import { describe, expect, it, vi } from "vitest";
-import { registerMatrixCliMetadata } from "./cli-metadata.js";
 import entry, { registerMatrixFullRuntime } from "./index.js";
 
 const cliMocks = vi.hoisted(() => ({
@@ -9,6 +9,8 @@ const cliMocks = vi.hoisted(() => ({
 
 const runtimeMocks = vi.hoisted(() => ({
   ensureMatrixCryptoRuntime: vi.fn(async () => {}),
+  handleMatrixSubagentDeliveryTarget: vi.fn(() => "delivery-target"),
+  handleMatrixSubagentEnded: vi.fn(async () => {}),
   handleVerificationBootstrap: vi.fn(async () => {}),
   handleVerificationStatus: vi.fn(async () => {}),
   handleVerifyRecoveryKey: vi.fn(async () => {}),
@@ -22,7 +24,19 @@ vi.mock("./src/cli.js", () => {
 });
 
 vi.mock("./plugin-entry.handlers.runtime.js", () => runtimeMocks);
-vi.mock("./runtime-setter-api.js", () => ({ setMatrixRuntime: runtimeMocks.setMatrixRuntime }));
+vi.mock("./runtime-setter-api.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./runtime-setter-api.js")>()),
+  setMatrixRuntime: runtimeMocks.setMatrixRuntime,
+}));
+vi.mock("./src/matrix/subagent-hooks.js", () => runtimeMocks);
+
+function requireFirstCliRegistration(mock: ReturnType<typeof vi.fn>) {
+  const [call] = mock.mock.calls;
+  if (!call || typeof call[0] !== "function") {
+    throw new Error("expected Matrix CLI registration");
+  }
+  return call as [(ctx: unknown) => unknown, unknown];
+}
 
 describe("matrix plugin", () => {
   it("registers matrix CLI through a descriptor-backed lazy registrar", async () => {
@@ -39,10 +53,12 @@ describe("matrix plugin", () => {
       registerGatewayMethod,
     });
 
-    registerMatrixCliMetadata(api);
+    entry.register(api);
 
-    const registrar = registerCli.mock.calls[0]?.[0];
-    expect(registerCli).toHaveBeenCalledWith(expect.any(Function), {
+    expect(registerCli).toHaveBeenCalledTimes(1);
+    const [registrar, options] = requireFirstCliRegistration(registerCli);
+    expect(typeof registrar).toBe("function");
+    expect(options).toEqual({
       descriptors: [
         {
           name: "matrix",
@@ -51,11 +67,10 @@ describe("matrix plugin", () => {
         },
       ],
     });
-    expect(typeof registrar).toBe("function");
     expect(cliMocks.registerMatrixCli).not.toHaveBeenCalled();
 
     const program = { command: vi.fn() };
-    const result = registrar?.({ program } as never);
+    const result = registrar({ program } as never);
 
     await result;
     expect(cliMocks.registerMatrixCli).toHaveBeenCalledWith({ program });
@@ -63,41 +78,14 @@ describe("matrix plugin", () => {
   });
 
   it("keeps runtime bootstrap and CLI metadata out of setup-only registration", () => {
-    expect(entry.kind).toBe("bundled-channel-entry");
-    expect(entry.id).toBe("matrix");
-    expect(entry.name).toBe("Matrix");
-    expect(entry.setChannelRuntime).toEqual(expect.any(Function));
+    if (!entry.setChannelRuntime) {
+      throw new Error("expected Matrix runtime setter");
+    }
+    entry.setChannelRuntime({ marker: "runtime" } as never);
+    expect(runtimeMocks.setMatrixRuntime).not.toHaveBeenCalled();
   });
 
-  it("wires CLI metadata through the bundled entry", () => {
-    const registerCli = vi.fn();
-    const registerGatewayMethod = vi.fn();
-    const api = createTestPluginApi({
-      id: "matrix",
-      name: "Matrix",
-      source: "test",
-      config: {},
-      runtime: {} as never,
-      registrationMode: "cli-metadata",
-      registerCli,
-      registerGatewayMethod,
-    });
-
-    entry.register(api);
-
-    expect(registerCli).toHaveBeenCalledWith(expect.any(Function), {
-      descriptors: [
-        {
-          name: "matrix",
-          description: "Manage Matrix accounts, verification, devices, and profile state",
-          hasSubcommands: true,
-        },
-      ],
-    });
-    expect(registerGatewayMethod).not.toHaveBeenCalled();
-  });
-
-  it("registers subagent lifecycle hooks during full runtime registration", () => {
+  it("registers subagent lifecycle hooks during full runtime registration", async () => {
     const on = vi.fn();
     const registerGatewayMethod = vi.fn();
     const api = createTestPluginApi({
@@ -115,12 +103,15 @@ describe("matrix plugin", () => {
 
     expect(runtimeMocks.ensureMatrixCryptoRuntime).not.toHaveBeenCalled();
     expect(on.mock.calls.map(([hookName]) => hookName)).toEqual([
-      "subagent_spawning",
       "subagent_ended",
       "subagent_delivery_target",
     ]);
-    for (const [, handler] of on.mock.calls) {
-      expect(handler).toEqual(expect.any(Function));
-    }
+    const handlers = Object.fromEntries(on.mock.calls);
+    await expect(handlers.subagent_ended({ id: "ended" })).resolves.toBeUndefined();
+    await expect(handlers.subagent_delivery_target({ id: "target" })).resolves.toBe(
+      "delivery-target",
+    );
+    expect(runtimeMocks.handleMatrixSubagentEnded).toHaveBeenCalledWith({ id: "ended" });
+    expect(runtimeMocks.handleMatrixSubagentDeliveryTarget).toHaveBeenCalledWith({ id: "target" });
   });
 });

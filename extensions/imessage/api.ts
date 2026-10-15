@@ -8,8 +8,8 @@ export {
   resolveIMessageAccount,
 } from "./src/accounts.js";
 export {
-  __testing,
   createIMessageConversationBindingManager,
+  createIMessageConversationBindingManagerV2,
 } from "./src/conversation-bindings.js";
 export {
   matchIMessageAcpConversation,
@@ -42,7 +42,7 @@ export {
   resolveServicePrefixedOrChatAllowTarget,
   resolveServicePrefixedTarget,
   type ServicePrefix,
-} from "./src/target-parsing-helpers.js";
+} from "openclaw/plugin-sdk/channel-targets";
 export {
   formatIMessageChatTarget,
   type IMessageAllowTarget,
@@ -55,3 +55,4 @@ export {
   parseIMessageAllowTarget,
   parseIMessageTarget,
 } from "./src/targets.js";
+export { IMESSAGE_ACTION_NAMES, IMESSAGE_ACTIONS } from "./src/actions-contract.js";

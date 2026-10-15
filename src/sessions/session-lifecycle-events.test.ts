@@ -1,5 +1,11 @@
+// Session lifecycle event tests cover lifecycle event ordering and serialization.
 import { describe, expect, it } from "vitest";
-import { emitSessionLifecycleEvent, onSessionLifecycleEvent } from "./session-lifecycle-events.js";
+import {
+  emitSessionIdentityMutation,
+  emitSessionLifecycleEvent,
+  onSessionIdentityMutation,
+  onSessionLifecycleEvent,
+} from "./session-lifecycle-events.js";
 
 function createListenerSpy(options: { throws?: boolean } = {}) {
   const calls: unknown[][] = [];
@@ -15,6 +21,22 @@ function createListenerSpy(options: { throws?: boolean } = {}) {
 }
 
 describe("session lifecycle events", () => {
+  it("delivers keyed identity mutations and stops after unsubscribe", () => {
+    const { calls, listener } = createListenerSpy();
+    const unsubscribe = onSessionIdentityMutation(listener);
+    const mutation = {
+      agentId: "main",
+      databaseIdentity: Symbol("test-agent-database"),
+      kind: "create" as const,
+      previous: { sessionKeys: [] },
+      current: { sessionId: "session-1", sessionKeys: ["agent:main:external"] },
+    };
+    emitSessionIdentityMutation(mutation);
+    unsubscribe();
+    emitSessionIdentityMutation(mutation);
+    expect(calls).toEqual([[mutation]]);
+  });
+
   it("delivers events to active listeners and stops after unsubscribe", () => {
     const { calls, listener } = createListenerSpy();
     const unsubscribe = onSessionLifecycleEvent(listener);
@@ -48,12 +70,12 @@ describe("session lifecycle events", () => {
     const unsubscribeNoisy = onSessionLifecycleEvent(noisy.listener);
     const unsubscribeHealthy = onSessionLifecycleEvent(healthy.listener);
 
-    expect(() =>
+    expect(
       emitSessionLifecycleEvent({
         sessionKey: "agent:main:main",
         reason: "resumed",
       }),
-    ).not.toThrow();
+    ).toBeUndefined();
 
     expect(noisy.calls).toHaveLength(1);
     expect(healthy.calls).toHaveLength(1);

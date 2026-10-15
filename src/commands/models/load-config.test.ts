@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createTestRuntime } from "../test-runtime-config-helpers.js";
 
 const mocks = vi.hoisted(() => ({
   getRuntimeConfig: vi.fn(),
@@ -8,8 +9,14 @@ const mocks = vi.hoisted(() => ({
   getModelsCommandSecretTargetIds: vi.fn(),
 }));
 
+// mock-isolation: Model-command fixtures control source and runtime snapshots without loading operator state.
 vi.mock("../../config/config.js", () => ({
   getRuntimeConfig: mocks.getRuntimeConfig,
+  loadConfig: mocks.getRuntimeConfig,
+  captureRuntimeConfigAsyncReader:
+    (...args: Parameters<typeof mocks.getRuntimeConfig>) =>
+    async () =>
+      mocks.getRuntimeConfig(...args),
   getRuntimeConfigSourceSnapshot: mocks.getRuntimeConfigSourceSnapshot,
   setRuntimeConfigSnapshot: mocks.setRuntimeConfigSnapshot,
 }));
@@ -57,7 +64,7 @@ describe("models load-config", () => {
         },
       },
     };
-    const runtime = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+    const runtime = createTestRuntime();
 
     mockResolvedConfigFlow({ sourceConfig, diagnostics: ["diag-one", "diag-two"] });
 
@@ -69,8 +76,9 @@ describe("models load-config", () => {
       targetIds,
     });
     expect(mocks.setRuntimeConfigSnapshot).toHaveBeenCalledWith(resolvedConfig, sourceConfig);
-    expect(runtime.log).toHaveBeenNthCalledWith(1, "[secrets] diag-one");
-    expect(runtime.log).toHaveBeenNthCalledWith(2, "[secrets] diag-two");
+    expect(runtime.error).toHaveBeenNthCalledWith(1, "[secrets] diag-one");
+    expect(runtime.error).toHaveBeenNthCalledWith(2, "[secrets] diag-two");
+    expect(runtime.log).not.toHaveBeenCalled();
     expect(result).toEqual({
       sourceConfig,
       resolvedConfig,
@@ -86,6 +94,15 @@ describe("models load-config", () => {
     expect(mocks.setRuntimeConfigSnapshot).toHaveBeenCalledWith(resolvedConfig, sourceConfig);
   });
 
+  it("can read core model config without loading plugin schemas", async () => {
+    const sourceConfig = { models: { providers: {} } };
+    mockResolvedConfigFlow({ sourceConfig, diagnostics: [] });
+
+    await loadModelsConfig({ commandName: "models status", skipPluginValidation: true });
+
+    expect(mocks.getRuntimeConfig).toHaveBeenCalledWith({ skipPluginValidation: true });
+  });
+
   it("does not reread config when no source snapshot is pinned", async () => {
     mocks.getRuntimeConfig.mockReturnValue(runtimeConfig);
     mocks.getRuntimeConfigSourceSnapshot.mockReturnValue(null);
@@ -98,6 +115,6 @@ describe("models load-config", () => {
     const result = await loadModelsConfigWithSource({ commandName: "models list" });
 
     expect(result.sourceConfig).toBe(runtimeConfig);
-    expect(mocks.setRuntimeConfigSnapshot).toHaveBeenCalledWith(resolvedConfig);
+    expect(mocks.setRuntimeConfigSnapshot).toHaveBeenCalledWith(resolvedConfig, runtimeConfig);
   });
 });

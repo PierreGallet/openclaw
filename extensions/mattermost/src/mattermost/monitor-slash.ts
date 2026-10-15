@@ -1,3 +1,5 @@
+import { resolveGatewayPort } from "openclaw/plugin-sdk/gateway-config-runtime";
+import { isLoopbackHost } from "openclaw/plugin-sdk/gateway-runtime";
 import type { ResolvedMattermostAccount } from "./accounts.js";
 import {
   fetchMattermostUserTeams,
@@ -5,8 +7,7 @@ import {
   type MattermostClient,
 } from "./client.js";
 import {
-  listSkillCommandsForAgents,
-  parseStrictPositiveInteger,
+  prepareSkillCommandsForAgents,
   type OpenClawConfig,
   type RuntimeEnv,
 } from "./runtime-api.js";
@@ -22,21 +23,17 @@ import {
 } from "./slash-commands.js";
 import { activateSlashCommands } from "./slash-state.js";
 
-function isLoopbackHost(hostname: string): boolean {
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-}
-
-function buildSlashCommands(params: {
+async function buildSlashCommands(params: {
   cfg: OpenClawConfig;
   runtime: RuntimeEnv;
   nativeSkills: boolean;
-}): MattermostCommandSpec[] {
+}): Promise<MattermostCommandSpec[]> {
   const commandsToRegister: MattermostCommandSpec[] = [...DEFAULT_COMMAND_SPECS];
   if (!params.nativeSkills) {
     return commandsToRegister;
   }
   try {
-    const skillCommands = listSkillCommandsForAgents({ cfg: params.cfg });
+    const skillCommands = await prepareSkillCommandsForAgents({ cfg: params.cfg });
     for (const spec of skillCommands) {
       const name = typeof spec.name === "string" ? spec.name.trim() : "";
       if (!name) {
@@ -98,42 +95,6 @@ function warnOnSuspiciousCallbackUrl(params: {
   }
 }
 
-async function registerSlashCommandsAcrossTeams(params: {
-  client: MattermostClient;
-  teams: Array<{ id: string }>;
-  botUserId: string;
-  callbackUrl: string;
-  commands: MattermostCommandSpec[];
-  runtime: RuntimeEnv;
-}): Promise<{
-  registered: MattermostRegisteredCommand[];
-  teamRegistrationFailures: number;
-}> {
-  const registered: MattermostRegisteredCommand[] = [];
-  let teamRegistrationFailures = 0;
-
-  for (const team of params.teams) {
-    try {
-      const created = await registerSlashCommands({
-        client: params.client,
-        teamId: team.id,
-        creatorUserId: params.botUserId,
-        callbackUrl: params.callbackUrl,
-        commands: params.commands,
-        log: (msg) => params.runtime.log?.(msg),
-      });
-      registered.push(...created);
-    } catch (err) {
-      teamRegistrationFailures += 1;
-      params.runtime.error?.(
-        `mattermost: failed to register slash commands for team ${team.id}: ${String(err)}`,
-      );
-    }
-  }
-
-  return { registered, teamRegistrationFailures };
-}
-
 export async function registerMattermostMonitorSlashCommands(params: {
   client: MattermostClient;
   cfg: OpenClawConfig;
@@ -152,11 +113,9 @@ export async function registerMattermostMonitorSlashCommands(params: {
 
   try {
     const teams = await fetchMattermostUserTeams(params.client, params.botUserId);
-    const envPort = parseStrictPositiveInteger(process.env.OPENCLAW_GATEWAY_PORT?.trim());
-    const slashGatewayPort = envPort ?? params.cfg.gateway?.port ?? 18789;
     const slashCallbackUrl = resolveCallbackUrl({
       config: slashConfig,
-      gatewayPort: slashGatewayPort,
+      gatewayPort: resolveGatewayPort(params.cfg),
       gatewayHost: params.cfg.gateway?.customBindHost ?? undefined,
     });
 
@@ -167,20 +126,32 @@ export async function registerMattermostMonitorSlashCommands(params: {
     });
 
     const dedupedCommands = dedupeSlashCommands(
-      buildSlashCommands({
+      await buildSlashCommands({
         cfg: params.cfg,
         runtime: params.runtime,
         nativeSkills: slashConfig.nativeSkills === true,
       }),
     );
-    const { registered, teamRegistrationFailures } = await registerSlashCommandsAcrossTeams({
-      client: params.client,
-      teams,
-      botUserId: params.botUserId,
-      callbackUrl: slashCallbackUrl,
-      commands: dedupedCommands,
-      runtime: params.runtime,
-    });
+    const registered: MattermostRegisteredCommand[] = [];
+    let teamRegistrationFailures = 0;
+    for (const team of teams) {
+      try {
+        const created = await registerSlashCommands({
+          client: params.client,
+          teamId: team.id,
+          creatorUserId: params.botUserId,
+          callbackUrl: slashCallbackUrl,
+          commands: dedupedCommands,
+          log: (msg) => params.runtime.log?.(msg),
+        });
+        registered.push(...created);
+      } catch (err) {
+        teamRegistrationFailures += 1;
+        params.runtime.error?.(
+          `mattermost: failed to register slash commands for team ${team.id}: ${String(err)}`,
+        );
+      }
+    }
 
     if (registered.length === 0) {
       params.runtime.error?.(

@@ -1,54 +1,74 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { isGemma4ModelId } from "../shared/google-models.js";
+import {
+  bindsClaudeThinkingPrefix,
+  resolveClaudeModelIdentity,
+  resolveClaudeOpus5ModelIdentity,
+} from "@openclaw/llm-core";
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import type { AgentMessage } from "../agents/runtime/index.js";
+import { warnSessionPersistenceDeprecation } from "../agents/sessions/session-persistence-deprecation.js";
 import { sanitizeGoogleAssistantFirstOrdering } from "../shared/google-turn-ordering.js";
-import { normalizeLowercaseStringOrEmpty } from "../shared/string-coerce.js";
+import type { ProviderRuntimeModel } from "./provider-runtime-model.types.js";
 import type {
   ProviderReasoningOutputMode,
   ProviderReplayPolicy,
   ProviderReplayPolicyContext,
   ProviderReplaySessionState,
   ProviderSanitizeReplayHistoryContext,
+  ProviderSanitizeReplayHistoryContextV2,
 } from "./types.js";
 
+/** @deprecated Provider replay helper; prefer provider-local replay hooks. */
 export function buildOpenAICompatibleReplayPolicy(
   modelApi: string | null | undefined,
-  options: { sanitizeToolCallIds?: boolean; modelId?: string | null } = {},
+  options: {
+    sanitizeToolCallIds?: boolean;
+    duplicateToolCallIdStyle?: "openai";
+    modelId?: string | null;
+    dropReasoningFromHistory?: boolean;
+  } = {},
 ): ProviderReplayPolicy | undefined {
   if (
     modelApi !== "openai-completions" &&
     modelApi !== "openai-responses" &&
-    modelApi !== "openai-codex-responses" &&
+    modelApi !== "openai-chatgpt-responses" &&
     modelApi !== "azure-openai-responses"
   ) {
     return undefined;
   }
 
   const sanitizeToolCallIds = options.sanitizeToolCallIds ?? true;
+  const dropReasoningFromHistory = options.dropReasoningFromHistory ?? true;
+  const isResponsesFamily =
+    modelApi === "openai-responses" ||
+    modelApi === "openai-chatgpt-responses" ||
+    modelApi === "azure-openai-responses";
 
   return {
     ...(sanitizeToolCallIds
-      ? { sanitizeToolCallIds: true, toolCallIdMode: "strict" as const }
-      : {}),
-    ...(modelApi === "openai-completions"
       ? {
-          applyAssistantFirstOrderingFix: true,
-          validateGeminiTurns: true,
-          validateAnthropicTurns: true,
+          sanitizeToolCallIds: true,
+          toolCallIdMode: "strict" as const,
+          ...(options.duplicateToolCallIdStyle
+            ? { duplicateToolCallIdStyle: options.duplicateToolCallIdStyle }
+            : {}),
         }
-      : {
-          applyAssistantFirstOrderingFix: false,
-          validateGeminiTurns: false,
-          validateAnthropicTurns: false,
-        }),
-    ...(modelApi === "openai-completions" && isGemma4ModelId(options.modelId)
+      : {}),
+    ...(isResponsesFamily ? { allowSyntheticToolResults: true } : {}),
+    applyAssistantFirstOrderingFix: modelApi === "openai-completions",
+    validateGeminiTurns: modelApi === "openai-completions",
+    validateAnthropicTurns: modelApi === "openai-completions",
+    ...(modelApi === "openai-completions" && dropReasoningFromHistory
       ? { dropReasoningFromHistory: true }
       : {}),
   };
 }
 
+/** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
 export function buildStrictAnthropicReplayPolicy(
   options: {
     dropThinkingBlocks?: boolean;
+    appendOnlyRuntimeContext?: boolean;
+    inHistorySystemUpdates?: boolean;
     sanitizeToolCallIds?: boolean;
     preserveNativeAnthropicToolUseIds?: boolean;
   } = {},
@@ -66,6 +86,9 @@ export function buildStrictAnthropicReplayPolicy(
         }
       : {}),
     preserveSignatures: true,
+    appendOnlyRuntimeContext:
+      options.inHistorySystemUpdates || options.appendOnlyRuntimeContext || false,
+    ...(options.inHistorySystemUpdates ? { inHistorySystemUpdates: true } : {}),
     repairToolUseResultPairing: true,
     validateAnthropicTurns: true,
     allowSyntheticToolResults: true,
@@ -73,65 +96,63 @@ export function buildStrictAnthropicReplayPolicy(
   };
 }
 
-/**
- * Returns true for Claude models that preserve thinking blocks in context
- * natively (Opus 4.5+, Sonnet 4.5+, Haiku 4.5+). For these models, dropping
- * thinking blocks from prior turns breaks prompt cache prefix matching.
- *
- * See: https://platform.claude.com/docs/en/build-with-claude/extended-thinking#differences-in-thinking-across-model-versions
- */
-export function shouldPreserveThinkingBlocks(modelId?: string): boolean {
-  const id = normalizeLowercaseStringOrEmpty(modelId);
-  if (!id.includes("claude")) {
-    return false;
-  }
-
-  // Models that preserve thinking blocks natively (Claude 4.5+):
-  // - claude-opus-4-x (opus-4-5, opus-4-6, ...)
-  // - claude-sonnet-4-x (sonnet-4-5, sonnet-4-6, ...)
-  //   Note: "sonnet-4" is safe — legacy "claude-3-5-sonnet" does not contain "sonnet-4"
-  // - claude-haiku-4-x (haiku-4-5, ...)
-  // Models that require dropping thinking blocks:
-  // - claude-3-7-sonnet, claude-3-5-sonnet, and earlier
-  if (id.includes("opus-4") || id.includes("sonnet-4") || id.includes("haiku-4")) {
-    return true;
-  }
-
-  // Future-proofing: claude-5-x, claude-6-x etc. should also preserve
-  if (/claude-[5-9]/.test(id) || /claude-\d{2,}/.test(id)) {
-    return true;
-  }
-
-  return false;
+function shouldDropClaudeThinkingBlocks(
+  modelId?: string,
+  model?: Pick<ProviderRuntimeModel, "params">,
+): boolean {
+  const ref = { id: modelId, params: model?.params };
+  const canonicalId = resolveClaudeModelIdentity(ref);
+  const isClaude =
+    canonicalId.startsWith("claude-") || resolveClaudeOpus5ModelIdentity(ref) !== undefined;
+  const preservesThinking =
+    bindsClaudeThinkingPrefix(ref) ||
+    resolveClaudeOpus5ModelIdentity(ref) !== undefined ||
+    /(?:^|-)claude-(?:fable-5|mythos-(?:5|preview)|opus-4-(?:5|6|7|8)|sonnet-(?:5|4-6))(?=$|[^a-z0-9])/.test(
+      canonicalId,
+    );
+  return isClaude && !preservesThinking;
 }
 
-export function buildAnthropicReplayPolicyForModel(modelId?: string): ProviderReplayPolicy {
-  const isClaude = normalizeLowercaseStringOrEmpty(modelId).includes("claude");
+/** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
+export function buildAnthropicReplayPolicyForModel(
+  modelId?: string,
+  model?: Pick<ProviderRuntimeModel, "params">,
+  inHistorySystemUpdates = false,
+): ProviderReplayPolicy {
   return buildStrictAnthropicReplayPolicy({
-    dropThinkingBlocks: isClaude && !shouldPreserveThinkingBlocks(modelId),
+    inHistorySystemUpdates,
+    dropThinkingBlocks: shouldDropClaudeThinkingBlocks(modelId, model),
+    appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({ id: modelId, params: model?.params }),
   });
 }
 
-export function buildNativeAnthropicReplayPolicyForModel(modelId?: string): ProviderReplayPolicy {
-  const isClaude = normalizeLowercaseStringOrEmpty(modelId).includes("claude");
-  return buildStrictAnthropicReplayPolicy({
-    dropThinkingBlocks: isClaude && !shouldPreserveThinkingBlocks(modelId),
-    sanitizeToolCallIds: true,
+/** @deprecated Anthropic-family provider replay helper; prefer provider-local replay hooks. */
+export function buildNativeAnthropicReplayPolicyForModel(
+  modelId?: string,
+  model?: Pick<ProviderRuntimeModel, "params">,
+  inHistorySystemUpdates = false,
+): ProviderReplayPolicy {
+  return {
+    ...buildAnthropicReplayPolicyForModel(modelId, model, inHistorySystemUpdates),
     preserveNativeAnthropicToolUseIds: true,
-  });
+  };
 }
 
+/** @deprecated Provider replay helper; prefer provider-local replay hooks. */
 export function buildHybridAnthropicOrOpenAIReplayPolicy(
   ctx: ProviderReplayPolicyContext,
   options: { anthropicModelDropThinkingBlocks?: boolean } = {},
 ): ProviderReplayPolicy | undefined {
   if (ctx.modelApi === "anthropic-messages" || ctx.modelApi === "bedrock-converse-stream") {
-    const isClaude = normalizeLowercaseStringOrEmpty(ctx.modelId).includes("claude");
     return buildStrictAnthropicReplayPolicy({
+      inHistorySystemUpdates: ctx.inHistorySystemUpdates,
+      appendOnlyRuntimeContext: bindsClaudeThinkingPrefix({
+        id: ctx.modelId,
+        params: ctx.model?.params,
+      }),
       dropThinkingBlocks:
         options.anthropicModelDropThinkingBlocks &&
-        isClaude &&
-        !shouldPreserveThinkingBlocks(ctx.modelId),
+        shouldDropClaudeThinkingBlocks(ctx.modelId, ctx.model),
     });
   }
 
@@ -152,8 +173,11 @@ function markGoogleTurnOrderingMarker(sessionState: ProviderReplaySessionState):
   });
 }
 
+/** @deprecated Google provider replay helper; prefer provider-local replay hooks. */
 export function buildGoogleGeminiReplayPolicy(): ProviderReplayPolicy {
   return {
+    // Managed explicit caching projects the current volatile system suffix here.
+    appendOnlyRuntimeContext: false,
     sanitizeMode: "full",
     sanitizeToolCallIds: true,
     toolCallIdMode: "strict",
@@ -169,6 +193,7 @@ export function buildGoogleGeminiReplayPolicy(): ProviderReplayPolicy {
   };
 }
 
+/** @deprecated Google provider replay helper; prefer provider-local replay hooks. */
 export function buildPassthroughGeminiSanitizingReplayPolicy(
   modelId?: string,
 ): ProviderReplayPolicy {
@@ -188,9 +213,14 @@ export function buildPassthroughGeminiSanitizingReplayPolicy(
   };
 }
 
+/** @deprecated Use sanitizeGoogleGeminiReplayHistoryAsync; final compatibility day: 2026-12-31. */
 export function sanitizeGoogleGeminiReplayHistory(
   ctx: ProviderSanitizeReplayHistoryContext,
 ): AgentMessage[] {
+  warnSessionPersistenceDeprecation(
+    "sanitizeGoogleGeminiReplayHistory",
+    "sanitizeGoogleGeminiReplayHistoryAsync",
+  );
   const messages = sanitizeGoogleAssistantFirstOrdering(ctx.messages);
   if (
     messages !== ctx.messages &&
@@ -202,6 +232,24 @@ export function sanitizeGoogleGeminiReplayHistory(
   return messages;
 }
 
+/** Sanitize replay and await the worker commit before returning the rewritten history. */
+export async function sanitizeGoogleGeminiReplayHistoryAsync(
+  ctx: ProviderSanitizeReplayHistoryContextV2,
+): Promise<AgentMessage[]> {
+  const messages = sanitizeGoogleAssistantFirstOrdering(ctx.messages);
+  if (
+    messages !== ctx.messages &&
+    ctx.sessionState &&
+    !hasGoogleTurnOrderingMarker(ctx.sessionState)
+  ) {
+    await ctx.sessionState.appendCustomEntryAsync(GOOGLE_TURN_ORDERING_CUSTOM_TYPE, {
+      timestamp: Date.now(),
+    });
+  }
+  return messages;
+}
+
+/** @deprecated Provider replay helper; prefer provider-local replay hooks. */
 export function resolveTaggedReasoningOutputMode(): ProviderReasoningOutputMode {
   return "tagged";
 }

@@ -4,196 +4,70 @@ import {
   resolveWhatsAppGroupSystemPrompt,
 } from "./system-prompt.js";
 
-describe("resolveWhatsAppGroupSystemPrompt", () => {
-  it("returns undefined when groupId is absent", () => {
-    expect(resolveWhatsAppGroupSystemPrompt({ groupId: null })).toBeUndefined();
-    expect(resolveWhatsAppGroupSystemPrompt({ groupId: undefined })).toBeUndefined();
-    expect(resolveWhatsAppGroupSystemPrompt({})).toBeUndefined();
-  });
+type Entries = Record<string, { systemPrompt?: string | null }>;
+type PromptCase = {
+  name: string;
+  entries?: Entries;
+  targetId: string | null;
+  expected?: string;
+};
 
-  it("returns undefined when accountConfig is absent", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({ groupId: "g1", accountConfig: null }),
-    ).toBeUndefined();
-    expect(
-      resolveWhatsAppGroupSystemPrompt({ groupId: "g1", accountConfig: undefined }),
-    ).toBeUndefined();
-  });
+const cases: PromptCase[] = [
+  {
+    name: "ignores prompts without a target",
+    targetId: null,
+    entries: { "*": { systemPrompt: "wildcard" } },
+  },
+  { name: "handles absent account config", targetId: "specific" },
+  {
+    name: "trims the specific prompt and gives it precedence over the wildcard",
+    targetId: "specific",
+    entries: { specific: { systemPrompt: "  chosen  " }, "*": { systemPrompt: "wildcard" } },
+    expected: "chosen",
+  },
+  {
+    name: "uses the wildcard when the specific entry is absent",
+    targetId: "specific",
+    entries: { "*": { systemPrompt: "wildcard" } },
+    expected: "wildcard",
+  },
+  {
+    name: "suppresses the wildcard for a whitespace-only specific prompt",
+    targetId: "specific",
+    entries: { specific: { systemPrompt: "   " }, "*": { systemPrompt: "wildcard" } },
+  },
+  {
+    name: "handles an entry with no prompt or wildcard",
+    targetId: "specific",
+    entries: { specific: {} },
+  },
+  {
+    name: "uses the wildcard for a null specific prompt",
+    targetId: "specific",
+    entries: { specific: { systemPrompt: null }, "*": { systemPrompt: "wildcard" } },
+    expected: "wildcard",
+  },
+];
 
-  it("returns the group-specific systemPrompt when defined", () => {
-    expect(
+describe.each([
+  {
+    name: "group",
+    resolve: (entries: Entries | undefined, targetId: string | null) =>
       resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: { groups: { g1: { systemPrompt: "group prompt" } } },
+        accountConfig: entries ? { groups: entries } : undefined,
+        groupId: targetId,
       }),
-    ).toBe("group prompt");
-  });
-
-  it("falls back to wildcard when specific group entry is absent", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: {
-          groups: { "*": { systemPrompt: "wildcard prompt" } },
-        },
-      }),
-    ).toBe("wildcard prompt");
-  });
-
-  it("suppresses wildcard when specific group entry sets systemPrompt to empty string", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: {
-          groups: {
-            g1: { systemPrompt: "" },
-            "*": { systemPrompt: "wildcard prompt" },
-          },
-        },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("suppresses wildcard when specific group entry sets systemPrompt to whitespace-only string", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: {
-          groups: {
-            g1: { systemPrompt: "   " },
-            "*": { systemPrompt: "wildcard prompt" },
-          },
-        },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("trims whitespace from specific group systemPrompt", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: { groups: { g1: { systemPrompt: "  trimmed  " } } },
-      }),
-    ).toBe("trimmed");
-  });
-
-  it("returns undefined when specific group entry has no systemPrompt key and no wildcard", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: { groups: { g1: {} } },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("falls back to wildcard when specific group entry has no systemPrompt key", () => {
-    expect(
-      resolveWhatsAppGroupSystemPrompt({
-        groupId: "g1",
-        accountConfig: {
-          groups: {
-            g1: {},
-            "*": { systemPrompt: "wildcard prompt" },
-          },
-        },
-      }),
-    ).toBe("wildcard prompt");
-  });
-});
-
-describe("resolveWhatsAppDirectSystemPrompt", () => {
-  it("returns undefined when peerId is absent", () => {
-    expect(resolveWhatsAppDirectSystemPrompt({ peerId: null })).toBeUndefined();
-    expect(resolveWhatsAppDirectSystemPrompt({ peerId: undefined })).toBeUndefined();
-    expect(resolveWhatsAppDirectSystemPrompt({})).toBeUndefined();
-  });
-
-  it("returns undefined when accountConfig is absent", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({ peerId: "p1", accountConfig: null }),
-    ).toBeUndefined();
-    expect(
-      resolveWhatsAppDirectSystemPrompt({ peerId: "p1", accountConfig: undefined }),
-    ).toBeUndefined();
-  });
-
-  it("returns the peer-specific systemPrompt when defined", () => {
-    expect(
+  },
+  {
+    name: "direct",
+    resolve: (entries: Entries | undefined, targetId: string | null) =>
       resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: { direct: { p1: { systemPrompt: "direct prompt" } } },
+        accountConfig: entries ? { direct: entries } : undefined,
+        peerId: targetId,
       }),
-    ).toBe("direct prompt");
-  });
-
-  it("falls back to wildcard when specific peer entry is absent", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: {
-          direct: { "*": { systemPrompt: "wildcard prompt" } },
-        },
-      }),
-    ).toBe("wildcard prompt");
-  });
-
-  it("suppresses wildcard when specific peer entry sets systemPrompt to empty string", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: {
-          direct: {
-            p1: { systemPrompt: "" },
-            "*": { systemPrompt: "wildcard prompt" },
-          },
-        },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("suppresses wildcard when specific peer entry sets systemPrompt to whitespace-only string", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: {
-          direct: {
-            p1: { systemPrompt: "   " },
-            "*": { systemPrompt: "wildcard prompt" },
-          },
-        },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("trims whitespace from specific peer systemPrompt", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: { direct: { p1: { systemPrompt: "  trimmed  " } } },
-      }),
-    ).toBe("trimmed");
-  });
-
-  it("returns undefined when specific peer entry has no systemPrompt key and no wildcard", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: { direct: { p1: {} } },
-      }),
-    ).toBeUndefined();
-  });
-
-  it("falls back to wildcard when specific peer entry has no systemPrompt key", () => {
-    expect(
-      resolveWhatsAppDirectSystemPrompt({
-        peerId: "p1",
-        accountConfig: {
-          direct: {
-            p1: {},
-            "*": { systemPrompt: "wildcard prompt" },
-          },
-        },
-      }),
-    ).toBe("wildcard prompt");
+  },
+])("WhatsApp $name system prompts", ({ resolve }) => {
+  it.each(cases)("$name", ({ entries, targetId, expected }) => {
+    expect(resolve(entries, targetId)).toBe(expected);
   });
 });

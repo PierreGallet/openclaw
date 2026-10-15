@@ -1,130 +1,43 @@
-import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { timestampMsToIsoString } from "openclaw/plugin-sdk/number-runtime";
+import { FsSafeError, root as fsRoot } from "openclaw/plugin-sdk/security-runtime";
+import { preserveHumanNotesBlock, renderMarkdownFence, renderWikiMarkdown } from "./markdown.js";
 import {
   setImportedSourceEntry,
-  shouldSkipImportedSourceWrite,
   type MemoryWikiImportedSourceGroup,
+  type MemoryWikiImportedSourceState,
 } from "./source-sync-state.js";
+import {
+  readExistingWikiPage,
+  readWikiPageStat,
+  writeGuardedVaultPage,
+} from "./vault-page-write.js";
 
-type ImportedSourceState = Parameters<typeof shouldSkipImportedSourceWrite>[0]["state"];
-type FileStats = Awaited<ReturnType<typeof fs.lstat>>;
-
-function isPathInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-async function resolveWritableVaultPagePath(params: {
-  vaultRoot: string;
-  pagePath: string;
-}): Promise<{
-  pageAbsPath: string;
-  pageDir: string;
-  pageDirRealPath: string;
-  vaultRealPath: string;
-  existing: FileStats | null;
-}> {
-  const vaultAbsPath = path.resolve(params.vaultRoot);
-  const pageAbsPath = path.resolve(vaultAbsPath, params.pagePath);
-  if (!isPathInside(vaultAbsPath, pageAbsPath)) {
-    throw new Error(`Refusing to write imported source page outside vault: ${params.pagePath}`);
-  }
-
-  const vaultRealPath = await fs.realpath(vaultAbsPath);
-  const pageDir = path.dirname(pageAbsPath);
-  await fs.mkdir(pageDir, { recursive: true });
-  const pageDirRealPath = await fs.realpath(pageDir);
-  if (!isPathInside(vaultRealPath, pageDirRealPath)) {
-    throw new Error(`Refusing to write imported source page outside vault: ${params.pagePath}`);
-  }
-
-  const existing = await fs.lstat(pageAbsPath).catch((err: unknown) => {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return null;
-    }
-    throw err;
-  });
-  if (existing?.isSymbolicLink()) {
-    throw new Error(`Refusing to write imported source page through symlink: ${params.pagePath}`);
-  }
-  if (existing && !existing.isFile()) {
-    throw new Error(`Refusing to write imported source page over non-file: ${params.pagePath}`);
-  }
-  return { pageAbsPath, pageDir, pageDirRealPath, vaultRealPath, existing };
-}
-
-async function assertWritablePageDir(params: {
-  pageDir: string;
-  pageDirRealPath: string;
-  vaultRealPath: string;
-  pagePath: string;
-}): Promise<void> {
-  const currentPageDirRealPath = await fs.realpath(params.pageDir);
-  if (
-    currentPageDirRealPath !== params.pageDirRealPath ||
-    !isPathInside(params.vaultRealPath, currentPageDirRealPath)
-  ) {
-    throw new Error(`Refusing to write imported source page outside vault: ${params.pagePath}`);
-  }
-}
-
-async function validateDestinationForReplace(filePath: string, pagePath: string): Promise<void> {
-  const existing = await fs.lstat(filePath).catch((err: unknown) => {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return null;
-    }
-    throw err;
-  });
-  if (existing?.isSymbolicLink()) {
-    throw new Error(`Refusing to write imported source page through symlink: ${pagePath}`);
-  }
-  if (existing && !existing.isFile()) {
-    throw new Error(`Refusing to write imported source page over non-file: ${pagePath}`);
-  }
-}
-
-async function writeFileAtomicInVault(params: {
-  filePath: string;
-  pageDir: string;
-  pageDirRealPath: string;
-  vaultRealPath: string;
-  pagePath: string;
+export function renderImportedSourcePage(params: {
+  frontmatter: Record<string, unknown> & { title: string };
+  sourceHeading: string;
+  sourceDetails: string[];
   content: string;
-}): Promise<void> {
-  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
-  await assertWritablePageDir(params);
-
-  const tempPath = path.join(params.pageDir, `.openclaw-wiki-${process.pid}-${randomUUID()}.tmp`);
-  let shouldRemoveTemp = true;
-  try {
-    const handle = await fs.open(
-      tempPath,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
-      0o600,
-    );
-    try {
-      const tempStat = await handle.stat();
-      if (!tempStat.isFile() || tempStat.nlink !== 1) {
-        throw new Error(
-          `Refusing to write imported source page through unsafe temp file: ${params.pagePath}`,
-        );
-      }
-      await handle.writeFile(params.content, "utf8");
-    } finally {
-      await handle.close();
-    }
-    await assertWritablePageDir(params);
-    await validateDestinationForReplace(params.filePath, params.pagePath);
-    await fs.rename(tempPath, params.filePath);
-    shouldRemoveTemp = false;
-    await assertWritablePageDir(params);
-  } finally {
-    if (shouldRemoveTemp) {
-      await fs.rm(tempPath, { force: true });
-    }
-  }
+  language: string;
+}): string {
+  return renderWikiMarkdown({
+    frontmatter: params.frontmatter,
+    body: [
+      `# ${params.frontmatter.title}`,
+      "",
+      `## ${params.sourceHeading}`,
+      ...params.sourceDetails,
+      "",
+      "## Content",
+      renderMarkdownFence(params.content, params.language),
+      "",
+      "## Notes",
+      "<!-- openclaw:human:start -->",
+      "<!-- openclaw:human:end -->",
+      "",
+    ].join("\n"),
+  });
 }
 
 export async function writeImportedSourcePage(params: {
@@ -136,46 +49,49 @@ export async function writeImportedSourcePage(params: {
   renderFingerprint: string;
   pagePath: string;
   group: MemoryWikiImportedSourceGroup;
-  state: ImportedSourceState;
+  state: MemoryWikiImportedSourceState;
+  prepareWrite?: () => Promise<unknown>;
   buildRendered: (raw: string, updatedAt: string) => string;
 }): Promise<{ pagePath: string; changed: boolean; created: boolean }> {
-  const {
-    pageAbsPath,
-    pageDir,
-    pageDirRealPath,
-    vaultRealPath,
-    existing: pageStat,
-  } = await resolveWritableVaultPagePath({
-    vaultRoot: params.vaultRoot,
-    pagePath: params.pagePath,
-  });
-  const created = !pageStat;
-  const updatedAt = new Date(params.sourceUpdatedAtMs).toISOString();
-  const shouldSkip = await shouldSkipImportedSourceWrite({
-    vaultRoot: params.vaultRoot,
-    syncKey: params.syncKey,
-    expectedPagePath: params.pagePath,
-    expectedSourcePath: params.sourcePath,
-    sourceUpdatedAtMs: params.sourceUpdatedAtMs,
-    sourceSize: params.sourceSize,
-    renderFingerprint: params.renderFingerprint,
-    state: params.state,
-  });
-  if (shouldSkip) {
-    return { pagePath: params.pagePath, changed: false, created };
+  const previous = params.state.entries[params.syncKey];
+  if (
+    previous?.pagePath === params.pagePath &&
+    previous.sourcePath === params.sourcePath &&
+    previous.sourceUpdatedAtMs === params.sourceUpdatedAtMs &&
+    previous.sourceSize === params.sourceSize &&
+    previous.renderFingerprint === params.renderFingerprint &&
+    (await fs.access(path.join(params.vaultRoot, params.pagePath)).then(
+      () => true,
+      () => false,
+    ))
+  ) {
+    return { pagePath: params.pagePath, changed: false, created: false };
   }
 
+  // Source metadata checks stay outside vault activation. This boundary keeps
+  // unchanged import polls from validating and rereading every retained page.
+  await params.prepareWrite?.();
+  const vault = await fsRoot(params.vaultRoot);
+  const pageStat = await readWikiPageStat(vault, params.pagePath);
+  const created = !pageStat;
+  const updatedAt = timestampMsToIsoString(params.sourceUpdatedAtMs) ?? new Date().toISOString();
   const raw = await fs.readFile(params.sourcePath, "utf8");
   const rendered = params.buildRendered(raw, updatedAt);
-  const existing = pageStat ? await fs.readFile(pageAbsPath, "utf8").catch(() => "") : "";
-  if (existing !== rendered) {
-    await writeFileAtomicInVault({
-      filePath: pageAbsPath,
-      pageDir,
-      pageDirRealPath,
-      vaultRealPath,
+  const existing = pageStat
+    ? await readExistingWikiPage(
+        () => vault.readText(params.pagePath),
+        (error) =>
+          error instanceof FsSafeError && (error.code === "not-file" || error.code === "hardlink"),
+      )
+    : "";
+  const nextRendered = existing ? preserveHumanNotesBlock(rendered, existing) : rendered;
+  if (existing !== nextRendered) {
+    await writeGuardedVaultPage({
+      vault,
       pagePath: params.pagePath,
-      content: rendered,
+      content: nextRendered,
+      pageStat,
+      pageLabel: "imported source page",
     });
   }
 
@@ -191,5 +107,5 @@ export async function writeImportedSourcePage(params: {
       renderFingerprint: params.renderFingerprint,
     },
   });
-  return { pagePath: params.pagePath, changed: existing !== rendered, created };
+  return { pagePath: params.pagePath, changed: existing !== nextRendered, created };
 }

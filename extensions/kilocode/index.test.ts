@@ -1,20 +1,11 @@
-import type { StreamFn } from "@mariozechner/pi-agent-core";
-import type { Context, Model } from "@mariozechner/pi-ai";
+// Kilocode tests cover index plugin behavior.
+import type { StreamFn } from "openclaw/plugin-sdk/agent-core";
+import type { Context, Model } from "openclaw/plugin-sdk/llm";
 import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { expectPassthroughReplayPolicy } from "openclaw/plugin-sdk/provider-test-contracts";
 import { describe, expect, it } from "vitest";
 import plugin from "./index.js";
 
 describe("kilocode provider plugin", () => {
-  it("owns passthrough-gemini replay policy for Gemini-backed models", async () => {
-    await expectPassthroughReplayPolicy({
-      plugin,
-      providerId: "kilocode",
-      modelId: "gemini-2.5-pro",
-      sanitizeThoughtSignatures: true,
-    });
-  });
-
   it("wires kilocode-thinking stream hooks", async () => {
     const provider = await registerSingleProviderPlugin(plugin);
     let capturedPayload: Record<string, unknown> | undefined;
@@ -45,13 +36,14 @@ describe("kilocode provider plugin", () => {
       {},
     );
 
-    expect(capturedPayload).toMatchObject({
+    expect(capturedPayload).toEqual({
+      config: { thinkingConfig: { thinkingBudget: -1 } },
       reasoning: { effort: "high" },
     });
 
     const wrappedAuto = provider.wrapStreamFn?.({
       provider: "kilocode",
-      modelId: "kilo/auto",
+      modelId: "kilo-auto/balanced",
       thinkingLevel: "high",
       streamFn: baseStreamFn,
     } as never);
@@ -60,13 +52,46 @@ describe("kilocode provider plugin", () => {
       {
         api: "openai-completions",
         provider: "kilocode",
-        id: "kilo/auto",
+        id: "kilo-auto/balanced",
       } as Model<"openai-completions">,
       { messages: [] } as Context,
       {},
     );
 
     expect(capturedPayload).not.toHaveProperty("reasoning");
+  });
+
+  it("normalizes string stop after caller payload hooks", async () => {
+    const provider = await registerSingleProviderPlugin(plugin);
+    const payloads: Array<Record<string, unknown>> = [];
+    const baseStreamFn: StreamFn = (model, _context, options) => {
+      const payload: Record<string, unknown> = {};
+      options?.onPayload?.(payload as never, model as never);
+      payloads.push(payload);
+      return {} as never;
+    };
+
+    const wrapped = provider.wrapStreamFn?.({
+      provider: "kilocode",
+      modelId: "deepseek/deepseek-v4-flash",
+      streamFn: baseStreamFn,
+    } as never);
+
+    void wrapped?.(
+      {
+        api: "openai-completions",
+        provider: "kilocode",
+        id: "deepseek/deepseek-v4-flash",
+      } as Model<"openai-completions">,
+      { messages: [] } as Context,
+      {
+        onPayload: (payload) => {
+          (payload as Record<string, unknown>).stop = "\n";
+        },
+      },
+    );
+
+    expect(payloads[0]?.stop).toEqual(["\n"]);
   });
 
   it("publishes configured Kilo models through plugin-owned catalog augmentation", async () => {
@@ -95,7 +120,7 @@ describe("kilocode provider plugin", () => {
     ).toEqual([
       {
         provider: "kilocode",
-        id: "google/gemini-3-pro-preview",
+        id: "google/gemini-3.1-pro-preview",
         name: "Gemini 3 Pro Preview",
         input: ["text", "image"],
         reasoning: true,

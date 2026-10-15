@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyClosePlan,
   buildDuplicateClosePlan,
+  defaultRunGh,
   parseArgs,
   parsePrNumberList,
   parseUnifiedDiffRanges,
@@ -77,10 +78,15 @@ diff --git a/b.ts b/b.ts
       repo: "openclaw/openclaw",
     });
 
-    expect(plan).toMatchObject([
+    expect(plan).toStrictEqual([
       {
         action: "close",
-        candidate: { number: 70530 },
+        candidate,
+        comment: `Thanks for the fix. This is now covered by the landed #70532 / commit https://github.com/openclaw/openclaw/commit/6415e35.
+
+Evidence: overlapping changed hunks; shared file(s): ui/src/ui/chat/grouped-render.ts.
+
+Closing #70530 as a duplicate.`,
         evidence: {
           overlappingHunks: true,
           sharedFiles: ["ui/src/ui/chat/grouped-render.ts"],
@@ -88,44 +94,6 @@ diff --git a/b.ts b/b.ts
         },
       },
     ]);
-  });
-
-  it("allows duplicate closure with a shared issue ref even when hunks drift", () => {
-    const landed = pr({
-      body: "Fixes #70491",
-      mergeCommit: "6415e35",
-      mergedAt: "2026-04-23T17:13:32Z",
-      number: 70532,
-      state: "MERGED",
-    });
-    const candidate = pr({ body: "Closes #70491", number: 70592 });
-    const diffs = new Map([
-      [
-        70532,
-        `diff --git a/ui/src/ui/chat/grouped-render.ts b/ui/src/ui/chat/grouped-render.ts
-@@ -402,8 +402,11 @@`,
-      ],
-      [
-        70592,
-        `diff --git a/ui/src/ui/chat/grouped-render.ts b/ui/src/ui/chat/grouped-render.ts
-@@ -286,8 +286,11 @@`,
-      ],
-    ]);
-
-    const plan = buildDuplicateClosePlan({
-      candidates: [candidate],
-      diffs,
-      landed,
-      repo: "openclaw/openclaw",
-    });
-
-    expect(plan[0]).toMatchObject({
-      action: "close",
-      evidence: {
-        overlappingHunks: false,
-        sharedIssues: [70491],
-      },
-    });
   });
 
   it("refuses candidates without shared issue or overlapping hunks", () => {
@@ -196,6 +164,14 @@ diff --git a/b.ts b/b.ts
     const plan = runDuplicateCloseWorkflow(args, runGh);
 
     expect(plan).toHaveLength(1);
+    expect(plan[0]).toMatchObject({
+      action: "close",
+      evidence: {
+        overlappingHunks: false,
+        sharedFiles: ["ui/src/ui/chat/grouped-render.ts"],
+        sharedIssues: [70491],
+      },
+    });
     expect(calls.map((call) => call.slice(0, 2).join(" "))).toEqual([
       "pr view",
       "pr view",
@@ -238,5 +214,46 @@ diff --git a/b.ts b/b.ts
       ["pr", "comment", "70592", "--repo", "openclaw/openclaw", "--body", "closing"],
       ["pr", "close", "70592", "--repo", "openclaw/openclaw"],
     ]);
+  });
+});
+
+describe("defaultRunGh", () => {
+  it("bounds each GitHub lookup with a timeout and SIGKILL", () => {
+    const execFileSyncImpl = vi.fn(() => "result");
+
+    const result = defaultRunGh(["pr", "view", "123"], {}, { execFileSyncImpl });
+
+    expect(result).toBe("result");
+    expect(execFileSyncImpl).toHaveBeenCalledWith(
+      "gh",
+      ["pr", "view", "123"],
+      expect.objectContaining({
+        encoding: "utf8",
+        killSignal: "SIGKILL",
+        stdio: ["ignore", "pipe", "inherit"],
+        timeout: 60_000,
+      }),
+    );
+  });
+
+  it("forwards stdin input while keeping the timeout bound", () => {
+    const execFileSyncImpl = vi.fn(() => "ok");
+
+    defaultRunGh(
+      ["pr", "edit", "123", "--add-label", "duplicate"],
+      { input: "body" },
+      { execFileSyncImpl },
+    );
+
+    expect(execFileSyncImpl).toHaveBeenCalledWith(
+      "gh",
+      ["pr", "edit", "123", "--add-label", "duplicate"],
+      expect.objectContaining({
+        input: "body",
+        killSignal: "SIGKILL",
+        stdio: ["pipe", "pipe", "inherit"],
+        timeout: 60_000,
+      }),
+    );
   });
 });

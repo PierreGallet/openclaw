@@ -1,32 +1,17 @@
 import type { ProviderCatalogContext } from "openclaw/plugin-sdk/provider-catalog-shared";
-import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
+import type {
+  ModelProviderConfig,
+  ProviderPlugin,
+} from "openclaw/plugin-sdk/provider-model-shared";
 import {
   OLLAMA_DEFAULT_API_KEY,
   OLLAMA_PROVIDER_ID,
+  getUnlistedOllamaConfiguredModelIds,
   resolveOllamaDiscoveryResult,
   shouldUseSyntheticOllamaAuth,
   type OllamaPluginConfig,
 } from "./src/discovery-shared.js";
-import { buildOllamaProvider } from "./src/provider-models.js";
-
-type OllamaProviderPlugin = {
-  id: string;
-  label: string;
-  docsPath: string;
-  envVars: string[];
-  auth: [];
-  resolveSyntheticAuth: (ctx: { provider?: string; providerConfig?: ModelProviderConfig }) =>
-    | {
-        apiKey: string;
-        source: string;
-        mode: "api-key";
-      }
-    | undefined;
-  discovery: {
-    order: "late";
-    run: (ctx: ProviderCatalogContext) => ReturnType<typeof runOllamaDiscovery>;
-  };
-};
+import { buildOllamaProvider, capLocalOllamaProviderContext } from "./src/provider-models.js";
 
 function resolveOllamaPluginConfig(ctx: ProviderCatalogContext): OllamaPluginConfig {
   const entries = (ctx.config.plugins?.entries ?? {}) as Record<
@@ -40,17 +25,24 @@ async function runOllamaDiscovery(ctx: ProviderCatalogContext) {
   return await resolveOllamaDiscoveryResult({
     ctx,
     pluginConfig: resolveOllamaPluginConfig(ctx),
-    buildProvider: buildOllamaProvider,
+    buildProvider: async (...args) =>
+      capLocalOllamaProviderContext(await buildOllamaProvider(...args)),
   });
 }
 
-export const ollamaProviderDiscovery: OllamaProviderPlugin = {
+export const ollamaProviderDiscovery = {
   id: OLLAMA_PROVIDER_ID,
   label: "Ollama",
   docsPath: "/providers/ollama",
   envVars: ["OLLAMA_API_KEY"],
   auth: [],
-  resolveSyntheticAuth: ({ provider, providerConfig }) => {
+  resolveSyntheticAuth: ({
+    provider,
+    providerConfig,
+  }: {
+    provider?: string;
+    providerConfig?: ModelProviderConfig;
+  }) => {
     if (!shouldUseSyntheticOllamaAuth(providerConfig)) {
       return undefined;
     }
@@ -60,10 +52,11 @@ export const ollamaProviderDiscovery: OllamaProviderPlugin = {
       mode: "api-key",
     };
   },
-  discovery: {
+  catalog: {
     order: "late",
     run: runOllamaDiscovery,
+    getUnlistedConfiguredModelIds: getUnlistedOllamaConfiguredModelIds,
   },
-};
+} satisfies ProviderPlugin;
 
 export default ollamaProviderDiscovery;

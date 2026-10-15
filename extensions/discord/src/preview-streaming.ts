@@ -1,15 +1,12 @@
 import {
   resolveChannelPreviewStreamMode,
   type StreamingMode,
-} from "openclaw/plugin-sdk/channel-streaming";
-
-type DiscordPreviewStreamMode = StreamingMode;
+} from "openclaw/plugin-sdk/channel-outbound";
 
 export function resolveDiscordPreviewStreamMode(
   params: {
-    streamMode?: unknown;
     streaming?: unknown;
   } = {},
-): DiscordPreviewStreamMode {
-  return resolveChannelPreviewStreamMode(params, "off");
+): StreamingMode {
+  return resolveChannelPreviewStreamMode(params, "progress");
 }

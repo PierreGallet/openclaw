@@ -1,9 +1,12 @@
+// Covers fetch resolution and abort-signal wrapping.
 import { describe, expect, it, vi } from "vitest";
 import { withFetchPreconnect } from "../test-utils/fetch-mock.js";
 import { resolveFetch, wrapFetchWithAbortSignal } from "./fetch.js";
 
 async function waitForMicrotaskTurn(): Promise<void> {
-  await new Promise<void>((resolve) => queueMicrotask(resolve));
+  await new Promise<void>((resolve) => {
+    queueMicrotask(resolve);
+  });
 }
 
 function createForeignSignalHarness() {
@@ -37,7 +40,7 @@ function createThrowingCleanupSignalHarness(cleanupError: Error) {
   });
   const fakeSignal = {
     aborted: false,
-    addEventListener: (_event: string, _handler: () => void) => {},
+    addEventListener: (_eventValue: string, _handler: () => void) => {},
     removeEventListener,
   } as unknown as AbortSignal;
   return { fakeSignal, removeEventListener };
@@ -63,6 +66,17 @@ function createSeenSignalFetch() {
     }),
   );
   return { fetchImpl, getSeenSignal: () => seenSignal };
+}
+
+function createSymbolHeaderInit(enumerable: boolean): RequestInit {
+  const headers = { "Content-Type": "application/json" } as Record<string, string> & {
+    [key: symbol]: unknown;
+  };
+  Object.defineProperty(headers, Symbol("sensitiveHeaders"), {
+    value: new Set(["content-type"]),
+    enumerable,
+  });
+  return { headers };
 }
 
 describe("wrapFetchWithAbortSignal", () => {
@@ -94,7 +108,7 @@ describe("wrapFetchWithAbortSignal", () => {
       duplex: "half",
     } as RequestInit & { duplex: "half" });
 
-    expect(getSeenInit()).toMatchObject({ duplex: "half" });
+    expect((getSeenInit() as (RequestInit & { duplex?: string }) | undefined)?.duplex).toBe("half");
   });
 
   it("converts foreign abort signals to native controllers", async () => {
@@ -135,7 +149,7 @@ describe("wrapFetchWithAbortSignal", () => {
       await Promise.resolve();
       await waitForMicrotaskTurn();
 
-      expect(unhandled).toEqual([]);
+      expect(unhandled).toStrictEqual([]);
       expect(removeEventListener).toHaveBeenCalledOnce();
     } finally {
       process.off("unhandledRejection", onUnhandled);
@@ -269,14 +283,25 @@ describe("wrapFetchWithAbortSignal", () => {
     expect(seenThis).toBe(fetchImpl);
   });
 
-  it("exposes a no-op preconnect when the source fetch has none", () => {
-    const fetchImpl = withFetchPreconnect(vi.fn(async () => ({ ok: true }) as Response));
-    const wrapped = wrapFetchWithAbortSignal(fetchImpl) as typeof fetch & {
-      preconnect: (url: string, init?: { credentials?: RequestCredentials }) => unknown;
-    };
+  it.each([
+    { enumerable: true, name: "enumerable" },
+    { enumerable: false, name: "non-enumerable" },
+  ])(
+    "drops $name header symbol metadata before calling the wrapped fetch",
+    async ({ enumerable }) => {
+      const { fetchImpl, getSeenInit } = createSeenInitFetch();
+      const wrapped = wrapFetchWithAbortSignal(fetchImpl);
+      const init = createSymbolHeaderInit(enumerable);
 
-    expect(() => wrapped.preconnect("https://example.com")).not.toThrow();
-  });
+      await wrapped("https://example.com", init);
+
+      const seenHeaders = getSeenInit()?.headers;
+      expect(seenHeaders).not.toBe(init.headers);
+      expect(Object.getOwnPropertySymbols(seenHeaders as object)).toStrictEqual([]);
+      expect(new Headers(seenHeaders).get("content-type")).toBe("application/json");
+      expect(Object.getOwnPropertySymbols(init.headers as object)).toHaveLength(1);
+    },
+  );
 });
 
 describe("resolveFetch", () => {

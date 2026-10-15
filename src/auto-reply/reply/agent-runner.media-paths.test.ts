@@ -1,315 +1,567 @@
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { setRuntimeConfigSnapshot } from "../../config/config.js";
 import type { TemplateContext } from "../templating.js";
+import type { AgentTurnParams } from "./agent-runner-execution.types.js";
+import {
+  createMediaFollowupRun,
+  createReplyMediaContextRuntimeMock,
+  enqueueFollowupRunMock,
+  makeRunReplyAgentParams,
+  parkSteerCandidateMock,
+  parkedSteerConsumeMock,
+  parkedSteerFallbackMock,
+  queueEmbeddedAgentMessageWithOutcomeAsyncMock,
+  runEmbeddedAgentMock,
+  runReplyAgent,
+  tempDirs,
+  testWorkspaceDir,
+  resetAgentRunnerMediaTestState,
+  cleanupAgentRunnerMediaTestState,
+} from "./agent-runner.media-paths.test-harness.js";
 import type { FollowupRun, QueueSettings } from "./queue.js";
-import { createMockFollowupRun, createMockTypingController } from "./test-helpers.js";
+import { createReplyOperation as createRegisteredReplyOperation } from "./reply-run-registry.js";
+import { prepareReplyToolAuthority } from "./reply-tool-authority.js";
 
-const runEmbeddedPiAgentMock = vi.fn();
-const runWithModelFallbackMock = vi.fn();
-const abortEmbeddedPiRunMock = vi.fn();
-const compactEmbeddedPiSessionMock = vi.fn();
-const isEmbeddedPiRunActiveMock = vi.fn(() => false);
-const isEmbeddedPiRunStreamingMock = vi.fn(() => false);
-const queueEmbeddedPiMessageMock = vi.fn(() => false);
-const resolveEmbeddedSessionLaneMock = vi.fn();
-const waitForEmbeddedPiRunEndMock = vi.fn();
-const enqueueFollowupRunMock = vi.fn();
-const scheduleFollowupDrainMock = vi.fn();
-const refreshQueuedFollowupSessionMock = vi.fn();
-const resolveOutboundAttachmentFromUrlMock = vi.fn();
-const createReplyMediaContextRuntimeMock = vi.fn();
+describe("runReplyAgent media path normalization", () => {
+  beforeEach(resetAgentRunnerMediaTestState);
+  afterEach(cleanupAgentRunnerMediaTestState);
 
-vi.mock("../../agents/model-fallback.js", () => ({
-  runWithModelFallback: (params: {
-    provider: string;
-    model: string;
-    run: (provider: string, model: string) => Promise<unknown>;
-  }) => runWithModelFallbackMock(params),
-  isFallbackSummaryError: (err: unknown) =>
-    err instanceof Error &&
-    err.name === "FallbackSummaryError" &&
-    Array.isArray((err as { attempts?: unknown[] }).attempts),
-}));
+  it.each(["device-a", "device-b"])(
+    "steers active non-streaming prompts from reviewer %s in steer queue mode",
+    async (approvalReviewerDeviceId) => {
+      queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(
+        async (sessionId: string) => ({
+          queued: true,
+          sessionId,
+          target: "embedded_run",
+          gatewayHealth: "live",
+        }),
+      );
+      const followupRun = createMediaFollowupRun({ prompt: "generate chart" });
+      followupRun.run.taskSuggestionDeliveryMode = "gateway";
+      followupRun.run.approvalReviewerDeviceId = "device-a";
 
-vi.mock("../../agents/pi-embedded.js", () => ({
-  abortEmbeddedPiRun: abortEmbeddedPiRunMock,
-  compactEmbeddedPiSession: compactEmbeddedPiSessionMock,
-  isEmbeddedPiRunActive: isEmbeddedPiRunActiveMock,
-  isEmbeddedPiRunStreaming: isEmbeddedPiRunStreamingMock,
-  queueEmbeddedPiMessage: queueEmbeddedPiMessageMock,
-  resolveEmbeddedSessionLane: resolveEmbeddedSessionLaneMock,
-  runEmbeddedPiAgent: runEmbeddedPiAgentMock,
-  waitForEmbeddedPiRunEnd: waitForEmbeddedPiRunEndMock,
-}));
+      const params = await makeRunReplyAgentParams({
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        followupRun,
+      });
+      followupRun.run.approvalReviewerDeviceId = approvalReviewerDeviceId;
 
-vi.mock("../../agents/pi-embedded-runner/runs.js", () => ({
-  queueEmbeddedPiMessage: queueEmbeddedPiMessageMock,
-}));
+      await runReplyAgent(params);
 
-vi.mock("./queue.js", () => ({
-  enqueueFollowupRun: enqueueFollowupRunMock,
-  refreshQueuedFollowupSession: refreshQueuedFollowupSessionMock,
-  resolvePiSteeringModeForQueueMode: (mode: string) => (mode === "queue" ? "one-at-a-time" : "all"),
-  scheduleFollowupDrain: scheduleFollowupDrainMock,
-}));
-
-vi.mock("../../media/outbound-attachment.js", () => ({
-  resolveOutboundAttachmentFromUrl: (...args: unknown[]) =>
-    resolveOutboundAttachmentFromUrlMock(...args),
-}));
-
-// Spy on the .runtime import path used by agent-runner-execution.ts so we can assert
-// that the fix prevents a second media context from being created inside runAgentTurnWithFallback.
-vi.mock("./reply-media-paths.runtime.js", async (importOriginal) => {
-  const mod = await importOriginal<typeof import("./reply-media-paths.runtime.js")>();
-  return {
-    createReplyMediaContext: (...args: Parameters<typeof mod.createReplyMediaContext>) => {
-      createReplyMediaContextRuntimeMock(...args);
-      return mod.createReplyMediaContext(...args);
+      expect(
+        queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls.map(([sessionId, prompt]) => [
+          sessionId,
+          prompt,
+        ]),
+      ).toEqual([["session", "generate chart"]]);
+      expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+      expect(parkedSteerConsumeMock).toHaveBeenCalledOnce();
+      expect(parkedSteerFallbackMock).not.toHaveBeenCalled();
     },
-    createReplyMediaPathNormalizer: mod.createReplyMediaPathNormalizer,
-  };
-});
+  );
 
-let runReplyAgent: typeof import("./agent-runner.js").runReplyAgent;
+  it.each([
+    { label: "permission mode", run: { permissionMode: "guarded" } },
+    { label: "tool overrides", run: { toolOverrides: { webSearch: false } } },
+    { label: "execution policy", run: { execOverrides: { security: "deny" } } },
+    { label: "elevation", run: { elevatedLevel: "full" } },
+    {
+      label: "shell elevation",
+      run: { bashElevated: { enabled: true, allowed: true, defaultLevel: "full" } },
+    },
+    { label: "workspace", run: { workspaceDir: "/tmp/different-steering-workspace" } },
+    { label: "client capabilities", run: { clientCaps: ["changed-capability"] } },
+    {
+      label: "tool bindings",
+      run: { toolBindings: { browser: { clientId: "different-browser" } } },
+    },
+  ] satisfies { label: string; run: Partial<FollowupRun["run"]> }[])(
+    "queues a different browser's prompt when its $label differs",
+    async ({ run }) => {
+      const followupRun = createMediaFollowupRun({
+        prompt: "generate chart",
+        run: { permissionMode: "full", approvalReviewerDeviceId: "device-a" },
+      });
+      const params = await makeRunReplyAgentParams({
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        isRunActive: () => true,
+        followupRun,
+      });
+      followupRun.run = {
+        ...followupRun.run,
+        ...run,
+        approvalReviewerDeviceId: "device-b",
+      };
 
-function makeRunReplyAgentParams(
-  overrides: Partial<Parameters<typeof runReplyAgent>[0]> & {
-    provider?: string;
-    prompt?: string;
-    workspaceDir?: string;
-  } = {},
-): Parameters<typeof runReplyAgent>[0] {
-  const provider = overrides.provider ?? "whatsapp";
-  const prompt = overrides.prompt ?? "generate chart";
-  const workspaceDir = overrides.workspaceDir ?? "/tmp/workspace";
+      await runReplyAgent(params);
 
-  return {
-    commandBody: prompt,
-    followupRun: createMockFollowupRun({
-      prompt,
-      run: {
-        agentId: "main",
-        agentDir: "/tmp/agent",
-        messageProvider: provider,
-        workspaceDir,
+      expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
+      expect(parkedSteerFallbackMock).toHaveBeenCalledOnce();
+      expect(parkSteerCandidateMock).toHaveBeenCalledWith(
+        params.queueKey,
+        followupRun,
+        params.resolvedQueue,
+        expect.any(Function),
+      );
+    },
+  );
+
+  it("does not wait on a queued command source when the target has no reply operation", async () => {
+    const source = createRegisteredReplyOperation({
+      sessionKey: "agent:main:slash:source",
+      sessionId: "command-source",
+      resetTriggered: false,
+    });
+    enqueueFollowupRunMock.mockReturnValueOnce(true);
+    const params = await makeRunReplyAgentParams({
+      replyOperation: source,
+      sessionKey: "main",
+      resolvedQueue: { mode: "steer" },
+      shouldSteer: true,
+      shouldFollowup: true,
+      isActive: true,
+    });
+    await runReplyAgent(params);
+    expect(source.phase).toBe("queued");
+    expect(source.abortSignal.aborted).toBe(false);
+    expect(enqueueFollowupRunMock).toHaveBeenCalledExactlyOnceWith(
+      params.queueKey,
+      params.followupRun,
+      params.resolvedQueue,
+      "message-id",
+      expect.any(Function),
+      false,
+    );
+    expect(parkSteerCandidateMock).not.toHaveBeenCalled();
+    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
+  });
+
+  it("steers ordered current-turn images and quoted context with the active prompt", async () => {
+    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+      queued: true,
+      sessionId,
+      target: "embedded_run",
+      gatewayHealth: "live",
+    }));
+    const images = [
+      { type: "image" as const, data: "first", mimeType: "image/jpeg" },
+      { type: "image" as const, data: "second", mimeType: "image/png" },
+    ];
+    const followupRun = createMediaFollowupRun({ prompt: "compare these" });
+    followupRun.images = images;
+    followupRun.currentInboundContext = {
+      text: "Replied message: Which color for the invitation?",
+    };
+    followupRun.media = [
+      { path: "/tmp/first.jpg", contentType: "image/jpeg" },
+      { path: "/tmp/second.png", contentType: "image/png" },
+    ];
+
+    await runReplyAgent(
+      await makeRunReplyAgentParams({
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        followupRun,
+      }),
+    );
+
+    expect(
+      queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls.map(([sessionId, prompt]) => [
+        sessionId,
+        prompt,
+      ]),
+    ).toEqual([["session", "compare these"]]);
+    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls[0]?.[2]).toMatchObject({
+      images,
+      media: followupRun.media,
+      currentInboundContext: followupRun.currentInboundContext,
+    });
+    expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+    expect(parkedSteerConsumeMock).toHaveBeenCalledOnce();
+    expect(parkedSteerFallbackMock).not.toHaveBeenCalled();
+  });
+
+  it("defers the complete image turn when the active runtime cannot preserve images", async () => {
+    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+      queued: false,
+      sessionId,
+      reason: "image_input_unsupported",
+      gatewayHealth: "live",
+    }));
+    const images = [{ type: "image" as const, data: "png", mimeType: "image/png" }];
+    const followupRun = createMediaFollowupRun({ prompt: "inspect this" });
+    followupRun.images = images;
+
+    await runReplyAgent(
+      await makeRunReplyAgentParams({
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+        followupRun,
+      }),
+    );
+
+    expect(parkSteerCandidateMock).toHaveBeenCalledWith(
+      "main",
+      followupRun,
+      expect.objectContaining({ mode: "steer" }),
+      expect.any(Function),
+    );
+    expect(parkedSteerFallbackMock).toHaveBeenCalledOnce();
+    expect(parkedSteerConsumeMock).not.toHaveBeenCalled();
+    expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+  });
+
+  it("latches audio only after the active reply operation accepts the steer", async () => {
+    const followupRun = {
+      ...createMediaFollowupRun({ prompt: "summarize the audio" }),
+      currentInboundAudio: true,
+    } as unknown as FollowupRun;
+    const operation = createRegisteredReplyOperation({
+      sessionKey: "agent:main:whatsapp:direct:chat-1",
+      sessionId: "session",
+      resetTriggered: false,
+    });
+    operation.setPhase("running");
+    await operation.bindToolAuthoritySnapshotAsync(prepareReplyToolAuthority(followupRun));
+    expect(operation.acceptedSteeredInboundAudio).toBe(false);
+    // An answer sent before this steer must not count as answering it.
+    operation.markSourceReplyDelivered();
+    queueEmbeddedAgentMessageWithOutcomeAsyncMock.mockImplementation(async (sessionId: string) => ({
+      queued: true,
+      sessionId,
+      target: "embedded_run",
+      gatewayHealth: "live",
+    }));
+
+    await runReplyAgent(
+      await makeRunReplyAgentParams({
+        followupRun,
+        replyOperation: operation,
+        sessionKey: "agent:main:whatsapp:direct:chat-1",
+        resolvedQueue: { mode: "steer" } as QueueSettings,
+        shouldSteer: true,
+        shouldFollowup: true,
+        isActive: true,
+      }),
+    );
+
+    expect(operation.acceptedSteeredInboundAudio).toBe(true);
+    expect(operation.sourceReplyDelivered).toBe(false);
+    expect(
+      queueEmbeddedAgentMessageWithOutcomeAsyncMock.mock.calls.map(([sessionId, prompt]) => [
+        sessionId,
+        prompt,
+      ]),
+    ).toEqual([["session", "summarize the audio"]]);
+    expect(enqueueFollowupRunMock).not.toHaveBeenCalled();
+    expect(parkedSteerConsumeMock).toHaveBeenCalledOnce();
+    expect(parkedSteerFallbackMock).not.toHaveBeenCalled();
+  });
+
+  it("queues active prompts in followup mode without steering", async () => {
+    await runReplyAgent(
+      await makeRunReplyAgentParams({
+        resolvedQueue: { mode: "followup" } as QueueSettings,
+        shouldSteer: false,
+        shouldFollowup: true,
+        isActive: true,
+        isRunActive: () => true,
+      }),
+    );
+
+    expect(queueEmbeddedAgentMessageWithOutcomeAsyncMock).not.toHaveBeenCalled();
+    expect(parkSteerCandidateMock).not.toHaveBeenCalled();
+    expect(enqueueFollowupRunMock).toHaveBeenCalledOnce();
+    expect(enqueueFollowupRunMock.mock.calls[0]?.[1].prompt).toBe("generate chart");
+  });
+
+  async function runAgentTurnWithSessionContext(
+    sessionCtx: TemplateContext,
+    prompt = "describe this image",
+    overrides: Partial<AgentTurnParams> = {},
+  ) {
+    const { executeAgentTurn } = await import("./agent-runner-execution.js");
+    const params: AgentTurnParams = {
+      commandBody: prompt,
+      followupRun:
+        overrides.followupRun ??
+        createMediaFollowupRun({
+          prompt,
+          run: {
+            provider: "ollama",
+            model: "gemma4:latest",
+            thinkingCatalog: [
+              { provider: "ollama", id: "gemma4:latest", input: ["text", "image"] },
+            ],
+            workspaceDir: testWorkspaceDir,
+            config: {},
+          },
+        }),
+      sessionCtx,
+      typingSignals: {
+        mode: "instant",
+        shouldStartImmediately: true,
+        shouldStartOnMessageStart: false,
+        shouldStartOnText: true,
+        shouldStartOnReasoning: false,
+        signalRunStart: async () => {},
+        signalMessageStart: async () => {},
+        signalTextDelta: async () => {},
+        signalReasoningDelta: async () => {},
+        signalToolStart: async () => {},
       },
-    }) as unknown as FollowupRun,
-    queueKey: "main",
-    resolvedQueue: { mode: "interrupt" } as QueueSettings,
-    shouldSteer: false,
-    shouldFollowup: false,
-    isActive: false,
-    isStreaming: false,
-    typing: createMockTypingController(),
-    sessionCtx: {
-      Provider: provider,
-      Surface: provider,
+      blockReplyPipeline: null,
+      blockStreamingEnabled: false,
+      resolvedBlockStreamingBreak: "message_end",
+      applyReplyToMode: (payload) => payload,
+      shouldEmitToolResult: () => false,
+      shouldEmitToolOutput: () => false,
+      pendingToolTasks: new Set(),
+      isHeartbeat: false,
+      sessionKey: "main",
+      getActiveSessionEntry: () => undefined,
+      resolvedVerboseLevel: "off",
+      replyMediaContext: {
+        normalizePayload: async (payload) => payload,
+      },
+      ...overrides,
+    };
+    setRuntimeConfigSnapshot(params.followupRun.run.config);
+    return await executeAgentTurn(params);
+  }
+
+  it.each([true, false])(
+    "keeps the prepared global owner in executeAgentTurn (provided context: %s)",
+    async (providedContext) => {
+      // Regression test for openclaw/openclaw#68056.
+      // executeAgentTurn must use the caller-provided context so block
+      // replies and final replies can share one media cache.
+      runEmbeddedAgentMock.mockResolvedValue({
+        payloads: [],
+        meta: {
+          agentMeta: {
+            sessionId: "session",
+            provider: "anthropic",
+            model: "claude",
+          },
+        },
+      });
+
+      const followupRun = createMediaFollowupRun({
+        prompt: "generate",
+        run: {
+          agentId: "qa",
+          sessionKey: "global",
+          provider: "anthropic",
+          model: "claude",
+          thinkingCatalog: [{ provider: "anthropic", id: "claude", input: ["text"] }],
+          workspaceDir: testWorkspaceDir,
+          config: { agents: { ownership: "explicit", entries: { qa: {}, beta: {} } } },
+        },
+      });
+      setRuntimeConfigSnapshot(followupRun.run.config, followupRun.run.config);
+      const result = await runAgentTurnWithSessionContext(
+        {
+          Provider: "telegram",
+          Surface: "telegram",
+          To: "chat-1",
+          OriginatingTo: "chat-1",
+          AccountId: "default",
+          MessageSid: "msg-1",
+        },
+        "generate",
+        {
+          followupRun,
+          blockStreamingEnabled: true,
+          sessionKey: "global",
+          replyMediaContext: providedContext
+            ? {
+                normalizePayload: async (payload) => payload,
+              }
+            : undefined,
+        },
+      );
+
+      // Execution creates a context only when the caller did not provide one.
+      if (providedContext) {
+        expect(createReplyMediaContextRuntimeMock).not.toHaveBeenCalled();
+      } else {
+        expect(createReplyMediaContextRuntimeMock).toHaveBeenCalledOnce();
+        expect(createReplyMediaContextRuntimeMock).toHaveBeenCalledWith(
+          expect.objectContaining({ cfg: followupRun.run.config, sessionKey: "global" }),
+        );
+      }
+      expect(result.outcome).toMatchObject({ kind: "settled", status: "ok" });
+      expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("passes current inbound media paths as native OpenClaw images", async () => {
+    const tmpDir = tempDirs.make("openclaw-native-agent-media-");
+    const imagePath = path.join(tmpDir, "photo.png");
+    await writeFile(
+      imagePath,
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        "base64",
+      ),
+    );
+    runEmbeddedAgentMock.mockResolvedValue({
+      payloads: [{ text: "ok" }],
+      meta: {
+        agentMeta: {
+          sessionId: "session",
+          provider: "ollama",
+          model: "gemma4:latest",
+        },
+      },
+    });
+
+    await runAgentTurnWithSessionContext({
+      Provider: "telegram",
+      Surface: "telegram",
       To: "chat-1",
       OriginatingTo: "chat-1",
       AccountId: "default",
       MessageSid: "msg-1",
-    } as unknown as TemplateContext,
-    defaultModel: "anthropic/claude",
-    resolvedVerboseLevel: "off",
-    isNewSession: false,
-    blockStreamingEnabled: false,
-    resolvedBlockStreamingBreak: "message_end",
-    shouldInjectGroupIntro: false,
-    typingMode: "instant",
-    ...overrides,
-  };
-}
+      media: [{ path: imagePath, contentType: "image/png", workspaceDir: tmpDir }],
+    } as unknown as TemplateContext);
 
-describe("runReplyAgent media path normalization", () => {
-  beforeAll(async () => {
-    ({ runReplyAgent } = await import("./agent-runner.js"));
+    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
+    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as
+      | {
+          images?: Array<{ type?: string; data?: string; mimeType?: string }>;
+          imageOrder?: string[];
+        }
+      | undefined;
+    expect(call).toMatchObject({ modelHasVision: true });
+    expect(call?.images).toEqual([
+      {
+        type: "image",
+        data: expect.any(String),
+        mimeType: "image/png",
+      },
+    ]);
+    expect(call?.images?.[0]?.data).toHaveLength(92);
+    expect(call?.imageOrder).toEqual(["inline"]);
   });
 
-  beforeEach(() => {
-    runEmbeddedPiAgentMock.mockReset();
-    runWithModelFallbackMock.mockReset();
-    abortEmbeddedPiRunMock.mockReset();
-    compactEmbeddedPiSessionMock.mockReset();
-    isEmbeddedPiRunActiveMock.mockReset();
-    isEmbeddedPiRunActiveMock.mockReturnValue(false);
-    isEmbeddedPiRunStreamingMock.mockReset();
-    isEmbeddedPiRunStreamingMock.mockReturnValue(false);
-    queueEmbeddedPiMessageMock.mockReset();
-    queueEmbeddedPiMessageMock.mockReturnValue(false);
-    resolveEmbeddedSessionLaneMock.mockReset();
-    waitForEmbeddedPiRunEndMock.mockReset();
-    enqueueFollowupRunMock.mockReset();
-    scheduleFollowupDrainMock.mockReset();
-    refreshQueuedFollowupSessionMock.mockReset();
-    resolveOutboundAttachmentFromUrlMock.mockReset();
-    createReplyMediaContextRuntimeMock.mockReset();
-    vi.stubEnv("OPENCLAW_TEST_FAST", "1");
-    resolveOutboundAttachmentFromUrlMock.mockImplementation(async (mediaUrl: string) => ({
-      path: path.join("/tmp/outbound-media", path.basename(mediaUrl)),
-    }));
-    runWithModelFallbackMock.mockImplementation(
-      async ({
-        provider,
-        model,
-        run,
-      }: {
-        provider: string;
-        model: string;
-        run: (...args: unknown[]) => Promise<unknown>;
-      }) => ({
-        result: await run(provider, model),
-        provider,
-        model,
-      }),
+  it("does not pass recent history images as unlabeled native OpenClaw images", async () => {
+    const tmpDir = tempDirs.make("openclaw-native-agent-history-");
+    const imagePath = path.join(tmpDir, "recent.png");
+    await writeFile(
+      imagePath,
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        "base64",
+      ),
     );
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it("normalizes final MEDIA replies against the run workspace", async () => {
-    runEmbeddedPiAgentMock.mockResolvedValue({
-      payloads: [{ text: "MEDIA:./out/generated.png" }],
+    runEmbeddedAgentMock.mockResolvedValue({
+      payloads: [{ text: "ok" }],
       meta: {
         agentMeta: {
           sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
+          provider: "ollama",
+          model: "gemma4:latest",
         },
       },
     });
 
-    const result = await runReplyAgent(
-      makeRunReplyAgentParams({
-        provider: "telegram",
-        prompt: "generate",
-      }),
-    );
-
-    expect(result).toMatchObject({
-      mediaUrl: "/tmp/outbound-media/generated.png",
-      mediaUrls: ["/tmp/outbound-media/generated.png"],
-    });
-    expect(resolveOutboundAttachmentFromUrlMock).toHaveBeenCalledWith(
-      path.join("/tmp/workspace", "out", "generated.png"),
-      5 * 1024 * 1024,
-      expect.objectContaining({
-        mediaAccess: expect.objectContaining({
-          workspaceDir: "/tmp/workspace",
-        }),
-      }),
-    );
-  });
-
-  it("maps steer queue modes to Pi steering drain modes", async () => {
-    queueEmbeddedPiMessageMock.mockReturnValue(true);
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        resolvedQueue: { mode: "steer" } as QueueSettings,
-        shouldSteer: true,
-        isStreaming: true,
-      }),
-    );
-
-    expect(queueEmbeddedPiMessageMock).toHaveBeenLastCalledWith("session", "generate chart", {
-      steeringMode: "all",
-    });
-
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        resolvedQueue: { mode: "queue" } as QueueSettings,
-        shouldSteer: true,
-        isStreaming: true,
-      }),
-    );
-
-    expect(queueEmbeddedPiMessageMock).toHaveBeenLastCalledWith("session", "generate chart", {
-      steeringMode: "one-at-a-time",
-    });
-  });
-
-  it("shares one media cache between block accumulation and final payload delivery", async () => {
-    let stagedIndex = 0;
-    resolveOutboundAttachmentFromUrlMock.mockImplementation(async (mediaUrl: string) => {
-      stagedIndex += 1;
-      return {
-        path: path.join("/tmp/outbound-media", `${stagedIndex}-${path.basename(mediaUrl)}`),
-      };
-    });
-    const onBlockReply = vi.fn();
-    runEmbeddedPiAgentMock.mockImplementation(
-      async (params: {
-        onBlockReply?: (payload: { text?: string; mediaUrls?: string[] }) => Promise<void>;
-      }) => {
-        await params.onBlockReply?.({
-          text: "here is the chart\nMEDIA:./out/chart.png",
-        });
-        return {
-          payloads: [{ text: "here is the chart\nMEDIA:./out/chart.png" }],
-          meta: {
-            agentMeta: {
-              sessionId: "session",
-              provider: "anthropic",
-              model: "claude",
-            },
+    await runAgentTurnWithSessionContext(
+      {
+        Provider: "telegram",
+        Surface: "telegram",
+        To: "chat-1",
+        OriginatingTo: "chat-1",
+        AccountId: "default",
+        MessageSid: "msg-1",
+        Timestamp: 1_700_000_000_000,
+        InboundHistory: [
+          {
+            sender: "alice",
+            body: "<media:image>",
+            timestamp: 1_700_000_000_000,
+            media: [{ path: imagePath, contentType: "image/png", kind: "image" }],
           },
-        };
-      },
+        ],
+      } as unknown as TemplateContext,
+      "what did we discuss?",
     );
 
-    const result = await runReplyAgent(
-      makeRunReplyAgentParams({
-        opts: {
-          onBlockReply,
-        },
-      }),
-    );
-
-    expect(result).toMatchObject({
-      text: "here is the chart",
-      mediaUrl: "/tmp/outbound-media/1-chart.png",
-      mediaUrls: ["/tmp/outbound-media/1-chart.png"],
-      replyToId: "msg-1",
-      replyToTag: false,
-      audioAsVoice: false,
-    });
-    expect(resolveOutboundAttachmentFromUrlMock).toHaveBeenCalledTimes(1);
-    expect(onBlockReply).not.toHaveBeenCalled();
+    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
+    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as
+      | {
+          images?: Array<{ type?: string; data?: string; mimeType?: string }>;
+          imageOrder?: string[];
+        }
+      | undefined;
+    expect(call?.images).toBeUndefined();
+    expect(call?.imageOrder).toBeUndefined();
   });
 
-  it("does not create a second media context inside runAgentTurnWithFallback when onBlockReply is provided", async () => {
-    // Regression test for openclaw/openclaw#68056.
-    // Before the fix, runAgentTurnWithFallback created its own media context, separate from
-    // the one agent-runner.ts created and passed to buildReplyPayloads. Two separate caches
-    // meant the same source could be persisted twice (two UUID outbound files, two sends).
-    //
-    // After the fix, agent-runner.ts passes its media context into runAgentTurnWithFallback, so
-    // the .runtime import path is never called from inside that function.
-    runEmbeddedPiAgentMock.mockResolvedValue({
-      payloads: [],
+  it("retains resolved current images and skips unresolved attachments", async () => {
+    const tmpDir = tempDirs.make("openclaw-native-agent-partial-");
+    const imagePath = path.join(tmpDir, "present.png");
+    await writeFile(
+      imagePath,
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+        "base64",
+      ),
+    );
+    runEmbeddedAgentMock.mockResolvedValue({
+      payloads: [{ text: "ok" }],
       meta: {
         agentMeta: {
           sessionId: "session",
-          provider: "anthropic",
-          model: "claude",
+          provider: "ollama",
+          model: "gemma4:latest",
         },
       },
     });
 
-    await runReplyAgent(
-      makeRunReplyAgentParams({
-        opts: {
-          onBlockReply: vi.fn(),
-        },
-      }),
+    await runAgentTurnWithSessionContext(
+      {
+        Provider: "telegram",
+        Surface: "telegram",
+        To: "chat-1",
+        OriginatingTo: "chat-1",
+        AccountId: "default",
+        MessageSid: "msg-1",
+        media: [
+          {
+            path: path.join(tmpDir, "missing.png"),
+            contentType: "image/png",
+            workspaceDir: tmpDir,
+          },
+          { path: imagePath, contentType: "image/png", workspaceDir: tmpDir },
+        ],
+      } as unknown as TemplateContext,
+      "compare these images",
     );
 
-    // The .runtime import is only used by agent-runner-execution.ts. After the fix,
-    // runAgentTurnWithFallback receives the context from the caller and never
-    // creates its own.
-    expect(createReplyMediaContextRuntimeMock).not.toHaveBeenCalled();
+    expect(runEmbeddedAgentMock).toHaveBeenCalledOnce();
+    const call = runEmbeddedAgentMock.mock.calls[0]?.[0] as
+      | {
+          images?: Array<{ type?: string; data?: string; mimeType?: string }>;
+          imageOrder?: string[];
+        }
+      | undefined;
+    expect(call?.images).toHaveLength(1);
+    expect(call?.images?.[0]).toMatchObject({ type: "image", mimeType: "image/png" });
+    expect(call?.imageOrder).toEqual(["inline"]);
   });
 });

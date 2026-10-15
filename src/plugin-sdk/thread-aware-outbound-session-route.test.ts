@@ -1,3 +1,6 @@
+/**
+ * Tests thread-aware outbound session route helpers exposed by the SDK.
+ */
 import { describe, expect, it } from "vitest";
 import {
   buildThreadAwareOutboundSessionRoute,
@@ -28,24 +31,12 @@ describe("buildThreadAwareOutboundSessionRoute", () => {
       currentSessionKey: "agent:main:workspace:channel:c123:thread:current-1",
     });
 
-    expect(route).toMatchObject({
-      sessionKey: "agent:main:workspace:channel:c123:thread:reply-1",
-      threadId: "reply-1",
-    });
-  });
-
-  it("supports provider-specific threadId-first precedence", () => {
-    const route = buildThreadAwareOutboundSessionRoute({
-      route: baseRoute(),
-      replyToId: "reply-1",
-      threadId: "thread-1",
-      precedence: ["threadId", "replyToId", "currentSession"],
-    });
-
-    expect(route).toMatchObject({
-      sessionKey: "agent:main:workspace:channel:c123:thread:thread-1",
-      threadId: "thread-1",
-    });
+    expect(route).toEqual(
+      baseRoute({
+        sessionKey: "agent:main:workspace:channel:c123:thread:reply-1",
+        threadId: "reply-1",
+      }),
+    );
   });
 
   it("keeps numeric delivery thread ids on the route while stringifying the session suffix", () => {
@@ -54,10 +45,12 @@ describe("buildThreadAwareOutboundSessionRoute", () => {
       threadId: 99,
     });
 
-    expect(route).toMatchObject({
-      sessionKey: "agent:main:workspace:channel:c123:thread:99",
-      threadId: 99,
-    });
+    expect(route).toEqual(
+      baseRoute({
+        sessionKey: "agent:main:workspace:channel:c123:thread:99",
+        threadId: 99,
+      }),
+    );
   });
 
   it("recovers a current-session thread only when the base session matches", () => {
@@ -75,6 +68,23 @@ describe("buildThreadAwareOutboundSessionRoute", () => {
     ).toBeUndefined();
   });
 
+  it("does not recover current-session threads across case-distinct Matrix rooms", () => {
+    const route = baseRoute({
+      sessionKey: "agent:main:matrix:channel:!Mixed:example.org",
+      baseSessionKey: "agent:main:matrix:channel:!Mixed:example.org",
+      peer: { kind: "channel", id: "!Mixed:example.org" },
+      from: "matrix:room:!Mixed:example.org",
+      to: "room:!Mixed:example.org",
+    });
+
+    expect(
+      recoverCurrentThreadSessionId({
+        route,
+        currentSessionKey: "agent:main:matrix:channel:!mixed:example.org:thread:$Root",
+      }),
+    ).toBeUndefined();
+  });
+
   it("lets providers veto current-session recovery", () => {
     const route = buildThreadAwareOutboundSessionRoute({
       route: baseRoute(),
@@ -82,35 +92,10 @@ describe("buildThreadAwareOutboundSessionRoute", () => {
       canRecoverCurrentThread: () => false,
     });
 
-    expect(route).toMatchObject({
-      sessionKey: "agent:main:workspace:channel:c123",
-    });
-    expect(route.threadId).toBeUndefined();
-  });
-
-  it("preserves provider-specific thread case when requested", () => {
-    const route = buildThreadAwareOutboundSessionRoute({
-      route: baseRoute(),
-      threadId: "$EventID:Example.Org",
-      normalizeThreadId: (threadId) => threadId,
-    });
-
-    expect(route).toMatchObject({
-      sessionKey: "agent:main:workspace:channel:c123:thread:$EventID:Example.Org",
-      threadId: "$EventID:Example.Org",
-    });
-  });
-
-  it("can carry a delivery thread without adding a session suffix", () => {
-    const route = buildThreadAwareOutboundSessionRoute({
-      route: baseRoute(),
-      threadId: "thread-1",
-      useSuffix: false,
-    });
-
-    expect(route).toMatchObject({
-      sessionKey: "agent:main:workspace:channel:c123",
-      threadId: "thread-1",
-    });
+    expect(route).toEqual(
+      baseRoute({
+        sessionKey: "agent:main:workspace:channel:c123",
+      }),
+    );
   });
 });

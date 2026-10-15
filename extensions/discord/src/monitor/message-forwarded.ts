@@ -1,8 +1,8 @@
 import type { APIAttachment, APIStickerItem } from "discord-api-types/v10";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { Message } from "../internal/discord.js";
 
-export type DiscordSnapshotAuthor = {
+type DiscordSnapshotAuthor = {
   id?: string | null;
   username?: string | null;
   discriminator?: string | null;
@@ -20,13 +20,13 @@ export type DiscordSnapshotMessage = {
   author?: DiscordSnapshotAuthor | null;
 };
 
-export type DiscordMessageSnapshot = {
+type DiscordMessageSnapshot = {
   message?: DiscordSnapshotMessage | null;
 };
 
 const FORWARD_MESSAGE_REFERENCE_TYPE = 1;
 
-export function normalizeDiscordStickerItems(value: unknown): APIStickerItem[] {
+function normalizeDiscordStickerItems(value: unknown): APIStickerItem[] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -39,19 +39,19 @@ export function normalizeDiscordStickerItems(value: unknown): APIStickerItem[] {
   );
 }
 
-export function resolveDiscordMessageStickers(message: Message): APIStickerItem[] {
-  const stickers = (message as { stickers?: unknown }).stickers;
-  const normalized = normalizeDiscordStickerItems(stickers);
+export function resolveDiscordMessageStickers(message: {
+  stickers?: unknown;
+  sticker_items?: unknown;
+  rawData?: { sticker_items?: unknown; stickers?: unknown };
+}): APIStickerItem[] {
+  const normalized = normalizeDiscordStickerItems(message.stickers);
   if (normalized.length > 0) {
     return normalized;
   }
-  const rawData = (message as { rawData?: { sticker_items?: unknown; stickers?: unknown } })
-    .rawData;
-  return normalizeDiscordStickerItems(rawData?.sticker_items ?? rawData?.stickers);
-}
-
-export function resolveDiscordSnapshotStickers(snapshot: DiscordSnapshotMessage): APIStickerItem[] {
-  return normalizeDiscordStickerItems(snapshot.stickers ?? snapshot.sticker_items);
+  const rawData = message.rawData;
+  return normalizeDiscordStickerItems(
+    message.sticker_items ?? rawData?.sticker_items ?? rawData?.stickers,
+  );
 }
 
 export function hasDiscordMessageStickers(message: Message): boolean {
@@ -83,6 +83,25 @@ export function resolveDiscordReferencedForwardMessage(message: Message): Messag
     : null;
 }
 
+export function resolveDiscordReferencedReplyMessage(message: Message): Message | null {
+  const referenceType = message.messageReference?.type;
+  return Number(referenceType) === FORWARD_MESSAGE_REFERENCE_TYPE
+    ? null
+    : (message.referencedMessage ?? null);
+}
+
+export function resolveDiscordReferencedReplyMessageId(message: Message): string | null {
+  const referenceType = message.messageReference?.type;
+  if (Number(referenceType) === FORWARD_MESSAGE_REFERENCE_TYPE) {
+    return null;
+  }
+  return (
+    normalizeOptionalString(message.messageReference?.message_id) ??
+    normalizeOptionalString(message.referencedMessage?.id) ??
+    null
+  );
+}
+
 export function formatDiscordSnapshotAuthor(
   author: DiscordSnapshotAuthor | null | undefined,
 ): string | undefined {
@@ -93,15 +112,9 @@ export function formatDiscordSnapshotAuthor(
   const username = normalizeOptionalString(author.username) ?? undefined;
   const name = normalizeOptionalString(author.name) ?? undefined;
   const discriminator = normalizeOptionalString(author.discriminator) ?? undefined;
-  const base = globalName || username || name;
+  const base = globalName || username || name || author.id;
   if (username && discriminator && discriminator !== "0") {
     return `@${username}#${discriminator}`;
   }
-  if (base) {
-    return `@${base}`;
-  }
-  if (author.id) {
-    return `@${author.id}`;
-  }
-  return undefined;
+  return base ? `@${base}` : undefined;
 }

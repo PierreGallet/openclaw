@@ -1,16 +1,34 @@
+// Preaction tests cover CLI preaction hooks and command context setup.
 import { Command } from "commander";
 import { repoInstallSpec } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { loggingState } from "../../logging/state.js";
+import { captureEnv } from "../../test-utils/env.js";
+import { isConfigSetJsonParseOnly } from "../config-output-mode.js";
 import { setCommandJsonMode } from "./json-mode.js";
+import {
+  registerPreActionCommandFixtures,
+  registerNativeExecutorPreActionTests,
+} from "./preaction.test-helpers.js";
 
 const DISCORD_REPO_INSTALL_SPEC = repoInstallSpec("discord");
 
 const setVerboseMock = vi.fn();
 const emitCliBannerMock = vi.fn();
-const ensureConfigReadyMock = vi.fn(async () => {});
+type EnsureConfigReadyOptions = {
+  allowInvalid?: boolean;
+  beforeStatePreparation?: () => Promise<boolean>;
+  commandPath?: string[];
+  requireConfig?: boolean;
+};
+const ensureConfigReadyMock = vi.fn<(_opts: EnsureConfigReadyOptions) => Promise<void>>(
+  async () => {},
+);
 const ensurePluginRegistryLoadedMock = vi.fn();
 const routeLogsToStderrMock = vi.fn();
+const prepareGatewayRunBootstrapMock = vi.fn(async () => true);
+const recheckGatewayRunBootstrapMock = vi.fn(async () => true);
+const reloadTrustedGatewayRunEnvironmentMock = vi.fn(async () => true);
 
 const runtimeMock = {
   log: vi.fn(),
@@ -36,10 +54,6 @@ vi.mock("../../logging/console.js", () => ({
   routeLogsToStderr: routeLogsToStderrMock,
 }));
 
-vi.mock("../cli-name.js", () => ({
-  resolveCliName: () => "openclaw",
-}));
-
 vi.mock("./config-guard.js", () => ({
   ensureConfigReady: ensureConfigReadyMock,
 }));
@@ -48,14 +62,24 @@ vi.mock("../plugin-registry.js", () => ({
   ensurePluginRegistryLoaded: ensurePluginRegistryLoadedMock,
 }));
 
+vi.mock("../state-dir-gateway-check.js", () => ({
+  checkCliGatewayStateDir: vi.fn(async () => ({ kind: "allow" })),
+}));
+
+vi.mock("../gateway-cli/pre-bootstrap.js", () => ({
+  prepareGatewayRunBootstrap: prepareGatewayRunBootstrapMock,
+  recheckGatewayRunBootstrap: recheckGatewayRunBootstrapMock,
+  reloadTrustedGatewayRunEnvironment: reloadTrustedGatewayRunEnvironmentMock,
+}));
+
 let registerPreActionHooks: typeof import("./preaction.js").registerPreActionHooks;
 let originalProcessArgv: string[];
 let originalProcessTitle: string;
 let originalProcessTitleDescriptor: PropertyDescriptor | undefined;
 let observedProcessTitle: string;
-let originalNodeNoWarnings: string | undefined;
-let originalHideBanner: string | undefined;
+let originalEnv: ReturnType<typeof captureEnv>;
 let originalForceStderr: boolean;
+let originalEarlyConsoleRoutingRestore: boolean | null;
 
 beforeAll(async () => {
   ({ registerPreActionHooks } = await import("./preaction.js"));
@@ -67,9 +91,9 @@ beforeEach(() => {
   originalProcessTitle = process.title;
   originalProcessTitleDescriptor = Object.getOwnPropertyDescriptor(process, "title");
   observedProcessTitle = originalProcessTitle;
-  originalNodeNoWarnings = process.env.NODE_NO_WARNINGS;
-  originalHideBanner = process.env.OPENCLAW_HIDE_BANNER;
+  originalEnv = captureEnv(["NODE_NO_WARNINGS", "OPENCLAW_HIDE_BANNER"]);
   originalForceStderr = loggingState.forceConsoleToStderr;
+  originalEarlyConsoleRoutingRestore = loggingState.earlyConsoleRoutingRestore;
   // Worker-thread Vitest runs do not reliably mutate the real process title,
   // so capture writes at the property boundary instead.
   Object.defineProperty(process, "title", {
@@ -81,6 +105,7 @@ beforeEach(() => {
     },
   });
   loggingState.forceConsoleToStderr = false;
+  loggingState.earlyConsoleRoutingRestore = null;
   delete process.env.NODE_NO_WARNINGS;
   delete process.env.OPENCLAW_HIDE_BANNER;
 });
@@ -98,86 +123,38 @@ afterEach(() => {
     process.title = originalProcessTitle;
   }
   loggingState.forceConsoleToStderr = originalForceStderr;
-  if (originalNodeNoWarnings === undefined) {
-    delete process.env.NODE_NO_WARNINGS;
-  } else {
-    process.env.NODE_NO_WARNINGS = originalNodeNoWarnings;
-  }
-  if (originalHideBanner === undefined) {
-    delete process.env.OPENCLAW_HIDE_BANNER;
-  } else {
-    process.env.OPENCLAW_HIDE_BANNER = originalHideBanner;
-  }
+  loggingState.earlyConsoleRoutingRestore = originalEarlyConsoleRoutingRestore;
+  originalEnv.restore();
 });
 
 describe("registerPreActionHooks", () => {
   let program: Command;
-  let preActionHook:
-    | ((thisCommand: Command, actionCommand: Command) => Promise<void> | void)
-    | null = null;
+  let preActionHook: Parameters<Command["hook"]>[1] | null = null;
 
   function buildProgram() {
-    const program = new Command().name("openclaw");
-    program
-      .command("agent")
-      .requiredOption("-m, --message <text>")
-      .option("--local")
-      .option("--json")
-      .action(() => {});
-    program
-      .command("status")
-      .option("--json")
-      .action(() => {});
-    program
-      .command("backup")
-      .command("create")
-      .option("--json")
-      .action(() => {});
-    program.command("doctor").action(() => {});
-    program.command("completion").action(() => {});
-    program.command("secrets").action(() => {});
-    program
-      .command("agents")
-      .command("list")
-      .option("--json")
-      .action(() => {});
-    program.command("configure").action(() => {});
-    program.command("onboard").action(() => {});
-    const channels = program.command("channels");
-    channels.command("add").action(() => {});
-    channels
-      .command("send")
-      .option("--json")
-      .action(() => {});
-    program
-      .command("plugins")
-      .command("install")
-      .argument("<spec>")
-      .option("--marketplace <marketplace>")
-      .action(() => {});
-    program
-      .command("update")
-      .command("status")
-      .option("--json")
-      .action(() => {});
-    program
-      .command("message")
-      .command("send")
-      .option("--json")
-      .action(() => {});
-    const config = program.command("config");
-    setCommandJsonMode(config.command("set"), "parse-only")
+    const programLocal = new Command().name("openclaw").enablePositionalOptions();
+    registerPreActionCommandFixtures(programLocal);
+    const config = programLocal.command("config");
+    config.option("--section <section>");
+    setCommandJsonMode(config.command("set"), "parse-only", ({ argv }) =>
+      isConfigSetJsonParseOnly(argv),
+    )
       .argument("<path>")
       .argument("<value>")
       .option("--json")
+      .action(() => {});
+    config.command("file").action(() => {});
+    config
+      .command("unset")
+      .argument("<path>")
       .action(() => {});
     config
       .command("validate")
       .option("--json")
       .action(() => {});
     config.command("schema").action(() => {});
-    registerPreActionHooks(program, "9.9.9-test");
-    return program;
+    registerPreActionHooks(programLocal, "9.9.9-test");
+    return programLocal;
   }
 
   function resolveActionCommand(parseArgv: string[]): Command {
@@ -193,7 +170,7 @@ describe("registerPreActionHooks", () => {
   }
 
   async function runPreAction(params: { parseArgv: string[]; processArgv?: string[] }) {
-    process.argv = params.processArgv ?? [...params.parseArgv];
+    process.argv = params.processArgv ?? ["node", "openclaw", ...params.parseArgv];
     const actionCommand = resolveActionCommand(params.parseArgv);
     if (!preActionHook) {
       throw new Error("missing preAction hook");
@@ -201,36 +178,63 @@ describe("registerPreActionHooks", () => {
     await preActionHook(program, actionCommand);
   }
 
-  it("handles debug mode and config-only command preaction", async () => {
-    const processTitleSetSpy = vi.spyOn(process, "title", "set");
-    await runPreAction({
-      parseArgv: ["status"],
-      processArgv: ["node", "openclaw", "status", "--debug"],
-    });
+  registerNativeExecutorPreActionTests(() => registerPreActionHooks, {
+    config: ensureConfigReadyMock,
+    plugins: ensurePluginRegistryLoadedMock,
+    banner: emitCliBannerMock,
+  });
 
-    expect(emitCliBannerMock).toHaveBeenCalledWith("9.9.9-test");
-    expect(setVerboseMock).toHaveBeenCalledWith(true);
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
+  it("runs gateway pre-bootstrap before full-CLI gateway bootstrap", async () => {
+    prepareGatewayRunBootstrapMock.mockResolvedValueOnce(false);
+    const gatewayRunCommand = resolveActionCommand(["gateway", "run"]);
+    gatewayRunCommand.setOptionValueWithSource("force", true, "cli");
+    try {
+      await runPreAction({
+        parseArgv: ["gateway", "run"],
+        processArgv: [
+          "node",
+          "openclaw",
+          "--log-level",
+          "debug",
+          "gateway",
+          "run",
+          "--raw-stream-path",
+          "--reset",
+          "--force",
+        ],
+      });
+    } finally {
+      gatewayRunCommand.setOptionValueWithSource("force", false, "default");
+    }
+
+    expect(prepareGatewayRunBootstrapMock).toHaveBeenCalledWith({
+      opts: expect.objectContaining({ force: true, reset: false }),
       runtime: runtimeMock,
-      commandPath: ["status"],
     });
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
-    expect(processTitleSetSpy).toHaveBeenCalledWith("openclaw-status");
+    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+  });
 
-    vi.clearAllMocks();
+  it("passes the gateway config recheck to the state migration boundary", async () => {
     await runPreAction({
-      parseArgv: ["agents", "list"],
-      processArgv: ["node", "openclaw", "agents", "list"],
+      parseArgv: ["gateway", "run"],
     });
 
-    expect(setVerboseMock).toHaveBeenCalledWith(false);
-    expect(process.env.NODE_NO_WARNINGS).toBe("1");
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
+    expect(ensureConfigReadyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        beforeStatePreparation: expect.any(Function),
+        commandPath: ["gateway", "run"],
+        measure: expect.any(Function),
+      }),
+    );
+    const beforeStatePreparation = ensureConfigReadyMock.mock.calls[0]?.[0]?.beforeStatePreparation;
+    await beforeStatePreparation?.();
+    expect(recheckGatewayRunBootstrapMock).toHaveBeenCalledWith({
+      opts: expect.objectContaining({ force: false, reset: false }),
       runtime: runtimeMock,
-      commandPath: ["agents", "list"],
     });
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
-    processTitleSetSpy.mockRestore();
+    expect(reloadTrustedGatewayRunEnvironmentMock).toHaveBeenCalledWith({
+      runtime: runtimeMock,
+    });
   });
 
   it("loads plugins for text local agent runs", async () => {
@@ -241,23 +245,8 @@ describe("registerPreActionHooks", () => {
 
     expect(ensureConfigReadyMock).toHaveBeenCalledWith({
       runtime: runtimeMock,
-      commandPath: ["agent", "hi"],
-    });
-    expect(ensurePluginRegistryLoadedMock).toHaveBeenCalledWith({
-      scope: "all",
-    });
-  });
-
-  it("loads plugins for json local agent runs", async () => {
-    await runPreAction({
-      parseArgv: ["agent"],
-      processArgv: ["node", "openclaw", "agent", "--local", "--message", "hi", "--json"],
-    });
-
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["agent", "hi"],
-      suppressDoctorStdout: true,
+      measure: expect.any(Function),
+      commandPath: ["agent"],
     });
     expect(ensurePluginRegistryLoadedMock).toHaveBeenCalledWith({
       scope: "all",
@@ -267,11 +256,11 @@ describe("registerPreActionHooks", () => {
   it("keeps setup alias and channels add manifest-first", async () => {
     await runPreAction({
       parseArgv: ["onboard"],
-      processArgv: ["node", "openclaw", "onboard"],
     });
 
     expect(ensureConfigReadyMock).toHaveBeenCalledWith({
       runtime: runtimeMock,
+      measure: expect.any(Function),
       commandPath: ["onboard"],
     });
     expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
@@ -279,79 +268,51 @@ describe("registerPreActionHooks", () => {
     vi.clearAllMocks();
     await runPreAction({
       parseArgv: ["channels", "add"],
-      processArgv: ["node", "openclaw", "channels", "add"],
     });
 
     expect(ensureConfigReadyMock).toHaveBeenCalledWith({
       runtime: runtimeMock,
+      measure: expect.any(Function),
       commandPath: ["channels", "add"],
     });
     expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
   });
 
-  it("lets configure own config validation and plugin loading", async () => {
+  it("skips startup bootstrap for parent default help actions", async () => {
     await runPreAction({
-      parseArgv: ["configure"],
-      processArgv: ["node", "openclaw", "configure"],
+      parseArgv: ["channels"],
     });
 
+    expect(emitCliBannerMock).not.toHaveBeenCalled();
+    expect(setVerboseMock).not.toHaveBeenCalled();
     expect(ensureConfigReadyMock).not.toHaveBeenCalled();
     expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
   });
 
-  it("only allows invalid config for explicit Discord reinstall requests", async () => {
-    await runPreAction({
-      parseArgv: ["plugins", "install", "@openclaw/discord"],
-      processArgv: ["node", "openclaw", "plugins", "install", "@openclaw/discord"],
-    });
+  it("only allows invalid config for explicit official recovery reinstall requests", async () => {
+    const scenarios: Array<{ args: string[]; allowInvalid?: true }> = [
+      { args: ["@openclaw/discord"], allowInvalid: true },
+      { args: ["@openclaw/discord@2026.5.22"], allowInvalid: true },
+      { args: ["@openclaw/brave-plugin"], allowInvalid: true },
+      { args: ["@openclaw/slack"], allowInvalid: true },
+      { args: ["alpha"] },
+      { args: [DISCORD_REPO_INSTALL_SPEC], allowInvalid: true },
+      { args: ["@openclaw/discord", "--marketplace", "local/repo"] },
+    ];
+    for (const { args, allowInvalid } of scenarios) {
+      vi.clearAllMocks();
+      await runPreAction({
+        parseArgv: ["plugins", "install", ...args],
+        processArgv: ["node", "openclaw", "plugins", "install", ...args],
+      });
 
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["plugins", "install"],
-      allowInvalid: true,
-    });
-
-    vi.clearAllMocks();
-    await runPreAction({
-      parseArgv: ["plugins", "install", "alpha"],
-      processArgv: ["node", "openclaw", "plugins", "install", "alpha"],
-    });
-
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["plugins", "install"],
-    });
-
-    vi.clearAllMocks();
-    await runPreAction({
-      parseArgv: ["plugins", "install", DISCORD_REPO_INSTALL_SPEC],
-      processArgv: ["node", "openclaw", "plugins", "install", DISCORD_REPO_INSTALL_SPEC],
-    });
-
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["plugins", "install"],
-      allowInvalid: true,
-    });
-
-    vi.clearAllMocks();
-    await runPreAction({
-      parseArgv: ["plugins", "install", "@openclaw/discord", "--marketplace", "local/repo"],
-      processArgv: [
-        "node",
-        "openclaw",
-        "plugins",
-        "install",
-        "@openclaw/discord",
-        "--marketplace",
-        "local/repo",
-      ],
-    });
-
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["plugins", "install"],
-    });
+      expect(ensureConfigReadyMock).toHaveBeenCalledWith({
+        runtime: runtimeMock,
+        measure: expect.any(Function),
+        commandPath: ["plugins", "install"],
+        ...(allowInvalid ? { allowInvalid } : {}),
+      });
+    }
   });
 
   it("skips help/version preaction and respects banner opt-out", async () => {
@@ -369,49 +330,29 @@ describe("registerPreActionHooks", () => {
 
     await runPreAction({
       parseArgv: ["status"],
-      processArgv: ["node", "openclaw", "status"],
     });
 
     expect(emitCliBannerMock).not.toHaveBeenCalled();
-    expect(ensureConfigReadyMock).toHaveBeenCalledTimes(1);
+    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
   });
 
-  it("applies --json stdout suppression only for explicit JSON output commands", async () => {
-    await runPreAction({
-      parseArgv: ["status"],
-      processArgv: ["node", "openclaw", "status", "--json"],
-    });
+  it("bootstraps when Commander consumed --help as a required option value", async () => {
+    const parseProgram = buildProgram();
+    process.argv = ["node", "openclaw", "agent", "--message", "--help", "--message", "hello"];
 
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["status"],
-      suppressDoctorStdout: true,
-    });
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
+    await parseProgram.parseAsync(process.argv);
 
-    vi.clearAllMocks();
-    await runPreAction({
-      parseArgv: ["update", "status", "--json"],
-      processArgv: ["node", "openclaw", "update", "status", "--json"],
-    });
+    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+  });
 
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["update", "status"],
-      suppressDoctorStdout: true,
-    });
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
+  it("does not select JSON output when Commander consumed --json as an option value", async () => {
+    const parseProgram = buildProgram();
+    process.argv = ["node", "openclaw", "agent", "", "--message", "--json", "--message", "hello"];
 
-    vi.clearAllMocks();
-    await runPreAction({
-      parseArgv: ["config", "set", "gateway.auth.mode", "{bad", "--json"],
-      processArgv: ["node", "openclaw", "config", "set", "gateway.auth.mode", "{bad", "--json"],
-    });
+    await parseProgram.parseAsync(process.argv);
 
-    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
-      runtime: runtimeMock,
-      commandPath: ["config", "set"],
-    });
+    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+    expect(routeLogsToStderrMock).not.toHaveBeenCalled();
   });
 
   it("routes logs to stderr in --json mode so stdout stays clean", async () => {
@@ -424,52 +365,125 @@ describe("registerPreActionHooks", () => {
 
     vi.clearAllMocks();
 
-    // config set --json is parse-only (not JSON output mode), should not route
+    // Early argv detection routes literal --json conservatively until Commander metadata resolves.
+    loggingState.forceConsoleToStderr = true;
+    loggingState.earlyConsoleRoutingRestore = false;
     await runPreAction({
       parseArgv: ["config", "set", "gateway.auth.mode", "local", "--json"],
-      processArgv: ["node", "openclaw", "config", "set", "gateway.auth.mode", "local", "--json"],
     });
 
     expect(routeLogsToStderrMock).not.toHaveBeenCalled();
+    expect(loggingState.forceConsoleToStderr).toBe(false);
+
+    vi.clearAllMocks();
+
+    loggingState.forceConsoleToStderr = true;
+    loggingState.earlyConsoleRoutingRestore = false;
+    await runPreAction({
+      parseArgv: ["config", "set", "gateway.auth.mode", "local", "--dry-run", "--json"],
+      processArgv: [
+        "node",
+        "openclaw",
+        "config",
+        "set",
+        "gateway.auth.mode",
+        "local",
+        "--dry-run",
+        "--json",
+      ],
+    });
+
+    expect(routeLogsToStderrMock).toHaveBeenCalledOnce();
+    expect(loggingState.forceConsoleToStderr).toBe(true);
 
     vi.clearAllMocks();
 
     // non-json command should not route
     await runPreAction({
       parseArgv: ["agents", "list"],
-      processArgv: ["node", "openclaw", "agents", "list"],
     });
 
     expect(routeLogsToStderrMock).not.toHaveBeenCalled();
   });
 
-  it("does not preload plugins for agents list JSON output", async () => {
+  it("keeps plain model output clean throughout Commander startup", async () => {
+    loggingState.forceConsoleToStderr = true;
+    loggingState.earlyConsoleRoutingRestore = false;
+
     await runPreAction({
-      parseArgv: ["agents", "list"],
-      processArgv: ["node", "openclaw", "agents", "list", "--json"],
+      parseArgv: ["models", "aliases", "list"],
+      processArgv: ["node", "openclaw", "models", "aliases", "list", "--plain"],
     });
 
+    expect(loggingState.forceConsoleToStderr).toBe(true);
     expect(routeLogsToStderrMock).toHaveBeenCalledOnce();
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
+    expect(emitCliBannerMock).not.toHaveBeenCalled();
+    expect(ensureConfigReadyMock).toHaveBeenCalledWith({
+      runtime: runtimeMock,
+      measure: expect.any(Function),
+      commandPath: ["models", "aliases", "list"],
+      suppressDoctorStdout: true,
+    });
   });
 
-  it("does not preload plugins for remote agent JSON output", async () => {
-    await runPreAction({
-      parseArgv: ["agent"],
-      processArgv: ["node", "openclaw", "agent", "--message", "hi", "--json"],
-    });
+  describe("infer model run startup", () => {
+    it.each([
+      { args: ["--prompt=--local", "--gateway"], validationOnly: true },
+      { args: ["--prompt", "hello", "--local"], validationOnly: false },
+    ])("uses parsed transport for $args", async ({ args, validationOnly }) => {
+      const parseProgram = new Command().name("openclaw").enablePositionalOptions();
+      const action = vi.fn();
+      parseProgram
+        .command("infer")
+        .command("model")
+        .command("run")
+        .requiredOption("--prompt <text>")
+        .option("--local", "Force local execution", false)
+        .option("--gateway", "Force Gateway execution", false)
+        .action(action);
+      registerPreActionHooks(parseProgram, "9.9.9-test");
+      process.argv = ["node", "openclaw", "infer", "model", "run", ...args];
 
-    expect(routeLogsToStderrMock).toHaveBeenCalledOnce();
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
+      await parseProgram.parseAsync(process.argv);
+
+      expect(action).toHaveBeenCalledOnce();
+      expect(ensureConfigReadyMock).toHaveBeenCalledOnce();
+      const bootstrap = ensureConfigReadyMock.mock.calls[0]?.[0];
+      if (validationOnly) {
+        expect(bootstrap).toHaveProperty("validateConfigOnly", true);
+      } else {
+        expect(bootstrap).not.toHaveProperty("validateConfigOnly");
+      }
+    });
   });
 
-  it("bypasses config guard for config validate", async () => {
-    await runPreAction({
-      parseArgv: ["config", "validate"],
-      processArgv: ["node", "openclaw", "config", "validate"],
-    });
+  it("leaves gateway call config loading to the transport past parent option values", async () => {
+    const parseProgram = buildProgram();
+    process.argv = ["node", "openclaw", "gateway", "--token", "secret", "call", "health", "--json"];
+
+    await parseProgram.parseAsync(process.argv);
 
     expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
+  });
+
+  it("uses the shared skip policy for gateway health on the Commander path", async () => {
+    const parseProgram = buildProgram();
+    process.argv = ["node", "openclaw", "gateway", "--port", "19083", "health", "--json"];
+
+    await parseProgram.parseAsync(process.argv);
+
+    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+  });
+
+  it("defers message config preparation until the action selects local or Gateway execution", async () => {
+    const parseProgram = buildProgram();
+    process.argv = ["node", "openclaw", "message", "send", "--json"];
+
+    await parseProgram.parseAsync(process.argv);
+
+    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
   });
 
   it("bypasses config guard for config validate when root option values are present", async () => {
@@ -479,24 +493,7 @@ describe("registerPreActionHooks", () => {
     });
 
     expect(ensureConfigReadyMock).not.toHaveBeenCalled();
-  });
-
-  it("bypasses config guard for config schema", async () => {
-    await runPreAction({
-      parseArgv: ["config", "schema"],
-      processArgv: ["node", "openclaw", "config", "schema"],
-    });
-
-    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
-  });
-
-  it("bypasses config guard for backup create", async () => {
-    await runPreAction({
-      parseArgv: ["backup", "create"],
-      processArgv: ["node", "openclaw", "backup", "create", "--json"],
-    });
-
-    expect(ensureConfigReadyMock).not.toHaveBeenCalled();
+    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
   });
 
   it("routes logs to stderr during plugin loading in --json mode and restores after", async () => {
@@ -518,16 +515,6 @@ describe("registerPreActionHooks", () => {
     expect(loggingState.forceConsoleToStderr).toBe(false);
   });
 
-  it("does not preload plugins or route logs to stderr for agents list without --json", async () => {
-    await runPreAction({
-      parseArgv: ["agents", "list"],
-      processArgv: ["node", "openclaw", "agents", "list"],
-    });
-
-    expect(ensurePluginRegistryLoadedMock).not.toHaveBeenCalled();
-    expect(loggingState.forceConsoleToStderr).toBe(false);
-  });
-
   beforeAll(() => {
     program = buildProgram();
     const hooks = (
@@ -536,7 +523,7 @@ describe("registerPreActionHooks", () => {
           preAction?: Array<(thisCommand: Command, actionCommand: Command) => Promise<void> | void>;
         };
       }
-    )._lifeCycleHooks?.preAction;
+    )["_lifeCycleHooks"]?.preAction;
     preActionHook = hooks?.[0] ?? null;
   });
 });

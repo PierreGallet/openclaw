@@ -1,3 +1,4 @@
+// Allow-from tests cover channel sender allowlist parsing and matching.
 import { describe, expect, it } from "vitest";
 import {
   firstDefined,
@@ -25,15 +26,6 @@ describe("mergeDmAllowFromSources", () => {
         dmPolicy: "allowlist" as const,
       },
       expected: ["+1111"],
-    },
-    {
-      name: "keeps pairing-store entries for non-allowlist policies",
-      input: {
-        allowFrom: ["+1111"],
-        storeAllowFrom: ["+2222"],
-        dmPolicy: "pairing" as const,
-      },
-      expected: ["+1111", "+2222"],
     },
   ])("$name", ({ input, expected }) => {
     expect(mergeDmAllowFromSources(input)).toEqual(expected);
@@ -66,7 +58,7 @@ describe("resolveGroupAllowFromSources", () => {
         groupAllowFrom: [],
         fallbackToAllowFrom: false,
       }),
-    ).toEqual([]);
+    ).toStrictEqual([]);
   });
 });
 

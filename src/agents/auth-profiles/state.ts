@@ -1,47 +1,16 @@
-import fs from "node:fs";
-import { loadJsonFile, saveJsonFile } from "../../infra/json-file.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
+/**
+ * Runtime-state normalization and persistence for auth profile selection.
+ * This state tracks order, last-good profile, and cooldown/failure metadata
+ * separately from secret-bearing credentials.
+ */
 import { AUTH_STORE_VERSION } from "./constants.js";
-import { resolveAuthStatePath } from "./paths.js";
-import type { AuthProfileState, AuthProfileStateStore, ProfileUsageStats } from "./types.js";
+import { readPersistedAuthProfileStateRaw, type AuthProfileDatabase } from "./sqlite.js";
+import { coerceAuthProfileState } from "./state-normalization.js";
+import type { AuthProfileState, AuthProfileStateStore } from "./types.js";
 
-function normalizeAuthProfileOrder(raw: unknown): AuthProfileState["order"] {
-  if (!raw || typeof raw !== "object") {
-    return undefined;
-  }
-  const normalized = Object.entries(raw as Record<string, unknown>).reduce<
-    Record<string, string[]>
-  >((acc, [provider, value]) => {
-    if (!Array.isArray(value)) {
-      return acc;
-    }
-    const list = value.map((entry) => normalizeOptionalString(entry) ?? "").filter(Boolean);
-    if (list.length > 0) {
-      acc[provider] = list;
-    }
-    return acc;
-  }, {});
-  return Object.keys(normalized).length > 0 ? normalized : undefined;
-}
+export { coerceAuthProfileState } from "./state-normalization.js";
 
-export function coerceAuthProfileState(raw: unknown): AuthProfileState {
-  if (!raw || typeof raw !== "object") {
-    return {};
-  }
-  const record = raw as Record<string, unknown>;
-  return {
-    order: normalizeAuthProfileOrder(record.order),
-    lastGood:
-      record.lastGood && typeof record.lastGood === "object"
-        ? (record.lastGood as Record<string, string>)
-        : undefined,
-    usageStats:
-      record.usageStats && typeof record.usageStats === "object"
-        ? (record.usageStats as Record<string, ProfileUsageStats>)
-        : undefined,
-  };
-}
-
+/** Merges auth profile runtime state, with override records winning per key. */
 export function mergeAuthProfileState(
   base: AuthProfileState,
   override: AuthProfileState,
@@ -49,12 +18,6 @@ export function mergeAuthProfileState(
   const mergeRecord = <T>(left?: Record<string, T>, right?: Record<string, T>) => {
     if (!left && !right) {
       return undefined;
-    }
-    if (!left) {
-      return { ...right };
-    }
-    if (!right) {
-      return { ...left };
     }
     return { ...left, ...right };
   };
@@ -66,11 +29,18 @@ export function mergeAuthProfileState(
   };
 }
 
-export function loadPersistedAuthProfileState(agentDir?: string): AuthProfileState {
-  return coerceAuthProfileState(loadJsonFile(resolveAuthStatePath(agentDir)));
+/** Loads persisted auth profile runtime state from SQLite. */
+export function loadPersistedAuthProfileState(
+  agentDir?: string,
+  database?: AuthProfileDatabase,
+): AuthProfileState {
+  return coerceAuthProfileState(readPersistedAuthProfileStateRaw(agentDir, database));
 }
 
-function buildPersistedAuthProfileState(store: AuthProfileState): AuthProfileStateStore | null {
+/** Builds the persisted auth profile runtime state payload. */
+export function buildPersistedAuthProfileState(
+  store: AuthProfileState,
+): AuthProfileStateStore | null {
   const state = coerceAuthProfileState(store);
   if (!state.order && !state.lastGood && !state.usageStats) {
     return null;
@@ -81,24 +51,4 @@ function buildPersistedAuthProfileState(store: AuthProfileState): AuthProfileSta
     ...(state.lastGood ? { lastGood: state.lastGood } : {}),
     ...(state.usageStats ? { usageStats: state.usageStats } : {}),
   };
-}
-
-export function savePersistedAuthProfileState(
-  store: AuthProfileState,
-  agentDir?: string,
-): AuthProfileStateStore | null {
-  const payload = buildPersistedAuthProfileState(store);
-  const statePath = resolveAuthStatePath(agentDir);
-  if (!payload) {
-    try {
-      fs.unlinkSync(statePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        throw error;
-      }
-    }
-    return null;
-  }
-  saveJsonFile(statePath, payload);
-  return payload;
 }

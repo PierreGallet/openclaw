@@ -1,4 +1,4 @@
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 const DTMF_PATTERN = /^[0-9*#wWpP,]+$/;
 
@@ -43,4 +43,12 @@ export function buildMeetDtmfSequence(params: {
     throw new Error("pin may only contain digits and an optional trailing #");
   }
   return compactPin.endsWith("#") ? compactPin : `${compactPin}#`;
+}
+
+export function prefixDtmfWait(sequence: string | undefined, delayMs: number): string | undefined {
+  if (!sequence || delayMs <= 0) {
+    return sequence;
+  }
+  const waitCount = Math.ceil(delayMs / 500);
+  return `${"w".repeat(waitCount)}${sequence}`;
 }

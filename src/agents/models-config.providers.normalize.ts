@@ -1,9 +1,13 @@
+import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import { ensureAuthProfileStore } from "./auth-profiles/store.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import {
-  normalizeProviderSpecificConfig,
-  resolveProviderConfigApiKeyResolver,
-} from "./models-config.providers.policy.js";
+  normalizeProviderConfigWithPlugin,
+  resolveProviderConfigApiKeyWithPlugin,
+} from "../plugins/provider-runtime.js";
+import { appendConfigPathSegment } from "../shared/dot-path.js";
+import { ensureAuthProfileStoreAsync } from "./auth-profiles/store-runtime.js";
+import { resolveProviderPluginLookupKey } from "./models-config.providers.policy.lookup.js";
 import type { ProviderConfig, SecretDefaults } from "./models-config.providers.secret-helpers.js";
 import {
   normalizeConfiguredProviderApiKey,
@@ -12,27 +16,32 @@ import {
   resolveApiKeyFromProfiles,
   resolveMissingProviderApiKey,
 } from "./models-config.providers.secret-helpers.js";
-import { enforceSourceManagedProviderSecrets } from "./models-config.providers.source-managed.js";
+import {
+  enforceSourceManagedProviderSecrets,
+  normalizeSourceProviderLookup,
+} from "./models-config.providers.source-managed.js";
 
 type ModelsConfig = NonNullable<OpenClawConfig["models"]>;
-
-export function normalizeProviders(params: {
+export async function normalizeProviders(params: {
   providers: ModelsConfig["providers"];
   agentDir: string;
   env?: NodeJS.ProcessEnv;
   secretDefaults?: SecretDefaults;
-  sourceProviders?: ModelsConfig["providers"];
-  sourceSecretDefaults?: SecretDefaults;
+  sourceConfigForSecrets?: OpenClawConfig;
   secretRefManagedProviders?: Set<string>;
-}): ModelsConfig["providers"] {
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
+}): Promise<ModelsConfig["providers"]> {
   const { providers } = params;
   if (!providers) {
     return providers;
   }
   const env = params.env ?? process.env;
-  let authStore: ReturnType<typeof ensureAuthProfileStore> | undefined;
-  const resolveProfileApiKey = (providerKey: string) => {
-    authStore ??= ensureAuthProfileStore(params.agentDir, {
+  const sourceProviders = normalizeSourceProviderLookup(
+    params.sourceConfigForSecrets?.models?.providers,
+  );
+  let authStore: Awaited<ReturnType<typeof ensureAuthProfileStoreAsync>> | undefined;
+  const resolveProfileApiKey = async (providerKey: string) => {
+    authStore ??= await ensureAuthProfileStoreAsync(params.agentDir, {
       allowKeychainPrompt: false,
     });
     return resolveApiKeyFromProfiles({
@@ -53,74 +62,87 @@ export function normalizeProviders(params: {
     if (normalizedKey !== key) {
       mutated = true;
     }
+    // Only authored fields inherit loader facts; plugin-discovered inputs keep their own syntax.
+    const sourceProvider = sourceProviders.get(normalizeProviderId(normalizedKey));
+    const source =
+      sourceProvider && params.sourceConfigForSecrets
+        ? {
+            config: params.sourceConfigForSecrets,
+            providerKey: sourceProvider.providerKey,
+          }
+        : undefined;
     let normalizedProvider = provider;
     const normalizedHeaders = normalizeHeaderValues({
       headers: normalizedProvider.headers,
       secretDefaults: params.secretDefaults,
+      source,
     });
     if (normalizedHeaders.mutated) {
-      mutated = true;
       normalizedProvider = { ...normalizedProvider, headers: normalizedHeaders.headers };
     }
-    const providerWithConfiguredApiKey = normalizeConfiguredProviderApiKey({
+    const sourceInput =
+      sourceProvider?.providerConfig.apiKey !== undefined
+        ? {
+            config: params.sourceConfigForSecrets,
+            path: `${appendConfigPathSegment("models.providers", sourceProvider.providerKey)}.apiKey`,
+            value: sourceProvider.providerConfig.apiKey,
+            defaults: params.sourceConfigForSecrets?.secrets?.defaults,
+          }
+        : undefined;
+    normalizedProvider = normalizeConfiguredProviderApiKey({
       providerKey: normalizedKey,
+      sourceInput,
       provider: normalizedProvider,
       secretDefaults: params.secretDefaults,
-      profileApiKey: undefined,
       secretRefManagedProviders: params.secretRefManagedProviders,
     });
-    if (providerWithConfiguredApiKey !== normalizedProvider) {
-      mutated = true;
-      normalizedProvider = providerWithConfiguredApiKey;
-    }
 
     // Reverse-lookup: if apiKey looks like a resolved secret value (not an env
     // var name), check whether it matches the canonical env var for this provider.
     // This prevents resolveConfigEnvVars()-resolved secrets from being persisted
     // to models.json as plaintext. (Fixes #38757)
-    const providerWithResolvedEnvApiKey = normalizeResolvedEnvApiKey({
+    normalizedProvider = normalizeResolvedEnvApiKey({
       providerKey: normalizedKey,
       provider: normalizedProvider,
       env,
       secretRefManagedProviders: params.secretRefManagedProviders,
     });
-    if (providerWithResolvedEnvApiKey !== normalizedProvider) {
-      mutated = true;
-      normalizedProvider = providerWithResolvedEnvApiKey;
-    }
 
     const needsProfileApiKey =
       Array.isArray(normalizedProvider.models) &&
       normalizedProvider.models.length > 0 &&
-      !(
-        (typeof normalizedProvider.apiKey === "string" && normalizedProvider.apiKey.trim()) ||
-        normalizedProvider.apiKey
-      );
-    const profileApiKey = needsProfileApiKey ? resolveProfileApiKey(normalizedKey) : undefined;
-    const providerApiKeyResolver = needsProfileApiKey
-      ? resolveProviderConfigApiKeyResolver(normalizedKey)
+      !normalizedProvider.apiKey;
+    const profileApiKey = needsProfileApiKey
+      ? await resolveProfileApiKey(normalizedKey)
       : undefined;
-    const providerWithApiKey = resolveMissingProviderApiKey({
+    const runtimeProviderKey = needsProfileApiKey
+      ? resolveProviderPluginLookupKey(normalizedKey).trim()
+      : undefined;
+    normalizedProvider = resolveMissingProviderApiKey({
       providerKey: normalizedKey,
       provider: normalizedProvider,
       env,
       profileApiKey,
       secretRefManagedProviders: params.secretRefManagedProviders,
-      providerApiKeyResolver,
+      providerApiKeyResolver:
+        runtimeProviderKey !== undefined
+          ? (providerEnv) =>
+              resolveProviderConfigApiKeyWithPlugin({
+                provider: runtimeProviderKey,
+                ...(params.manifestRegistry ? { manifestRegistry: params.manifestRegistry } : {}),
+                context: { provider: normalizedKey, env: providerEnv },
+              })
+          : undefined,
     });
-    if (providerWithApiKey !== normalizedProvider) {
-      mutated = true;
-      normalizedProvider = providerWithApiKey;
-    }
 
-    const providerSpecificNormalized = normalizeProviderSpecificConfig(
-      normalizedKey,
-      normalizedProvider,
-    );
-    if (providerSpecificNormalized !== normalizedProvider) {
-      mutated = true;
-      normalizedProvider = providerSpecificNormalized;
-    }
+    normalizedProvider =
+      normalizeProviderConfigWithPlugin({
+        provider: resolveProviderPluginLookupKey(normalizedKey, normalizedProvider),
+        ...(params.manifestRegistry ? { manifestRegistry: params.manifestRegistry } : {}),
+        context: { provider: normalizedKey, providerConfig: normalizedProvider },
+      }) ?? normalizedProvider;
+
+    mutated ||= normalizedProvider !== provider;
 
     const existing = next[normalizedKey];
     if (existing) {
@@ -140,8 +162,7 @@ export function normalizeProviders(params: {
   const normalizedProviders = mutated ? next : providers;
   return enforceSourceManagedProviderSecrets({
     providers: normalizedProviders,
-    sourceProviders: params.sourceProviders,
-    sourceSecretDefaults: params.sourceSecretDefaults,
+    sourceConfigForSecrets: params.sourceConfigForSecrets,
     secretRefManagedProviders: params.secretRefManagedProviders,
   });
 }

@@ -1,6 +1,13 @@
-import type { StreamFn } from "@mariozechner/pi-agent-core";
-import { streamSimple, type AssistantMessageEvent } from "@mariozechner/pi-ai";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
+/**
+ * Plugin-defined text replacement transforms for stream boundaries.
+ *
+ * Provider and CLI plugins can rewrite prompt/event text without owning the transport implementation.
+ */
+import type { AssistantMessage, AssistantMessageEvent } from "../llm/types.js";
 import type { PluginTextReplacement, PluginTextTransforms } from "../plugins/cli-backend.types.js";
+import type { StreamFn } from "./runtime/index.js";
+import type { MutableAssistantMessageEventStream } from "./stream-compat.js";
 import { createStreamIteratorWrapper } from "./stream-iterator-wrapper.js";
 
 export function mergePluginTextTransforms(
@@ -31,62 +38,45 @@ export function applyPluginTextReplacements(
   return next;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === "object" && !Array.isArray(value));
-}
-
-function transformContentText(content: unknown, replacements?: PluginTextReplacement[]): unknown {
+function transformContentText(
+  content: unknown,
+  replacements?: PluginTextReplacement[],
+  mode: "content" | "arguments" | "message" = "content",
+): unknown {
+  if (mode === "message" && !isRecord(content)) {
+    return content;
+  }
   if (typeof content === "string") {
     return applyPluginTextReplacements(content, replacements);
   }
   if (Array.isArray(content)) {
-    return content.map((entry) => transformContentText(entry, replacements));
+    return content.map((entry) => transformContentText(entry, replacements, mode));
   }
   if (!isRecord(content)) {
     return content;
   }
+  if (mode === "arguments") {
+    return Object.fromEntries(
+      Object.entries(content).map(([key, entry]) => [
+        key,
+        transformContentText(entry, replacements, mode),
+      ]),
+    );
+  }
   const next = { ...content };
-  if (typeof next.text === "string") {
+  if (mode === "content" && typeof next.text === "string") {
     next.text = applyPluginTextReplacements(next.text, replacements);
   }
   if (Object.hasOwn(next, "content")) {
     next.content = transformContentText(next.content, replacements);
   }
-  return next;
-}
-
-function transformMessageText(message: unknown, replacements?: PluginTextReplacement[]): unknown {
-  if (!isRecord(message)) {
-    return message;
+  if (mode === "content" && next.type === "toolCall" && Object.hasOwn(next, "arguments")) {
+    next.arguments = transformContentText(next.arguments, replacements, "arguments");
   }
-  const next = { ...message };
-  if (Object.hasOwn(next, "content")) {
-    next.content = transformContentText(next.content, replacements);
-  }
-  if (typeof next.errorMessage === "string") {
+  if (mode === "message" && typeof next.errorMessage === "string") {
     next.errorMessage = applyPluginTextReplacements(next.errorMessage, replacements);
   }
   return next;
-}
-
-export function transformStreamContextText(
-  context: Parameters<StreamFn>[1],
-  replacements?: PluginTextReplacement[],
-  options?: { systemPrompt?: boolean },
-): Parameters<StreamFn>[1] {
-  if (!replacements || replacements.length === 0) {
-    return context;
-  }
-  return {
-    ...context,
-    systemPrompt:
-      options?.systemPrompt !== false && typeof context.systemPrompt === "string"
-        ? applyPluginTextReplacements(context.systemPrompt, replacements)
-        : context.systemPrompt,
-    messages: Array.isArray(context.messages)
-      ? context.messages.map((message) => transformMessageText(message, replacements))
-      : context.messages,
-  } as Parameters<StreamFn>[1];
 }
 
 function transformAssistantEventText(
@@ -103,45 +93,53 @@ function transformAssistantEventText(
   if (next.type === "text_end" && typeof next.content === "string") {
     next.content = applyPluginTextReplacements(next.content, replacements);
   }
-  if (Object.hasOwn(next, "partial")) {
-    next.partial = transformMessageText(next.partial, replacements);
+  if (
+    next.type === "toolcall_end" &&
+    isRecord(next.toolCall) &&
+    Object.hasOwn(next.toolCall, "arguments")
+  ) {
+    // Tool names are routing identifiers; only argument values are text.
+    next.toolCall = {
+      ...next.toolCall,
+      arguments: transformContentText(next.toolCall.arguments, replacements, "arguments"),
+    };
   }
-  if (Object.hasOwn(next, "message")) {
-    next.message = transformMessageText(next.message, replacements);
-  }
-  if (Object.hasOwn(next, "error")) {
-    next.error = transformMessageText(next.error, replacements);
+  for (const field of ["partial", "message", "error"]) {
+    if (Object.hasOwn(next, field)) {
+      next[field] = transformContentText(next[field], replacements, "message");
+    }
   }
   return next as AssistantMessageEvent;
 }
 
 function wrapStreamTextTransforms(
-  stream: ReturnType<typeof streamSimple>,
+  stream: MutableAssistantMessageEventStream,
   replacements?: PluginTextReplacement[],
-): ReturnType<typeof streamSimple> {
+): MutableAssistantMessageEventStream {
   if (!replacements || replacements.length === 0) {
     return stream;
   }
   const originalResult = stream.result.bind(stream);
-  stream.result = async () => transformMessageText(await originalResult(), replacements) as never;
+  stream.result = async () =>
+    transformContentText(await originalResult(), replacements, "message") as AssistantMessage;
 
+  // Wrap async iteration so streamed deltas and the final result receive the
+  // same output replacement policy.
   const originalAsyncIterator = stream[Symbol.asyncIterator].bind(stream);
-  (stream as { [Symbol.asyncIterator]: typeof originalAsyncIterator })[Symbol.asyncIterator] =
-    function () {
-      const iterator = originalAsyncIterator();
-      return createStreamIteratorWrapper({
-        iterator,
-        next: async (streamIterator) => {
-          const result = await streamIterator.next();
-          return result.done
-            ? result
-            : {
-                done: false as const,
-                value: transformAssistantEventText(result.value, replacements),
-              };
-        },
-      });
-    };
+  stream[Symbol.asyncIterator] = function () {
+    return createStreamIteratorWrapper({
+      iterator: originalAsyncIterator(),
+      next: async (streamIterator) => {
+        const result = await streamIterator.next();
+        return result.done
+          ? result
+          : {
+              done: false as const,
+              value: transformAssistantEventText(result.value, replacements),
+            };
+      },
+    });
+  };
   return stream;
 }
 
@@ -152,9 +150,20 @@ export function wrapStreamFnTextTransforms(params: {
   transformSystemPrompt?: boolean;
 }): StreamFn {
   return (model, context, options) => {
-    const nextContext = transformStreamContextText(context, params.input, {
-      systemPrompt: params.transformSystemPrompt,
-    });
+    const nextContext = params.input?.length
+      ? ({
+          ...context,
+          systemPrompt:
+            params.transformSystemPrompt !== false && typeof context.systemPrompt === "string"
+              ? applyPluginTextReplacements(context.systemPrompt, params.input)
+              : context.systemPrompt,
+          messages: Array.isArray(context.messages)
+            ? context.messages.map((message) =>
+                transformContentText(message, params.input, "message"),
+              )
+            : context.messages,
+        } as Parameters<StreamFn>[1])
+      : context;
     const maybeStream = params.streamFn(model, nextContext, options);
     if (maybeStream && typeof maybeStream === "object" && "then" in maybeStream) {
       return Promise.resolve(maybeStream).then((stream) =>

@@ -1,22 +1,33 @@
+// Channel config example tests validate channel configuration snippets in docs.
 import fs from "node:fs";
 import path from "node:path";
 import JSON5 from "json5";
 import { describe, expect, it } from "vitest";
 import { OpenClawSchema } from "../config/zod-schema.js";
-
-const CHANNEL_DOCS_DIR = path.join(process.cwd(), "docs", "channels");
+import { expectNoReaddirSyncDuring } from "../test-utils/fs-scan-assertions.js";
+import { listGitTrackedFiles } from "../test-utils/repo-files.js";
 
 function lineNumberAt(source: string, index: number): number {
   return source.slice(0, index).split("\n").length;
 }
 
+function listChannelDocFiles(): string[] {
+  const files = expectNoReaddirSyncDuring(() =>
+    listGitTrackedFiles({ pathspecs: "docs/channels/*.md" }),
+  );
+  if (!files) {
+    throw new Error("Could not list tracked channel docs");
+  }
+  expect(files.length).toBeGreaterThan(0);
+  expect(files.every((filePath) => filePath.endsWith(".md"))).toBe(true);
+  return files.map((filePath) => path.join(process.cwd(), filePath));
+}
+
 describe("channel docs config examples", () => {
   it("keeps channel docs JSON fences parseable", () => {
     const failures: string[] = [];
-    for (const fileName of fs
-      .readdirSync(CHANNEL_DOCS_DIR)
-      .filter((entry) => entry.endsWith(".md"))) {
-      const docPath = path.join(CHANNEL_DOCS_DIR, fileName);
+    for (const docPath of listChannelDocFiles()) {
+      const fileName = path.basename(docPath);
       const markdown = fs.readFileSync(docPath, "utf8");
       const blocks = markdown.matchAll(/```(?:json5|json)\n([\s\S]*?)```/g);
       for (const match of blocks) {
@@ -36,15 +47,13 @@ describe("channel docs config examples", () => {
         }
       }
     }
-    expect(failures).toEqual([]);
+    expect(failures).toStrictEqual([]);
   });
 
   it("keeps OpenClaw channel config snippets parseable and schema-valid", () => {
     const failures: string[] = [];
-    for (const fileName of fs
-      .readdirSync(CHANNEL_DOCS_DIR)
-      .filter((entry) => entry.endsWith(".md"))) {
-      const docPath = path.join(CHANNEL_DOCS_DIR, fileName);
+    for (const docPath of listChannelDocFiles()) {
+      const fileName = path.basename(docPath);
       const markdown = fs.readFileSync(docPath, "utf8");
       const blocks = markdown.matchAll(/```(?:json5|json)\n([\s\S]*?)```/g);
       for (const match of blocks) {
@@ -70,6 +79,6 @@ describe("channel docs config examples", () => {
         }
       }
     }
-    expect(failures).toEqual([]);
+    expect(failures).toStrictEqual([]);
   });
 });

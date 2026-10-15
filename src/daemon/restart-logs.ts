@@ -1,15 +1,29 @@
+import fs from "node:fs";
 import path from "node:path";
 import { quoteCmdScriptArg } from "./cmd-argv.js";
-import { resolveGatewayStateDir } from "./paths.js";
-import type { GatewayServiceEnv } from "./service-types.js";
+import { resolveGatewayProfileSuffix } from "./constants.js";
+import { resolveDaemonHomeDir, resolveGatewayStateDir } from "./paths.js";
+import type { GatewayLifecycleMutationMode, GatewayServiceEnv } from "./service-types.js";
 
-export const GATEWAY_RESTART_LOG_FILENAME = "gateway-restart.log";
+const GATEWAY_RESTART_LOG_FILENAME = "gateway-restart.log";
 
-export function resolveGatewayLogPaths(env: GatewayServiceEnv): {
+export type GatewayLifecycleAuditSource = "cli" | "safe-rpc" | "supervisor" | "handoff";
+
+type GatewayLifecycleAuditEntry = {
+  action: "start" | "stop" | "restart";
+  source: GatewayLifecycleAuditSource;
+  mode: GatewayLifecycleMutationMode;
+  pid?: number;
+  interactive: boolean;
+};
+
+type GatewayLogPaths = {
   logDir: string;
   stdoutPath: string;
   stderrPath: string;
-} {
+};
+
+export function resolveGatewayLogPaths(env: GatewayServiceEnv): GatewayLogPaths {
   const stateDir = resolveGatewayStateDir(env);
   const logDir = path.join(stateDir, "logs");
   const prefix = env.OPENCLAW_LOG_PREFIX?.trim() || "gateway";
@@ -20,19 +34,60 @@ export function resolveGatewayLogPaths(env: GatewayServiceEnv): {
   };
 }
 
+/** launchd supervisors write outside the state directory in ~/Library/Logs. */
+export function resolveGatewaySupervisorLogPaths(env: GatewayServiceEnv): GatewayLogPaths {
+  const home = resolveDaemonHomeDir(env).replaceAll("\\", "/");
+  const logDir = path.posix.join(home, "Library", "Logs", "openclaw");
+  const prefix =
+    env.OPENCLAW_LOG_PREFIX?.trim() ||
+    `gateway${resolveGatewayProfileSuffix(env.OPENCLAW_PROFILE)}`;
+  return {
+    logDir,
+    stdoutPath: path.posix.join(logDir, `${prefix}.log`),
+    stderrPath: path.posix.join(logDir, `${prefix}.err.log`),
+  };
+}
+
 export function resolveGatewayRestartLogPath(env: GatewayServiceEnv): string {
   return path.join(resolveGatewayLogPaths(env).logDir, GATEWAY_RESTART_LOG_FILENAME);
 }
 
-export function shellEscapeRestartLogValue(value: string): string {
+/** Append one best-effort lifecycle record without letting diagnostics block the mutation. */
+export function appendGatewayLifecycleAuditLog(
+  env: GatewayServiceEnv,
+  entry: GatewayLifecycleAuditEntry,
+): void {
+  try {
+    const logPath = resolveGatewayRestartLogPath(env);
+    fs.mkdirSync(path.dirname(logPath), { recursive: true });
+    const fields = [
+      `source=${entry.source}`,
+      `action=${entry.action}`,
+      `mode=${entry.mode}`,
+      ...(entry.pid !== undefined ? [`pid=${entry.pid}`] : []),
+      `interactive=${entry.interactive ? 1 : 0}`,
+    ];
+    fs.appendFileSync(
+      logPath,
+      `[${new Date().toISOString()}] openclaw gateway lifecycle ${fields.join(" ")}\n`,
+      "utf8",
+    );
+  } catch {
+    // Lifecycle logging is diagnostic only; service control remains authoritative.
+  }
+}
+
+function shellEscapeRestartLogValue(value: string): string {
   return value.replace(/'/g, "'\\''");
 }
 
 export function renderPosixRestartLogSetup(env: GatewayServiceEnv): string {
-  const logDir = path.dirname(resolveGatewayRestartLogPath(env));
   const logPath = resolveGatewayRestartLogPath(env);
+  const logDir = path.dirname(logPath);
   const escapedLogDir = shellEscapeRestartLogValue(logDir);
   const escapedLogPath = shellEscapeRestartLogValue(logPath);
+  // Logging is best-effort; restart handoffs must still run when the log path
+  // cannot be created in constrained service environments.
   return `if mkdir -p '${escapedLogDir}' 2>/dev/null && : >>'${escapedLogPath}' 2>/dev/null; then
   exec >>'${escapedLogPath}' 2>&1
 fi`;

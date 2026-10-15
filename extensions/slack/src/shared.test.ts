@@ -1,14 +1,12 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+// Slack tests cover shared plugin behavior.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { describe, expect, it } from "vitest";
-import { createSlackPluginBase, setSlackChannelAllowlist, slackConfigAdapter } from "./shared.js";
+import { slackSetupPlugin } from "./channel.setup.js";
+import { setSlackChannelAllowlist } from "./setup-shared.js";
+import { slackPluginBase as plugin, slackConfigAdapter } from "./shared.js";
 
-describe("createSlackPluginBase", () => {
+describe("slackPluginBase", () => {
   it("owns Slack native command name overrides", () => {
-    const plugin = createSlackPluginBase({
-      setup: {} as never,
-      setupWizard: {} as never,
-    });
-
     expect(
       plugin.commands?.resolveNativeCommandName?.({
         commandKey: "status",
@@ -21,17 +19,12 @@ describe("createSlackPluginBase", () => {
         defaultName: "tts",
       }),
     ).toBe("tts");
-  });
-
-  it("exposes security checks on the setup surface", () => {
-    const plugin = createSlackPluginBase({
-      setup: {} as never,
-      setupWizard: {} as never,
-    });
-
-    expect(plugin.security?.resolveDmPolicy).toBeTypeOf("function");
-    expect(plugin.security?.collectWarnings).toBeTypeOf("function");
-    expect(plugin.security?.collectAuditFindings).toBeTypeOf("function");
+    expect(
+      plugin.commands?.resolveNativeCommandName?.({
+        commandKey: "login",
+        defaultName: "login",
+      }),
+    ).toBe("login");
   });
 });
 
@@ -59,6 +52,35 @@ describe("setSlackChannelAllowlist", () => {
 });
 
 describe("slackConfigAdapter", () => {
+  it("clears user-identity credentials when deleting the root account", () => {
+    const cfg = {
+      channels: {
+        slack: {
+          identity: "user",
+          mode: "http",
+          userToken: "test-user-token",
+          signingSecret: "test-signing-secret",
+          accounts: {
+            work: {
+              identity: "user",
+              userToken: "test-work-user-token",
+              appToken: "test-work-app-token",
+            },
+          },
+        },
+      },
+    } as OpenClawConfig;
+
+    const next = slackConfigAdapter.deleteAccount?.({ cfg, accountId: "default" });
+
+    expect(next?.channels?.slack?.userToken).toBeUndefined();
+    expect(next?.channels?.slack?.signingSecret).toBeUndefined();
+    expect(next?.channels?.slack?.accounts?.work).toMatchObject({
+      userToken: "test-work-user-token",
+      appToken: "test-work-app-token",
+    });
+  });
+
   it("keeps read-only accessors from resolving token SecretRefs", () => {
     const cfg = {
       secrets: {
@@ -87,5 +109,9 @@ describe("slackConfigAdapter", () => {
 
     expect(slackConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual(["U123"]);
     expect(slackConfigAdapter.resolveDefaultTo?.({ cfg, accountId: "default" })).toBe("C123");
+    expect(slackSetupPlugin.config.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual([
+      "U123",
+    ]);
+    expect(slackSetupPlugin.config.resolveDefaultTo?.({ cfg, accountId: "default" })).toBe("C123");
   });
 });

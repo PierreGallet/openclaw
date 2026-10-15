@@ -3,7 +3,7 @@ import {
   logAckFailure,
   type StatusReactionAdapter,
 } from "openclaw/plugin-sdk/channel-feedback";
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { logVerbose } from "openclaw/plugin-sdk/runtime-env";
 import { createDiscordRuntimeAccountContext } from "../client.js";
 import type { RequestClient } from "../internal/discord.js";
@@ -17,10 +17,7 @@ export function createDiscordAckReactionContext(params: {
 }): DiscordReactionRuntimeContext {
   return {
     rest: params.rest,
-    ...createDiscordRuntimeAccountContext({
-      cfg: params.cfg,
-      accountId: params.accountId,
-    }),
+    ...createDiscordRuntimeAccountContext(params),
   };
 }
 
@@ -59,7 +56,7 @@ export function queueInitialDiscordAckReaction(params: {
   if (!params.shouldSendAckReaction || !params.ackReaction) {
     return;
   }
-  void params.reactionAdapter.setReaction(params.ackReaction).catch((err) => {
+  void params.reactionAdapter.setReaction(params.ackReaction).catch((err: unknown) => {
     logAckFailure({
       log: logVerbose,
       channel: "discord",

@@ -1,14 +1,50 @@
-import { spawn, type SpawnOptions } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { root } from "openclaw/plugin-sdk/security-runtime";
+import { normalizeOptionalString as trimToValue } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { ensureRepoBoundDirectory, resolveRepoRelativeOutputDir } from "../cli-paths.js";
+import {
+  copyMantisLaneArtifacts,
+  createMantisRunStaging,
+  publishMantisRunOutput,
+  readMantisLaneResult,
+  remapMantisLaneResult,
+  removeMantisRunStaging,
+  stageMantisLaneOutput,
+  type LaneResult,
+  type MantisRunStaging,
+} from "./run-artifacts.runtime.js";
+import { removeLegacyMantisWorktrees, removeMantisWorktree } from "./run-cleanup.runtime.js";
+import {
+  assertMantisCommandNotAborted,
+  defaultMantisCommandRunner,
+  MantisCommandCleanupError,
+  resolveMantisCommandTimeouts,
+  runMantisCommand,
+  type MantisCommandExecution,
+  type MantisCommandRunner,
+  type MantisCommandTimeoutOverrides,
+  type MantisCommandTimeouts,
+} from "./run-command.runtime.js";
+import {
+  captureMantisDirectoryOwnership,
+  type MantisDirectoryOwnership,
+} from "./run-directory.runtime.js";
+import {
+  buildEvidenceManifest,
+  renderReport,
+  type MantisComparison,
+  type MantisScenarioConfig,
+} from "./run-evidence.runtime.js";
+import { attachMantisFailureArtifact } from "./run-failure.runtime.js";
 
 export type MantisBeforeAfterOptions = {
-  allowFailures?: boolean;
   baseline?: string;
   candidate?: string;
-  commandRunner?: CommandRunner;
+  commandRunner?: MantisCommandRunner;
+  commandTimeouts?: MantisCommandTimeoutOverrides;
   credentialRole?: string;
   credentialSource?: string;
   fastMode?: boolean;
@@ -17,75 +53,51 @@ export type MantisBeforeAfterOptions = {
   providerMode?: string;
   repoRoot?: string;
   scenario?: string;
+  signal?: AbortSignal;
   skipBuild?: boolean;
   skipInstall?: boolean;
   transport?: string;
 };
 
-export type MantisBeforeAfterResult = {
+type MantisBeforeAfterResult = {
   comparisonPath: string;
+  manifestPath: string;
   outputDir: string;
   reportPath: string;
   status: "pass" | "fail";
 };
 
-type CommandRunner = (
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-) => Promise<void>;
-
-type DiscordQaSummary = {
-  scenarios?: {
-    artifactPaths?: Record<string, string>;
-    details?: string;
-    id?: string;
-    status?: string;
-    title?: string;
-  }[];
-};
-
-type LaneResult = {
-  outputDir: string;
-  scenarioDetails?: string;
-  screenshotPath?: string;
-  status: string;
-  summaryPath: string;
-};
-
-type Comparison = {
-  baseline: {
-    expected: "queued-only";
-    ref: string;
-    reproduced: boolean;
-    screenshotPath?: string;
-    status: string;
-  };
-  candidate: {
-    expected: "queued -> thinking -> done";
-    fixed: boolean;
-    ref: string;
-    screenshotPath?: string;
-    status: string;
-  };
-  pass: boolean;
-  scenario: string;
-  transport: "discord";
-};
-
 const DEFAULT_BASELINE_REF = "0bf06e953fdda290799fc9fb9244a8f67fdae593";
 const DEFAULT_CANDIDATE_REF = "HEAD";
 const DEFAULT_SCENARIO = "discord-status-reactions-tool-only";
+const DISCORD_THREAD_FILEPATH_ATTACHMENT_SCENARIO = "discord-thread-reply-filepath-attachment";
 const DEFAULT_TRANSPORT = "discord";
 const DEFAULT_PROVIDER_MODE = "live-frontier";
 const DEFAULT_MODEL = "openai/gpt-5.4";
 const DEFAULT_CREDENTIAL_SOURCE = "convex";
 const DEFAULT_CREDENTIAL_ROLE = "ci";
-
-function trimToValue(value: string | undefined) {
-  const trimmed = value?.trim();
-  return trimmed && trimmed.length > 0 ? trimmed : undefined;
-}
+const MANTIS_SCENARIO_CONFIGS: Record<string, MantisScenarioConfig> = {
+  [DEFAULT_SCENARIO]: {
+    baselineExpected: "queued-only",
+    baselineLabel: "Baseline queued-only",
+    baselineScreenshotAlt: "Baseline Discord status reaction timeline",
+    candidateExpected: "queued -> thinking -> done",
+    candidateLabel: "Candidate queued -> thinking -> done",
+    candidateScreenshotAlt: "Candidate Discord status reaction timeline",
+    defaultBaselineRef: DEFAULT_BASELINE_REF,
+    title: "Mantis Discord Status Reactions QA",
+  },
+  [DISCORD_THREAD_FILEPATH_ATTACHMENT_SCENARIO]: {
+    baselineExpected: "thread reply omits filePath attachment",
+    baselineLabel: "Baseline missing filePath attachment",
+    baselineScreenshotAlt: "Baseline Discord thread reply without filePath attachment",
+    candidateExpected: "thread reply includes filePath attachment",
+    candidateLabel: "Candidate includes filePath attachment",
+    candidateScreenshotAlt: "Candidate Discord thread reply with filePath attachment",
+    defaultBaselineRef: "81349cdc2a9d5143fd0991ed858b739e7d96e05c",
+    title: "Mantis Discord Thread Attachment QA",
+  },
+};
 
 function normalizeRequiredLiteral<T extends string>(
   value: string | undefined,
@@ -105,117 +117,35 @@ function defaultOutputDir(repoRoot: string, startedAt: Date) {
   return path.join(repoRoot, ".artifacts", "qa-e2e", "mantis", `run-${stamp}`);
 }
 
-function defaultCommandRunner(
-  command: string,
-  args: readonly string[],
-  options: SpawnOptions,
-): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      ...options,
-      stdio: options.stdio ?? "inherit",
-    });
-    child.on("error", reject);
-    child.on("close", (code, signal) => {
-      if (code === 0) {
-        resolve();
-        return;
-      }
-      const detail = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
-      reject(new Error(`${command} ${args.join(" ")} failed with ${detail}`));
-    });
-  });
+function formatMantisFailure(error: unknown): string {
+  const lines: string[] = [];
+  const append = (entry: unknown, pathParts: number[]) => {
+    const prefix = pathParts.length > 0 ? `${pathParts.join(".")}. ` : "";
+    lines.push(`${prefix}${formatErrorMessage(entry)}`);
+    if (entry instanceof AggregateError) {
+      entry.errors.forEach((nestedError, index) => append(nestedError, [...pathParts, index + 1]));
+    }
+  };
+  append(error, []);
+  return lines.join("\n");
 }
 
-async function runCommand(params: {
-  args: readonly string[];
-  command: string;
-  cwd: string;
-  runner: CommandRunner;
-}) {
-  await params.runner(params.command, params.args, {
-    cwd: params.cwd,
-    env: process.env,
-    stdio: "inherit",
-  });
-}
-
-async function copyDirContents(sourceDir: string, targetDir: string) {
-  await fs.rm(targetDir, { force: true, recursive: true });
-  await fs.mkdir(targetDir, { recursive: true });
-  await fs.cp(sourceDir, targetDir, { recursive: true });
-}
-
-async function readLaneResult(params: {
-  laneOutputDir: string;
-  publishedLaneDir: string;
-  scenario: string;
-}) {
-  const summaryPath = path.join(params.publishedLaneDir, "discord-qa-summary.json");
-  const summary = JSON.parse(await fs.readFile(summaryPath, "utf8")) as DiscordQaSummary;
-  const scenarioSummary =
-    summary.scenarios?.find((entry) => entry.id === params.scenario) ?? summary.scenarios?.[0];
-  const status = scenarioSummary?.status ?? "fail";
-  const screenshotPath = scenarioSummary?.artifactPaths?.screenshot;
-  return {
-    outputDir: params.publishedLaneDir,
-    scenarioDetails: scenarioSummary?.details,
-    screenshotPath,
-    status,
-    summaryPath,
-  } satisfies LaneResult;
-}
-
-function renderReport(params: {
-  baseline: LaneResult;
-  candidate: LaneResult;
-  comparison: Comparison;
+async function throwMantisRunFailure(params: {
+  error: unknown;
   outputDir: string;
-}) {
-  const lines = [
-    "# Mantis Before/After",
-    "",
-    `Status: ${params.comparison.pass ? "pass" : "fail"}`,
-    `Transport: ${params.comparison.transport}`,
-    `Scenario: ${params.comparison.scenario}`,
-    `Output: ${params.outputDir}`,
-    "",
-    "## Baseline",
-    "",
-    `- Ref: \`${params.comparison.baseline.ref}\``,
-    `- Expected: ${params.comparison.baseline.expected}`,
-    `- Status: \`${params.baseline.status}\``,
-    `- Reproduced: \`${params.comparison.baseline.reproduced}\``,
-    params.baseline.screenshotPath
-      ? `- Screenshot: \`${path.join("baseline", path.basename(params.baseline.screenshotPath))}\``
-      : "- Screenshot: missing",
-    params.baseline.scenarioDetails ? `- Details: ${params.baseline.scenarioDetails}` : undefined,
-    "",
-    "## Candidate",
-    "",
-    `- Ref: \`${params.comparison.candidate.ref}\``,
-    `- Expected: ${params.comparison.candidate.expected}`,
-    `- Status: \`${params.candidate.status}\``,
-    `- Fixed: \`${params.comparison.candidate.fixed}\``,
-    params.candidate.screenshotPath
-      ? `- Screenshot: \`${path.join("candidate", path.basename(params.candidate.screenshotPath))}\``
-      : "- Screenshot: missing",
-    params.candidate.scenarioDetails ? `- Details: ${params.candidate.scenarioDetails}` : undefined,
-    "",
-  ].filter((line) => line !== undefined);
-  return `${lines.join("\n")}\n`;
-}
-
-async function copyScreenshot(params: { lane: "baseline" | "candidate"; result: LaneResult }) {
-  if (!params.result.screenshotPath) {
-    return undefined;
+  outputRoot: Pick<Awaited<ReturnType<typeof root>>, "write">;
+}): Promise<never> {
+  const errorPath = path.join(params.outputDir, "error.txt");
+  try {
+    await params.outputRoot.write("error.txt", `${formatMantisFailure(params.error)}\n`);
+  } catch (artifactError) {
+    throw new AggregateError(
+      [params.error, artifactError],
+      `Mantis run failed and could not safely write ${errorPath}: ${formatErrorMessage(params.error)}`,
+      { cause: artifactError },
+    );
   }
-  const source = path.isAbsolute(params.result.screenshotPath)
-    ? params.result.screenshotPath
-    : path.join(params.result.outputDir, params.result.screenshotPath);
-  const target = path.join(params.result.outputDir, `${params.lane}.png`);
-  await fs.copyFile(source, target);
-  return target;
+  throw attachMantisFailureArtifact(params.error, errorPath);
 }
 
 async function runLane(params: {
@@ -223,8 +153,12 @@ async function runLane(params: {
   outputDir: string;
   ref: string;
   repoRoot: string;
-  runner: CommandRunner;
+  runId: string;
+  runner: MantisCommandRunner;
   scenario: string;
+  signal?: AbortSignal;
+  stagingDir: string;
+  commandTimeouts: MantisCommandTimeouts;
   worktreeRoot: string;
   opts: Required<
     Pick<
@@ -238,35 +172,78 @@ async function runLane(params: {
     >
   >;
 }) {
-  const worktreeDir = path.join(params.worktreeRoot, params.lane);
+  const worktreeDir = path.join(params.worktreeRoot, `${params.lane}-${params.runId}`);
   const worktreeOutputDir = path.join(".artifacts", "qa-e2e", "mantis", "run", params.lane);
-  await runCommand({
-    command: "git",
-    args: ["worktree", "add", "--detach", worktreeDir, params.ref],
+  const publishedLaneDir = path.join(params.outputDir, params.lane);
+  const stagedLaneDir = path.join(params.stagingDir, params.lane);
+  const worktreeAddArgs = ["worktree", "add", "--detach", "--", worktreeDir, params.ref];
+  const worktreeAddExecution = {
     cwd: params.repoRoot,
-    runner: params.runner,
+    env: process.env,
+    signal: params.signal,
+    stage: "worktree-add",
+    timeoutMs: params.commandTimeouts["worktree-add"],
+  } satisfies MantisCommandExecution;
+  let worktreeOwnership: MantisDirectoryOwnership | undefined;
+  let workloadFailed = false;
+  let workloadError: unknown;
+  let cleanupFailed = false;
+  let cleanupError: unknown;
+  let stagedResult: LaneResult | undefined;
+
+  assertMantisCommandNotAborted({
+    command: "git",
+    args: worktreeAddArgs,
+    execution: worktreeAddExecution,
+    lane: params.lane,
   });
-  if (!params.opts.skipInstall) {
-    await runCommand({
-      command: "pnpm",
-      args: ["--dir", worktreeDir, "install", "--frozen-lockfile"],
-      cwd: params.repoRoot,
+  // The launcher's interrupt timer starts before command settlement or artifact
+  // staging finishes. Charge that transition to the same cleanup budget.
+  let interruptedCleanupDeadline: number | undefined;
+  const onAbort = () => {
+    interruptedCleanupDeadline ??= Date.now() + params.commandTimeouts["worktree-cleanup"];
+  };
+  params.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    await fs.mkdir(worktreeDir, { mode: 0o700 });
+    worktreeOwnership = await captureMantisDirectoryOwnership({
+      directoryPath: worktreeDir,
+      repoRoot: params.repoRoot,
+    });
+    assertMantisCommandNotAborted({
+      command: "git",
+      args: worktreeAddArgs,
+      execution: worktreeAddExecution,
+      lane: params.lane,
+    });
+    await runMantisCommand({
+      command: "git",
+      args: worktreeAddArgs,
+      execution: worktreeAddExecution,
+      lane: params.lane,
       runner: params.runner,
     });
-  }
-  if (!params.opts.skipBuild) {
-    await runCommand({
-      command: "pnpm",
-      args: ["--dir", worktreeDir, "build"],
-      cwd: params.repoRoot,
-      runner: params.runner,
-    });
-  }
-  await runCommand({
-    command: "pnpm",
-    args: [
-      "--dir",
-      worktreeDir,
+    const runPnpmStage = (stage: "install" | "build" | "qa", args: readonly string[]) =>
+      runMantisCommand({
+        command: "pnpm",
+        args: ["--dir", worktreeDir, ...args],
+        execution: {
+          cwd: params.repoRoot,
+          env: process.env,
+          signal: params.signal,
+          stage,
+          timeoutMs: params.commandTimeouts[stage],
+        },
+        lane: params.lane,
+        runner: params.runner,
+      });
+    if (!params.opts.skipInstall) {
+      await runPnpmStage("install", ["install", "--frozen-lockfile"]);
+    }
+    if (!params.opts.skipBuild) {
+      await runPnpmStage("build", ["build"]);
+    }
+    await runPnpmStage("qa", [
       "openclaw",
       "qa",
       "discord",
@@ -288,22 +265,86 @@ async function runLane(params: {
       "--scenario",
       params.scenario,
       "--allow-failures",
-    ],
-    cwd: params.repoRoot,
-    runner: params.runner,
-  });
-  const publishedLaneDir = path.join(params.outputDir, params.lane);
-  await copyDirContents(path.join(worktreeDir, worktreeOutputDir), publishedLaneDir);
-  const result = await readLaneResult({
-    laneOutputDir: path.join(worktreeDir, worktreeOutputDir),
+    ]);
+    // Git owns worktree removal, so preserve the lane artifacts before cleanup.
+    await stageMantisLaneOutput(path.join(worktreeDir, worktreeOutputDir), stagedLaneDir);
+    // Resolve producer coordinates and preserve referenced media before Git removes the worktree.
+    const result = await readMantisLaneResult({
+      laneOutputDir: path.join(worktreeDir, worktreeOutputDir),
+      laneRepoRoot: worktreeDir,
+      publishedLaneDir: stagedLaneDir,
+      scenario: params.scenario,
+    });
+    stagedResult = await copyMantisLaneArtifacts({ lane: params.lane, result });
+  } catch (error) {
+    workloadFailed = true;
+    workloadError = error;
+  }
+  // Both failures are collected before either is rethrown, so cleanup cannot
+  // overwrite the workload failure or lose its diagnostic cause.
+  try {
+    if (worktreeOwnership) {
+      if (workloadError instanceof MantisCommandCleanupError) {
+        throw new Error(
+          `Mantis preserved ${worktreeDir}: command descendants may still be running`,
+          {
+            cause: workloadError,
+          },
+        );
+      }
+      const cleanupMs =
+        interruptedCleanupDeadline === undefined
+          ? params.commandTimeouts["worktree-cleanup"]
+          : interruptedCleanupDeadline - Date.now();
+      if (cleanupMs <= 0) {
+        throw new Error(`Mantis preserved ${worktreeDir}: interrupt cleanup budget exhausted`, {
+          cause: params.signal?.reason,
+        });
+      }
+      await removeMantisWorktree({
+        commandTimeouts: { ...params.commandTimeouts, "worktree-cleanup": cleanupMs },
+        lane: params.lane,
+        repoRoot: params.repoRoot,
+        runner: params.runner,
+        worktreeDir,
+        ownership: worktreeOwnership,
+      });
+    }
+  } catch (error) {
+    cleanupFailed = true;
+    cleanupError = error;
+  } finally {
+    params.signal?.removeEventListener("abort", onAbort);
+  }
+
+  if (workloadFailed && cleanupFailed) {
+    throw new AggregateError(
+      [workloadError, cleanupError],
+      "Mantis lane failed and worktree cleanup failed",
+      { cause: workloadError },
+    );
+  }
+  if (workloadFailed) {
+    throw workloadError;
+  }
+  if (cleanupFailed) {
+    throw cleanupError;
+  }
+  if (params.signal?.aborted) {
+    throw new Error(`${params.lane} artifact processing aborted`, {
+      cause: params.signal.reason,
+    });
+  }
+  if (!stagedResult) {
+    throw new Error("Mantis lane artifacts were not staged");
+  }
+  // Reports are rendered before publication, so expose final stable paths while
+  // the bytes remain in this run's private staging directory.
+  return remapMantisLaneResult({
     publishedLaneDir,
-    scenario: params.scenario,
-  });
-  const copiedScreenshot = await copyScreenshot({ lane: params.lane, result });
-  return {
-    ...result,
-    screenshotPath: copiedScreenshot ?? result.screenshotPath,
-  } satisfies LaneResult;
+    result: stagedResult,
+    stagedLaneDir,
+  }) satisfies LaneResult;
 }
 
 export async function runMantisBeforeAfter(
@@ -326,18 +367,39 @@ export async function runMantisBeforeAfter(
   const scenario = normalizeRequiredLiteral(
     opts.scenario,
     DEFAULT_SCENARIO,
-    [DEFAULT_SCENARIO],
+    Object.keys(MANTIS_SCENARIO_CONFIGS),
     "--scenario",
   );
-  const baseline = trimToValue(opts.baseline) ?? DEFAULT_BASELINE_REF;
+  const scenarioConfig = MANTIS_SCENARIO_CONFIGS[scenario];
+  if (!scenarioConfig) {
+    throw new Error(`Unsupported Mantis scenario: ${scenario}`);
+  }
+  const baseline = trimToValue(opts.baseline) ?? scenarioConfig.defaultBaselineRef;
   const candidate = trimToValue(opts.candidate) ?? DEFAULT_CANDIDATE_REF;
-  const runner = opts.commandRunner ?? defaultCommandRunner;
-  const worktreeRoot = path.join(outputDir, "worktrees");
+  const commandTimeouts = resolveMantisCommandTimeouts(scenario, opts.commandTimeouts);
+  const runner = opts.commandRunner ?? defaultMantisCommandRunner;
+  const outputRoot = await root(outputDir);
+  const runId = `${process.pid}-${randomUUID()}`;
+  const worktreeRoot = await ensureRepoBoundDirectory(
+    repoRoot,
+    `${outputDir}.worktrees`,
+    "Mantis before/after worktree directory",
+    { mode: 0o755 },
+  );
   const comparisonPath = path.join(outputDir, "comparison.json");
+  const manifestPath = path.join(outputDir, "mantis-evidence.json");
   const reportPath = path.join(outputDir, "mantis-report.md");
-  await fs.mkdir(worktreeRoot, { recursive: true });
+  let staging: MantisRunStaging | undefined;
 
   try {
+    await removeLegacyMantisWorktrees({
+      commandTimeouts,
+      outputDir,
+      repoRoot,
+      runner,
+    });
+    staging = await createMantisRunStaging({ outputDir, outputRoot, runId });
+    const stagingRoot = await root(staging.dir);
     const commonOpts = {
       credentialRole: trimToValue(opts.credentialRole) ?? DEFAULT_CREDENTIAL_ROLE,
       credentialSource: trimToValue(opts.credentialSource) ?? DEFAULT_CREDENTIAL_SOURCE,
@@ -346,64 +408,94 @@ export async function runMantisBeforeAfter(
       skipBuild: opts.skipBuild ?? false,
       skipInstall: opts.skipInstall ?? false,
     };
-    const baselineResult = await runLane({
-      lane: "baseline",
+    const laneOptions = {
       outputDir,
-      ref: baseline,
       repoRoot,
+      runId,
       runner,
       scenario,
+      signal: opts.signal,
+      stagingDir: staging.dir,
+      commandTimeouts,
       worktreeRoot,
       opts: commonOpts,
-    });
-    const candidateResult = await runLane({
-      lane: "candidate",
-      outputDir,
-      ref: candidate,
-      repoRoot,
-      runner,
-      scenario,
-      worktreeRoot,
-      opts: commonOpts,
-    });
+    };
+    const baselineResult = await runLane({ ...laneOptions, lane: "baseline", ref: baseline });
+    const candidateResult = await runLane({ ...laneOptions, lane: "candidate", ref: candidate });
     const comparison = {
       baseline: {
-        expected: "queued-only",
+        expected: scenarioConfig.baselineExpected,
         ref: baseline,
         reproduced: baselineResult.status === "fail",
         screenshotPath: baselineResult.screenshotPath,
         status: baselineResult.status,
+        videoPath: baselineResult.videoPath,
       },
       candidate: {
-        expected: "queued -> thinking -> done",
+        expected: scenarioConfig.candidateExpected,
         fixed: candidateResult.status === "pass",
         ref: candidate,
         screenshotPath: candidateResult.screenshotPath,
         status: candidateResult.status,
+        videoPath: candidateResult.videoPath,
       },
       pass: baselineResult.status === "fail" && candidateResult.status === "pass",
       scenario,
       transport,
-    } satisfies Comparison;
-    await fs.writeFile(comparisonPath, `${JSON.stringify(comparison, null, 2)}\n`, "utf8");
-    await fs.writeFile(
-      reportPath,
+    } satisfies MantisComparison;
+    if (opts.signal?.aborted) {
+      throw new Error("Mantis artifact processing aborted", { cause: opts.signal.reason });
+    }
+    await stagingRoot.write("comparison.json", `${JSON.stringify(comparison, null, 2)}\n`);
+    await stagingRoot.write(
+      "mantis-report.md",
       renderReport({
         baseline: baselineResult,
         candidate: candidateResult,
         comparison,
         outputDir,
+        scenarioConfig,
       }),
-      "utf8",
     );
+    await stagingRoot.write(
+      "mantis-evidence.json",
+      `${JSON.stringify(
+        buildEvidenceManifest({
+          baseline: baselineResult,
+          candidate: candidateResult,
+          comparison,
+          outputDir,
+          scenarioConfig,
+        }),
+        null,
+        2,
+      )}\n`,
+    );
+    await publishMantisRunOutput({ outputRoot, runId, signal: opts.signal, staging });
     return {
       comparisonPath,
+      manifestPath,
       outputDir,
       reportPath,
       status: comparison.pass ? "pass" : "fail",
     };
   } catch (error) {
-    await fs.writeFile(path.join(outputDir, "error.txt"), `${formatErrorMessage(error)}\n`, "utf8");
-    throw error;
+    let failure = error;
+    if (staging) {
+      try {
+        await removeMantisRunStaging({ outputRoot, staging });
+      } catch (cleanupError) {
+        failure = new AggregateError(
+          [error, cleanupError],
+          "Mantis run failed and artifact staging cleanup failed",
+          { cause: error },
+        );
+      }
+    }
+    return throwMantisRunFailure({
+      error: failure,
+      outputDir,
+      outputRoot,
+    });
   }
 }

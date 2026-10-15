@@ -1,3 +1,4 @@
+// Channels plugin-install test helpers build catalog, plugin, and config fixtures for add/remove suites.
 import { vi } from "vitest";
 import type { ChannelPluginCatalogEntry } from "../channels/plugins/catalog.js";
 import type { ChannelPlugin } from "../channels/plugins/types.plugin.js";
@@ -10,7 +11,7 @@ export function createMockChannelSetupPluginInstallModule(
   return {
     ...actual,
     ensureChannelSetupPluginInstalled: vi.fn(async ({ cfg }) => ({ cfg, installed: true })),
-    loadChannelSetupPluginRegistrySnapshotForChannel: vi.fn(() => createTestRegistry()),
+    loadChannelSetupPluginRegistrySnapshotForChannel: vi.fn(async () => createTestRegistry()),
   };
 }
 

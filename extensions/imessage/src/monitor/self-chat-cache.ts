@@ -11,6 +11,14 @@ type SelfChatCacheKeyParts = {
 type SelfChatLookup = SelfChatCacheKeyParts & {
   text?: string;
   createdAt?: number;
+  allowCreatedAtSkew?: boolean;
+};
+
+type SelfChatCacheEntry = {
+  key: string;
+  createdAt: number;
+  createdAtSkewToleranceMs: number;
+  rememberedAt: number;
 };
 
 export type SelfChatCache = {
@@ -19,6 +27,7 @@ export type SelfChatCache = {
 };
 
 const SELF_CHAT_TTL_MS = 10_000;
+const SELF_CHAT_CREATED_AT_TOLERANCE_MS = 1_000;
 const MAX_SELF_CHAT_CACHE_ENTRIES = 512;
 const CLEANUP_MIN_INTERVAL_MS = 1_000;
 
@@ -47,34 +56,47 @@ function buildScope(parts: SelfChatCacheKeyParts): string {
 }
 
 class DefaultSelfChatCache implements SelfChatCache {
-  private cache = new Map<string, number>();
+  private entries: SelfChatCacheEntry[] = [];
   private lastCleanupAt = 0;
 
-  private buildKey(lookup: SelfChatLookup): string | null {
+  private buildBucketKey(lookup: SelfChatLookup): string | null {
     const text = normalizeText(lookup.text);
-    if (!text || !isUsableTimestamp(lookup.createdAt)) {
+    if (!text) {
       return null;
     }
-    return `${buildScope(lookup)}:${lookup.createdAt}:${digestText(text)}`;
+    return `${buildScope(lookup)}:${digestText(text)}`;
   }
 
   remember(lookup: SelfChatLookup): void {
-    const key = this.buildKey(lookup);
-    if (!key) {
+    const key = this.buildBucketKey(lookup);
+    if (!key || !isUsableTimestamp(lookup.createdAt)) {
       return;
     }
-    this.cache.set(key, Date.now());
+    this.entries.push({
+      key,
+      createdAt: lookup.createdAt,
+      createdAtSkewToleranceMs: lookup.allowCreatedAtSkew ? SELF_CHAT_CREATED_AT_TOLERANCE_MS : 0,
+      rememberedAt: Date.now(),
+    });
     this.maybeCleanup();
   }
 
   has(lookup: SelfChatLookup): boolean {
     this.maybeCleanup();
-    const key = this.buildKey(lookup);
-    if (!key) {
+    const key = this.buildBucketKey(lookup);
+    if (!key || !isUsableTimestamp(lookup.createdAt)) {
       return false;
     }
-    const timestamp = this.cache.get(key);
-    return typeof timestamp === "number" && Date.now() - timestamp <= SELF_CHAT_TTL_MS;
+    const now = Date.now();
+    const createdAt = lookup.createdAt;
+    return this.entries.some((entry) => {
+      const createdAtDelta = Math.abs(entry.createdAt - createdAt);
+      return (
+        entry.key === key &&
+        now - entry.rememberedAt <= SELF_CHAT_TTL_MS &&
+        (createdAtDelta === 0 || createdAtDelta < entry.createdAtSkewToleranceMs)
+      );
+    });
   }
 
   private maybeCleanup(): void {
@@ -83,18 +105,9 @@ class DefaultSelfChatCache implements SelfChatCache {
       return;
     }
     this.lastCleanupAt = now;
-    for (const [key, timestamp] of this.cache.entries()) {
-      if (now - timestamp > SELF_CHAT_TTL_MS) {
-        this.cache.delete(key);
-      }
-    }
-    while (this.cache.size > MAX_SELF_CHAT_CACHE_ENTRIES) {
-      const oldestKey = this.cache.keys().next().value;
-      if (typeof oldestKey !== "string") {
-        break;
-      }
-      this.cache.delete(oldestKey);
-    }
+    this.entries = this.entries
+      .filter((entry) => now - entry.rememberedAt <= SELF_CHAT_TTL_MS)
+      .slice(-MAX_SELF_CHAT_CACHE_ENTRIES);
   }
 }
 

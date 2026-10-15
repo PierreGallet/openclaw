@@ -1,15 +1,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-
-export async function exists(filePath: string): Promise<boolean> {
-  try {
-    await fs.access(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
+import { tryReadJson } from "@openclaw/fs-safe/json";
+import { asNonArrayRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export async function isDirectory(filePath: string | undefined): Promise<boolean> {
   if (!filePath) {
@@ -48,13 +41,5 @@ export function sanitizeName(value: string): string {
 export async function readJsonObject(
   filePath: string | undefined,
 ): Promise<Record<string, unknown>> {
-  if (!filePath) {
-    return {};
-  }
-  try {
-    const parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
+  return asNonArrayRecord(filePath ? await tryReadJson(filePath) : null);
 }

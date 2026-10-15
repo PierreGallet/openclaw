@@ -1,346 +1,537 @@
-import { resolveOpenClawAgentDir } from "../../agents/agent-paths.js";
 import {
-  type AuthHealthSummary,
+  findNormalizedProviderKey,
+  normalizeProviderId,
+} from "@openclaw/model-catalog-core/provider-id";
+import { asDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
+import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
+import {
+  ErrorCodes,
+  errorShape,
+  validateModelsAuthSetApiKeyParams,
+  type ModelsAuthSetApiKeyResult,
+} from "../../../packages/gateway-protocol/src/index.js";
+import { tryResolveAmbientOwnerAgentId } from "../../agents/agent-scope-config.js";
+import {
   type AuthProfileHealthStatus,
   type AuthProviderHealth,
-  type AuthProviderHealthStatus,
-  buildAuthHealthSummary,
   formatRemainingShort,
 } from "../../agents/auth-health.js";
 import {
-  ensureAuthProfileStore,
+  ensureAuthProfileStoreWithoutExternalProfilesAsync,
   externalCliDiscoveryForConfigStatus,
+  listProfilesForProvider,
+  resolveAuthProfileMetadata,
+  resolveExplicitAuthOrderSelection,
 } from "../../agents/auth-profiles.js";
-import { normalizeProviderId } from "../../agents/provider-id.js";
+import { refreshRuntimeAuthProfileStoreSources } from "../../agents/auth-profiles/runtime-snapshots.js";
+import type { RuntimeAuthProfileStore } from "../../agents/auth-profiles/types.js";
+import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import type { OpenClawConfig } from "../../config/config.js";
-import { isSecretRef } from "../../config/types.secrets.js";
-import { loadProviderUsageSummary } from "../../infra/provider-usage.load.js";
-import { PROVIDER_LABELS, resolveUsageProviderId } from "../../infra/provider-usage.shared.js";
-import type { UsageProviderId, UsageWindow } from "../../infra/provider-usage.types.js";
+import { providerUsageLabel, resolveUsageProviderId } from "../../infra/provider-usage.shared.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import { ErrorCodes, errorShape } from "../protocol/index.js";
+import { refreshActiveProviderAuthRuntimeSnapshot } from "../../secrets/runtime.js";
+import { abortChatRunsForProvider } from "../chat-abort.js";
+import { refreshModelAuthStateAfterMutation } from "../model-auth-refresh.js";
+import { hasGatewayAdminScope } from "../operator-scopes.js";
+import { loadDeferredCatalog, readPreparedCatalog } from "../server-model-catalog-auth.js";
 import { formatForLog } from "../ws-log.js";
-import type { GatewayRequestHandlers } from "./types.js";
+import {
+  captureLocalStateMutationGuard,
+  localStateOwnerChangedError,
+} from "./local-state-owner.js";
+import { resolveModelAuthAgentScope } from "./model-auth-agent-scope.js";
+import { modelsAuthRefreshHandlers } from "./models-auth-refresh.js";
+import { readModelAuthStatusFacts } from "./models-auth-status-facts.js";
+import { readProviderUsageStaleWhileRevalidate } from "./models-auth-status-usage-cache.js";
+import type {
+  ModelAuthExpiry,
+  ModelAuthLogoutResult,
+  ModelAuthStatusProvider,
+  ModelAuthStatusResult,
+} from "./models-auth-status.types.js";
+import { getProviderUsageRuntimeSnapshot } from "./provider-usage-runtime.js";
+import { respondUnavailableOnThrow } from "./response.js";
+import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
+import { assertValidParams } from "./validation.js";
 
 const log = createSubsystemLogger("models-auth-status");
-
-/**
- * Models-auth status wire types. Mirrored in ui/src/ui/types.ts via an
- * `import(...)` re-export — edit here and the UI picks up the change.
- *
- * Expiry fields are grouped into a sub-object so they're present together or
- * not at all: a profile either has a time-bounded credential or it doesn't.
- */
-export type ModelAuthExpiry = {
-  /** Absolute expiry timestamp, ms since epoch. */
-  at: number;
-  /** Remaining time in ms (negative if already expired). */
-  remainingMs: number;
-  /** Human-readable remaining time (e.g. "10d", "2h", "45m"). */
-  label: string;
-};
-
-export type ModelAuthStatusProfile = {
-  profileId: string;
-  type: "oauth" | "token" | "api_key";
-  status: AuthProfileHealthStatus;
-  expiry?: ModelAuthExpiry;
-};
-
-export type ModelAuthStatusProvider = {
-  provider: string;
-  displayName: string;
-  status: AuthProviderHealthStatus;
-  expiry?: ModelAuthExpiry;
-  profiles: ModelAuthStatusProfile[];
-  usage?: {
-    windows: UsageWindow[];
-    plan?: string;
+function resolveAuthRefreshScope(cfg: OpenClawConfig): {
+  providerIds: string[];
+  profileIds?: string[];
+} {
+  const discovery = externalCliDiscoveryForConfigStatus({ cfg });
+  if (discovery.mode !== "scoped") {
+    return { providerIds: [] };
+  }
+  const providerIds = [...(discovery.providerIds ?? [])];
+  const profileIds = [...(discovery.profileIds ?? [])];
+  return {
+    providerIds,
+    ...(profileIds.length > 0 ? { profileIds } : {}),
   };
-};
-
-export type ModelAuthStatusResult = {
-  /** Snapshot build time, ms since epoch. 0 = never loaded (UI fallback sentinel). */
-  ts: number;
-  providers: ModelAuthStatusProvider[];
-};
-
-const CACHE_TTL_MS = 60_000;
-let cached: { ts: number; result: ModelAuthStatusResult } | null = null;
-
-/**
- * Invalidate the in-memory cache. Reserved for future gateway-side auth
- * mutation handlers (login, logout, token rotation) so the next read returns
- * fresh data. Today those mutations happen via the CLI and the 60s TTL plus
- * `{refresh: true}` param cover the stale-data window.
- */
-export function invalidateModelAuthStatusCache(): void {
-  cached = null;
 }
 
+function readProviderParam(params: Record<string, unknown>): string | null {
+  const raw = params.provider;
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const provider = normalizeProviderId(raw);
+  return provider || null;
+}
+
+type LogoutProfileSelection = { ok: true; profileIds?: string[] } | { ok: false; message: string };
+
+function readLogoutProfileSelection(params: Record<string, unknown>): LogoutProfileSelection {
+  if (!("profileIds" in params)) {
+    return { ok: true };
+  }
+  if (!Array.isArray(params.profileIds) || params.profileIds.length === 0) {
+    return { ok: false, message: "profileIds must be a non-empty string array" };
+  }
+  for (const value of params.profileIds) {
+    if (typeof value !== "string" || !value.trim()) {
+      return { ok: false, message: "profileIds must be a non-empty string array" };
+    }
+  }
+  return { ok: true, profileIds: normalizeUniqueStringEntries(params.profileIds) };
+}
+
+// UI expiry fields are emitted only when both timestamp and remaining duration
+// are valid, keeping profile/provider expiry shapes all-or-nothing.
 function buildExpiry(
   remainingMs: number | undefined,
   expiresAt: number | undefined,
 ): ModelAuthExpiry | undefined {
-  if (
-    typeof expiresAt !== "number" ||
-    !Number.isFinite(expiresAt) ||
-    typeof remainingMs !== "number"
-  ) {
+  const normalizedExpiresAt = asDateTimestampMs(expiresAt);
+  if (normalizedExpiresAt === undefined || typeof remainingMs !== "number") {
     return undefined;
   }
-  return { at: expiresAt, remainingMs, label: formatRemainingShort(remainingMs) };
+  return { at: normalizedExpiresAt, remainingMs, label: formatRemainingShort(remainingMs) };
 }
 
 function providerDisplayName(provider: string): string {
   const usageId = resolveUsageProviderId(provider);
-  if (usageId && PROVIDER_LABELS[usageId]) {
-    return PROVIDER_LABELS[usageId];
-  }
-  return provider;
+  return (usageId && providerUsageLabel(usageId)) || provider;
+}
+
+type ModelAuthStatusRollup = Pick<AuthProviderHealth, "status" | "expiresAt" | "remainingMs">;
+
+function aggregateProfileStatus(
+  profiles: AuthProviderHealth["profiles"],
+  now: number,
+): ModelAuthStatusRollup {
+  const statuses = new Set<AuthProfileHealthStatus>(profiles.map((profile) => profile.status));
+  const status = (["expired", "missing", "expiring", "ok", "static"] as const).find((candidate) =>
+    statuses.has(candidate),
+  );
+  const expirable = profiles
+    .map((p) => p.expiresAt)
+    .filter((v): v is number => asDateTimestampMs(v) !== undefined);
+  const expiresAt = expirable.length > 0 ? Math.min(...expirable) : undefined;
+  const remainingMs = expiresAt !== undefined ? expiresAt - now : undefined;
+  return { status: status ?? "static", expiresAt, remainingMs };
 }
 
 /**
- * Aggregate provider status from OAuth profiles only. `buildAuthHealthSummary`
- * rolls up across both OAuth and token profiles, which mis-reports providers
- * where a healthy OAuth sits alongside an expired/missing bearer token.
- * For the dashboard's OAuth-health signal, token profiles are a separate
- * concern — we want "is OAuth healthy?", not "is every credential healthy?"
+ * Aggregate the effective refreshable credential status for the dashboard.
+ * OAuth remains authoritative when present; token credentials are the
+ * supported fallback after an OAuth-to-token migration. Explicit auth-order
+ * exclusions remain authoritative through `effectiveProfiles`.
  *
- * `expectsOAuth` surfaces the configured-OAuth-but-no-oauth-profile case as
- * `missing` instead of silently falling back to the provider's rollup (which
- * would report `static` if only api_key credentials exist). Without this,
- * switching a provider from api_key to oauth in config but forgetting to
- * login hides behind the residual api_key profile until runtime fails.
- *
- * Exported for direct unit testing of the rollup rules.
+ * `expectsOAuth` keeps an API-key-only provider `missing` after config switches
+ * to OAuth but login has not completed.
  */
-export function aggregateOAuthStatus(
+export function aggregateRefreshableAuthStatus(
   prov: AuthProviderHealth,
   now: number = Date.now(),
   expectsOAuth = false,
-): {
-  status: AuthProviderHealthStatus;
-  expiresAt?: number;
-  remainingMs?: number;
-} {
-  const oauth = prov.profiles.filter((p) => p.type === "oauth");
-  if (oauth.length === 0) {
-    if (expectsOAuth) {
-      return { status: "missing" };
+): ModelAuthStatusRollup {
+  const profiles = prov.effectiveProfiles ?? prov.profiles;
+  for (const type of ["oauth", "token"] as const) {
+    const selected = profiles.filter((profile) => profile.type === type);
+    if (selected.length > 0) {
+      return aggregateProfileStatus(selected, now);
     }
-    return { status: prov.status, expiresAt: prov.expiresAt, remainingMs: prov.remainingMs };
   }
-  const statuses = new Set<AuthProfileHealthStatus>(oauth.map((p) => p.status));
-  // Priority: expired/missing > expiring > ok > static. Exhaustive — if a
-  // new AuthProfileHealthStatus variant is added, the `never` check fires.
-  let status: AuthProviderHealthStatus;
-  if (statuses.has("expired") || statuses.has("missing")) {
-    status = "expired";
-  } else if (statuses.has("expiring")) {
-    status = "expiring";
-  } else if (statuses.has("ok")) {
-    status = "ok";
-  } else if (statuses.has("static")) {
-    status = "static";
-  } else {
-    // Compile-time guard: exhaustiveness over AuthProfileHealthStatus. If
-    // auth-health ever adds a new variant without updating this rollup,
-    // TypeScript will fail the `never` assignment.
-    const _exhaustive: never = Array.from(statuses)[0] as never;
-    void _exhaustive;
-    status = "static";
+  if (expectsOAuth) {
+    return { status: "missing" };
   }
-  const expirable = oauth
-    .map((p) => p.expiresAt)
-    .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
-  const expiresAt = expirable.length > 0 ? Math.min(...expirable) : undefined;
-  const remainingMs = expiresAt !== undefined ? expiresAt - now : undefined;
-  return { status, expiresAt, remainingMs };
+  return { status: prov.status, expiresAt: prov.expiresAt, remainingMs: prov.remainingMs };
 }
 
-function mapProvider(
-  prov: AuthProviderHealth,
-  usageByProvider: Map<string, { windows: UsageWindow[]; plan?: string }>,
-  expectsOAuthSet: Set<string>,
-): ModelAuthStatusProvider {
-  const usageKey = resolveUsageProviderId(prov.provider);
-  const usage = usageKey ? usageByProvider.get(usageKey) : undefined;
-  const rollup = aggregateOAuthStatus(prov, Date.now(), expectsOAuthSet.has(prov.provider));
-  return {
-    provider: prov.provider,
-    displayName: providerDisplayName(prov.provider),
-    status: rollup.status,
-    expiry: buildExpiry(rollup.remainingMs, rollup.expiresAt),
-    profiles: prov.profiles.map((prof) => ({
-      profileId: prof.profileId,
-      type: prof.type,
-      status: prof.status,
-      expiry: buildExpiry(prof.remainingMs, prof.expiresAt),
-    })),
-    usage: usage ? { windows: usage.windows, plan: usage.plan } : undefined,
-  };
-}
-
-/**
- * Collect provider IDs with refreshable credentials (OAuth or bearer token)
- * so a configured-but-not-logged-in provider surfaces as `missing` rather
- * than being silently absent. API-key and AWS-SDK providers are excluded —
- * their credentials don't expire on a schedule this endpoint can meaningfully
- * monitor, and surfacing them here would flash a red alert on a healthy
- * API-key setup.
- *
- * Providers with `models.providers.<id>.apiKey` set (commonly via a
- * SecretRef env binding) are excluded from the "missing" synthesis even
- * when their `auth` mode is `oauth` or `token` — an env-backed credential
- * is already present, so flagging the dashboard as missing would cry wolf
- * for a working auth path. They can still show up with real status if the
- * profile store has an entry for them.
- */
-function resolveConfiguredProviders(cfg: OpenClawConfig): {
-  providers: string[];
-  expectsOAuth: Set<string>;
-} {
-  const out = new Set<string>();
-  const expectsOAuth = new Set<string>();
-  // Providers with a resolvable apiKey (inline or SecretRef pointing at a
-  // set env var) are treated as env-backed and skipped from the "missing"
-  // synthesis. Captured once up front so both the models.providers scan
-  // and the auth.profiles scan apply the escape hatch consistently.
-  const envBacked = new Set<string>();
-  for (const [id, provider] of Object.entries(cfg.models?.providers ?? {})) {
-    const apiKey = provider?.apiKey;
-    if (!id || apiKey === undefined || apiKey === null) {
-      continue;
-    }
-    // Treat as env-backed when the credential is currently resolvable:
-    // - inline string literal → always resolvable (satisfies auth today)
-    // - env SecretRef → check process.env for the referenced id (the only
-    //   source we can cheaply verify synchronously on a dashboard read)
-    // - file/exec SecretRef → conservatively treat as env-backed; we can't
-    //   read files or run commands here without making this a heavy async
-    //   path, and the alternative is crying wolf on valid configs
-    // A SecretRef pointing at an unset env var falls through to the normal
-    // "missing" synthesis so the dashboard surfaces the broken config.
-    let resolvable = false;
-    if (typeof apiKey === "string" && apiKey.length > 0) {
-      resolvable = true;
-    } else if (isSecretRef(apiKey)) {
-      if (apiKey.source === "env") {
-        const envValue = process.env[apiKey.id];
-        resolvable = typeof envValue === "string" && envValue.length > 0;
-      } else {
-        resolvable = true;
-      }
-    }
-    if (resolvable) {
-      envBacked.add(normalizeProviderId(id));
-    }
+async function refreshAfterCredentialMutation(
+  context: GatewayRequestContext,
+  agentId: string,
+): Promise<string | undefined> {
+  try {
+    await refreshModelAuthStateAfterMutation(context.getRuntimeConfig, agentId);
+    return undefined;
+  } catch (error) {
+    log.warn(`credential change saved but auth refresh failed: ${formatForLog(error)}`);
+    return "Model auth changes were saved, but the Gateway could not refresh them. Run `openclaw gateway restart` to apply the saved changes.";
   }
-  for (const [id, provider] of Object.entries(cfg.models?.providers ?? {})) {
-    if (!id) {
-      continue;
-    }
-    // Only include providers whose configured auth mode is refreshable.
-    // `undefined` / "api-key" / "aws-sdk" are deliberately skipped.
-    const mode = provider?.auth;
-    if (mode !== "oauth" && mode !== "token") {
-      continue;
-    }
-    if (envBacked.has(normalizeProviderId(id))) {
-      continue;
-    }
-    out.add(id);
-    if (mode === "oauth") {
-      // Store normalized id so lookups against `AuthProviderHealth.provider`
-      // (which is already normalized by buildAuthHealthSummary) match even
-      // when the config uses an alias like `z.ai` that normalizes to `zai`.
-      expectsOAuth.add(normalizeProviderId(id));
-    }
-  }
-  // auth.profiles entries explicitly opt into the refreshable set via
-  // `mode: oauth | token`. api_key profiles are excluded (no lifecycle).
-  for (const profile of Object.values(cfg.auth?.profiles ?? {})) {
-    const provider = profile?.provider;
-    const mode = profile?.mode;
-    if (
-      typeof provider !== "string" ||
-      provider.length === 0 ||
-      (mode !== "oauth" && mode !== "token")
-    ) {
-      continue;
-    }
-    if (envBacked.has(normalizeProviderId(provider))) {
-      continue;
-    }
-    out.add(provider);
-    if (mode === "oauth") {
-      expectsOAuth.add(normalizeProviderId(provider));
-    }
-  }
-  return { providers: Array.from(out), expectsOAuth };
 }
 
 export const modelsAuthStatusHandlers: GatewayRequestHandlers = {
-  "models.authStatus": async ({ params, respond, context }) => {
-    const now = Date.now();
-    const bypassCache = Boolean((params as { refresh?: boolean } | undefined)?.refresh);
-    if (!bypassCache && cached && now - cached.ts < CACHE_TTL_MS) {
-      respond(true, cached.result, undefined, { cached: true });
+  ...modelsAuthRefreshHandlers,
+  "models.authSetApiKey": async (options) => {
+    const { params, respond, context, client } = options;
+    const expectedOwnerId = params.expectedOwnerId;
+    if (
+      !assertValidParams(params, validateModelsAuthSetApiKeyParams, "models.authSetApiKey", respond)
+    ) {
       return;
     }
-    try {
-      const cfg = context.getRuntimeConfig();
-      const agentDir = resolveOpenClawAgentDir();
-      const store = ensureAuthProfileStore(agentDir, {
-        externalCli: externalCliDiscoveryForConfigStatus({ cfg }),
-      });
-      const configured = resolveConfiguredProviders(cfg);
-      const authHealth: AuthHealthSummary = buildAuthHealthSummary({
-        store,
-        cfg,
-        providers: configured.providers.length > 0 ? configured.providers : undefined,
-      });
-
-      // Usage queries only for refreshable credentials.
-      const usageProviderIds = [
-        ...new Set(
-          authHealth.profiles
-            .filter((p) => p.type === "oauth" || p.type === "token")
-            .map((p) => resolveUsageProviderId(p.provider))
-            .filter((id): id is UsageProviderId => Boolean(id)),
-        ),
-      ];
-
-      const usageByProvider = new Map<string, { windows: UsageWindow[]; plan?: string }>();
-      if (usageProviderIds.length > 0) {
-        try {
-          const usage = await loadProviderUsageSummary({
-            providers: usageProviderIds,
-            agentDir,
-            timeoutMs: 3500,
-          });
-          for (const snap of usage.providers) {
-            usageByProvider.set(snap.provider, { windows: snap.windows, plan: snap.plan });
+    let assertCurrent: (() => void) | undefined;
+    if (expectedOwnerId !== undefined) {
+      if (typeof expectedOwnerId !== "string" || !expectedOwnerId.trim()) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "expectedOwnerId must be a non-empty string"),
+        );
+        return;
+      }
+      if (!hasGatewayAdminScope(client)) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.FORBIDDEN, "missing scope: operator.admin"),
+        );
+        return;
+      }
+      try {
+        assertCurrent = captureLocalStateMutationGuard(expectedOwnerId, options);
+      } catch (error) {
+        respond(false, undefined, localStateOwnerChangedError(error));
+        return;
+      }
+    }
+    const provider = normalizeProviderId(params.provider);
+    await respondUnavailableOnThrow(respond, async () => {
+      const config = context.getRuntimeConfig();
+      // CLI-only target semantics must not load the model-command runtime during Gateway startup.
+      const scope = assertCurrent
+        ? {
+            ok: true as const,
+            ...(await import("../../commands/models/shared.js")).resolveModelsTargetAgent(
+              config,
+              params.agentId,
+              { kind: "mutation" },
+            ),
           }
-        } catch (err) {
-          // Usage data is auxiliary — failing here must not block auth status,
-          // but log at debug so a silently-broken usage endpoint is still
-          // diagnosable in gateway logs.
-          log.debug(
-            `usage enrichment failed (auth status still returned): providers=${usageProviderIds.join(",")} error=${formatForLog(err)}`,
-          );
+        : resolveModelAuthAgentScope(config, params.agentId);
+      if (!scope.ok) {
+        respond(false, undefined, scope.error);
+        return;
+      }
+      const { saveModelProviderApiKey } = await import("../../commands/models/auth-api-key.js");
+      const { profileId, warning: configWarning } = await saveModelProviderApiKey({
+        config,
+        provider,
+        apiKey: params.apiKey,
+        agentDir: scope.agentDir,
+        assertCurrent,
+      });
+      const refreshWarning = await refreshAfterCredentialMutation(context, scope.agentId);
+      const warning = [configWarning, refreshWarning].filter(Boolean).join(" ");
+      const result: ModelsAuthSetApiKeyResult = {
+        provider,
+        profileId,
+        ...(warning ? { warning } : {}),
+      };
+      respond(true, result, undefined);
+    });
+  },
+  "models.authLogout": async ({ params, respond, context }) => {
+    const provider = readProviderParam(params);
+    if (!provider) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "provider is required"));
+      return;
+    }
+    const selection = readLogoutProfileSelection(params);
+    if (!selection.ok) {
+      respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, selection.message));
+      return;
+    }
+    if (
+      (params.credentialType !== undefined && params.credentialType !== "api_key") ||
+      (params.credentialType !== undefined && selection.profileIds !== undefined)
+    ) {
+      respond(
+        false,
+        undefined,
+        errorShape(ErrorCodes.INVALID_REQUEST, "Choose either API keys or specific profiles"),
+      );
+      return;
+    }
+    const apiKeyOnly = params.credentialType === "api_key";
+    await respondUnavailableOnThrow(respond, async () => {
+      const cfg = context.getRuntimeConfig();
+      const scope = resolveModelAuthAgentScope(cfg, params.agentId);
+      if (!scope.ok) {
+        respond(false, undefined, scope.error);
+        return;
+      }
+      const { agentDir } = scope;
+      const authProvider = resolveProviderIdForAuth(provider, { config: cfg });
+      const store = await ensureAuthProfileStoreWithoutExternalProfilesAsync(agentDir);
+      const availableProfiles = listProfilesForProvider(store, provider);
+      const removedProfiles =
+        selection.profileIds ??
+        availableProfiles.filter((profileId) => {
+          const credential = store.profiles[profileId];
+          return !apiKeyOnly || (credential?.type === "api_key" && !credential.keyRef);
+        });
+      if (
+        selection.profileIds &&
+        selection.profileIds.some((profileId) => !availableProfiles.includes(profileId))
+      ) {
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "profileIds contain unavailable auth profiles"),
+        );
+        return;
+      }
+      const { removeModelAuthCredentials } = await import("../../commands/models/auth-logout.js");
+      const configWarning = await removeModelAuthCredentials({
+        cfg,
+        agentDir,
+        profileIds: removedProfiles,
+        ...(apiKeyOnly ? { apiKeyProvider: provider } : {}),
+        ...(!apiKeyOnly && !selection.profileIds ? { provider } : {}),
+      });
+      // A provider-wide abort would terminate runs using credentials this
+      // logout preserved (other profiles, tokens, or the config API key). Abort
+      // entries do not carry the profile id, so a targeted logout cannot scope
+      // the abort and instead leaves in-flight runs to fail on their next
+      // request; only a full-provider logout revokes everything and aborts.
+      const { runIds: abortedRunIds } =
+        selection.profileIds || apiKeyOnly
+          ? { runIds: [] as string[] }
+          : abortChatRunsForProvider(
+              {
+                chatAbortControllers: context.chatAbortControllers,
+                chatRunState: context.chatRunState,
+                removeChatRun: context.removeChatRun,
+                agentRunSeq: context.agentRunSeq,
+                broadcast: context.broadcast,
+                nodeSendToSession: context.nodeSendToSession,
+              },
+              {
+                cfg,
+                providerId: authProvider,
+                agentId: scope.agentId,
+                stopReason: "auth-revoked",
+              },
+            );
+      const refreshWarning = await refreshAfterCredentialMutation(context, scope.agentId);
+      const warning = [configWarning, refreshWarning].filter(Boolean).join(" ");
+      const result: ModelAuthLogoutResult = {
+        provider,
+        removedProfiles,
+        abortedRunIds,
+        ...(warning ? { warning } : {}),
+      };
+      respond(true, result, undefined);
+    });
+  },
+  "models.authStatus": async ({ params, respond, context, client }) => {
+    const now = Date.now();
+    const refreshRequested = Boolean(params.refresh);
+    const includeProfileIdentity = hasGatewayAdminScope(client);
+    const resolveScope = (cfg: OpenClawConfig) =>
+      resolveModelAuthAgentScope(
+        cfg,
+        params.agentId === undefined || params.agentId === ""
+          ? tryResolveAmbientOwnerAgentId(cfg)
+          : params.agentId,
+      );
+    await respondUnavailableOnThrow(respond, async () => {
+      let cfg = context.getRuntimeConfig();
+      let scope = resolveScope(cfg);
+      if (!scope.ok) {
+        respond(false, undefined, scope.error);
+        return;
+      }
+      if (refreshRequested) {
+        // Refresh into the transient prepared owner; mutations alone clear warmed auth state.
+        await refreshRuntimeAuthProfileStoreSources();
+        await refreshActiveProviderAuthRuntimeSnapshot();
+        cfg = context.getRuntimeConfig();
+        scope = resolveScope(cfg);
+        if (!scope.ok) {
+          respond(false, undefined, scope.error);
+          return;
         }
       }
+      const preparedSnapshot = refreshRequested
+        ? await loadDeferredCatalog(context, scope.agentId, {
+            readOnly: true,
+            authScope: resolveAuthRefreshScope(cfg),
+            refreshAuth: true,
+            refreshFullCatalog: false,
+          })
+        : await readPreparedCatalog(context, scope.agentId);
+      if (!preparedSnapshot) {
+        // A lifecycle replacement may temporarily withdraw this owner. Status must not
+        // rediscover credentials or turn missing preparation into a connection failure.
+        const result: ModelAuthStatusResult = {
+          ts: now,
+          providers: [],
+          unavailable: {
+            code: "PREPARED_MODEL_AUTH_UNAVAILABLE",
+            message:
+              "Model authentication status is unavailable. Refresh Models after setup finishes; restart the Gateway if it persists.",
+          },
+        };
+        respond(true, result, undefined);
+        return;
+      }
+      cfg = preparedSnapshot.config;
+      const { agentId, agentDir } = preparedSnapshot;
+      const store: RuntimeAuthProfileStore = preparedSnapshot.authStore;
+      const {
+        authAliasLookupParams,
+        apiKeys,
+        expectsOAuth,
+        authHealth,
+        usageProviderIds,
+        externalProfileIds,
+        logoutProfileIds,
+        configBoundProfileIds,
+        configBoundAuthProviders,
+        providerCapabilities,
+      } = readModelAuthStatusFacts(preparedSnapshot, refreshRequested, now);
 
-      const providers = authHealth.providers.map((prov) =>
-        mapProvider(prov, usageByProvider, configured.expectsOAuth),
-      );
-      const result: ModelAuthStatusResult = { ts: now, providers };
-      cached = { ts: now, result };
+      const providerUsageRuntime = await getProviderUsageRuntimeSnapshot({
+        config: cfg,
+        agentId,
+        agentDir,
+        store,
+      });
+      const usageByProvider = readProviderUsageStaleWhileRevalidate({
+        agentId,
+        agentDir,
+        authStore: providerUsageRuntime.store,
+        configRef: cfg,
+        credentialKey: providerUsageRuntime.credentialKey,
+        forceRefresh: refreshRequested,
+        providerIds: usageProviderIds,
+        now,
+      });
+
+      const providers: ModelAuthStatusProvider[] = [];
+      for (const prov of authHealth.providers) {
+        const providerKey = normalizeProviderId(prov.provider);
+        const authProviderKey = resolveProviderIdForAuth(prov.provider, authAliasLookupParams);
+        const profileOrder = resolveExplicitAuthOrderSelection({
+          storeOrder: store.order,
+          configuredOrder: cfg.auth?.order,
+          providerKey,
+          providerAuthKey: authProviderKey,
+        });
+        const storedOrderKey =
+          findNormalizedProviderKey(store.order, authProviderKey) ??
+          findNormalizedProviderKey(store.order, providerKey);
+        const localOrderStored =
+          storedOrderKey !== undefined &&
+          store.runtimeLocalOrderProviderIds?.includes(storedOrderKey);
+        const localProfileIds = new Set(
+          store.runtimeLocalProfileIds ??
+            Object.keys(store.profiles).filter((profileId) => !externalProfileIds.has(profileId)),
+        );
+        const providerOrderLocked = configBoundAuthProviders.has(authProviderKey);
+        const configuredOrderLocked = profileOrder.order !== undefined && !profileOrder.fromStore;
+        const usageProfile =
+          prov.profiles.find((profile) => profile.type === "oauth" || profile.type === "token") ??
+          prov.profiles.find((profile) => profile.type === "api_key");
+        const usageKey = resolveUsageProviderId(prov.provider, {
+          credentialType: usageProfile?.type,
+        });
+        const usage = usageKey ? usageByProvider.get(usageKey) : undefined;
+        const rollup = aggregateRefreshableAuthStatus(
+          prov,
+          Date.now(),
+          expectsOAuth.has(prov.provider),
+        );
+        const apiKey = apiKeys.get(normalizeProviderId(prov.provider));
+        const hasRefreshableProfile = prov.profiles.some(
+          (profile) => profile.type === "oauth" || profile.type === "token",
+        );
+        providers.push({
+          provider: prov.provider,
+          authProvider: authProviderKey,
+          displayName: providerDisplayName(prov.provider),
+          status:
+            apiKey && !hasRefreshableProfile && rollup.status === "missing"
+              ? "static"
+              : rollup.status,
+          expiry: buildExpiry(rollup.remainingMs, rollup.expiresAt),
+          profiles: prov.profiles.map((prof) => {
+            const metadata = resolveAuthProfileMetadata({ cfg, store, profileId: prof.profileId });
+            const lastUsedAt = store.usageStats?.[prof.profileId]?.lastUsed;
+            const profile: ModelAuthStatusProvider["profiles"][number] = {
+              profileId: prof.profileId,
+              type: prof.type,
+              status: prof.status,
+              reasonCode: prof.reasonCode,
+              source: configBoundProfileIds.has(prof.profileId)
+                ? "config"
+                : externalProfileIds.has(prof.profileId)
+                  ? "external"
+                  : localProfileIds.has(prof.profileId)
+                    ? "saved"
+                    : "inherited",
+              expiry: buildExpiry(
+                prof.expiresAt === undefined ? prof.remainingMs : prof.expiresAt - Date.now(),
+                prof.expiresAt,
+              ),
+            };
+            if (includeProfileIdentity && metadata.displayName) {
+              profile.displayName = metadata.displayName;
+            }
+            if (prof.reasonCode === "setup_inactive") {
+              profile.displayName = "Saved sign-in (inactive)";
+            }
+            if (includeProfileIdentity && metadata.email) {
+              profile.email = metadata.email;
+            }
+            if (includeProfileIdentity && lastUsedAt) {
+              profile.lastUsedAt = lastUsedAt;
+            }
+            if (logoutProfileIds.has(prof.profileId)) {
+              profile.logoutSupported = true;
+            }
+            return profile;
+          }),
+          ...(profileOrder.order !== undefined ? { profileOrder: profileOrder.order } : {}),
+          ...(profileOrder.fromStore && localOrderStored ? { profileOrderStored: true } : {}),
+          ...(providerOrderLocked
+            ? { profileOrderLocked: "provider-config" as const }
+            : configuredOrderLocked
+              ? { profileOrderLocked: "auth-config" as const }
+              : {}),
+          ...(apiKey ? { apiKey } : {}),
+          usage:
+            usage && usageKey
+              ? {
+                  providerId: usageKey,
+                  windows: usage.windows,
+                  ...(usage.summary ? { summary: usage.summary } : {}),
+                  ...(usage.plan ? { plan: usage.plan } : {}),
+                  ...(usage.billing?.length ? { billing: usage.billing } : {}),
+                  ...(includeProfileIdentity && usage.accountEmail
+                    ? { accountEmail: usage.accountEmail }
+                    : {}),
+                }
+              : undefined,
+        });
+      }
+      const result: ModelAuthStatusResult = { ts: now, providers, providerCapabilities };
       respond(true, result, undefined);
-    } catch (err) {
-      respond(false, undefined, errorShape(ErrorCodes.UNAVAILABLE, formatForLog(err)));
-    }
+    });
   },
 };

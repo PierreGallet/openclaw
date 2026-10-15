@@ -1,16 +1,61 @@
+// Test helpers provide isolated delivery-queue state directories and logger
+// stubs for queue/recovery tests.
 import fs from "node:fs";
 import path from "node:path";
-import { afterAll, beforeAll, beforeEach, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, vi } from "vitest";
+import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
+import { deriveDeliveryQueueRetentionColumns } from "../delivery-queue-retention-columns.js";
+import {
+  claimDeliveryQueueEntryPlatformSendInDatabase,
+  renewDeliveryQueueEntryPlatformSendLeaseInDatabase,
+} from "../delivery-queue-sqlite-claim.kernel.js";
+import { loadDeliveryQueueEntries } from "../delivery-queue-sqlite.js";
+import { isPostgresSqlConnection } from "../sql-connection.js";
 import { resolvePreferredOpenClawTmpDir } from "../tmp-openclaw-dir.js";
-import type { DeliverFn, RecoveryLogger } from "./delivery-queue.js";
+import { OUTBOUND_DELIVERY_QUEUE_NAME } from "./delivery-queue-media-staging.js";
+import type { DeliverFn, RecoveryLogger } from "./delivery-queue-recovery.js";
+import type { QueuedDelivery } from "./delivery-queue-types.js";
 
+// Clock-controlled kernel cases stay in one realm; facade tests exercise real worker leases.
+export function claimDeliveryQueueEntryForTest(
+  params: Parameters<typeof claimDeliveryQueueEntryPlatformSendInDatabase>[1] & {
+    stateDir: string;
+  },
+) {
+  return claimDeliveryQueueEntryPlatformSendInDatabase(
+    openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: params.stateDir } }),
+    params,
+  );
+}
+
+export function renewDeliveryQueueEntryLeaseForTest(
+  params: Parameters<typeof renewDeliveryQueueEntryPlatformSendLeaseInDatabase>[1] & {
+    stateDir: string;
+  },
+) {
+  return renewDeliveryQueueEntryPlatformSendLeaseInDatabase(
+    openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: params.stateDir } }),
+    params,
+  );
+}
+
+export async function loadPendingDeliveries(stateDir?: string): Promise<QueuedDelivery[]> {
+  return loadDeliveryQueueEntries(OUTBOUND_DELIVERY_QUEUE_NAME, stateDir) as QueuedDelivery[];
+}
+
+/** Installs Vitest hooks that provide a fresh delivery-queue state dir per case. */
 export function installDeliveryQueueTmpDirHooks(): { readonly tmpDir: () => string } {
   let tmpDir = "";
   let fixtureRoot = "";
   let fixtureCount = 0;
 
   beforeAll(() => {
-    fixtureRoot = fs.mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), "openclaw-dq-suite-"));
+    fixtureRoot = fs.realpathSync.native(
+      // openclaw-temp-dir: allow suite-owned queues drain their agent stores before removal
+      fs.mkdtempSync(path.join(resolvePreferredOpenClawTmpDir(), "openclaw-dq-suite-")),
+    );
   });
 
   beforeEach(() => {
@@ -18,7 +63,16 @@ export function installDeliveryQueueTmpDirHooks(): { readonly tmpDir: () => stri
     fs.mkdirSync(tmpDir, { recursive: true });
   });
 
-  afterAll(() => {
+  afterEach(async () => {
+    await closeStateDatabaseForTest();
+    tmpDir = "";
+  });
+
+  afterAll(async () => {
+    if (fixtureRoot) {
+      await closeOpenClawAgentDatabasesAsync(fixtureRoot);
+    }
+    await closeStateDatabaseForTest();
     if (!fixtureRoot) {
       return;
     }
@@ -32,17 +86,45 @@ export function installDeliveryQueueTmpDirHooks(): { readonly tmpDir: () => stri
 }
 
 export function readQueuedEntry(tmpDir: string, id: string): Record<string, unknown> {
-  return JSON.parse(
-    fs.readFileSync(path.join(tmpDir, "delivery-queue", `${id}.json`), "utf-8"),
-  ) as Record<string, unknown>;
+  const { db } = openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir } });
+  const row = db
+    .prepare("SELECT entry_json FROM delivery_queue_entries WHERE queue_name = ? AND id = ?")
+    .get(OUTBOUND_DELIVERY_QUEUE_NAME, id) as { entry_json?: string } | undefined;
+  if (!row?.entry_json) {
+    throw new Error(`Missing queued entry ${id}`);
+  }
+  return JSON.parse(row.entry_json) as Record<string, unknown>;
+}
+
+export function readQueuedEntries(tmpDir: string): Record<string, unknown>[] {
+  const { db } = openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir } });
+  const rows = db
+    .prepare(
+      `
+        SELECT entry_json
+          FROM delivery_queue_entries
+         WHERE queue_name = ? AND status = 'pending'
+         ORDER BY enqueued_at ASC, id ASC
+      `,
+    )
+    .all(OUTBOUND_DELIVERY_QUEUE_NAME) as Array<{ entry_json: string }>;
+  return rows.map((row) => JSON.parse(row.entry_json) as Record<string, unknown>);
 }
 
 export function setQueuedEntryState(
   tmpDir: string,
   id: string,
-  state: { retryCount: number; lastAttemptAt?: number; enqueuedAt?: number },
+  state: {
+    retryCount: number;
+    lastAttemptAt?: number;
+    lastError?: string;
+    enqueuedAt?: number;
+    platformSendStartedAt?: number;
+    recoveryState?: "send_attempt_started" | "unknown_after_send";
+    producerClaimId?: string;
+    availableAt?: number;
+  },
 ): void {
-  const filePath = path.join(tmpDir, "delivery-queue", `${id}.json`);
   const entry = readQueuedEntry(tmpDir, id);
   entry.retryCount = state.retryCount;
   if (state.lastAttemptAt === undefined) {
@@ -53,7 +135,57 @@ export function setQueuedEntryState(
   if (state.enqueuedAt !== undefined) {
     entry.enqueuedAt = state.enqueuedAt;
   }
-  fs.writeFileSync(filePath, JSON.stringify(entry), "utf-8");
+  if (state.lastError === undefined) {
+    delete entry.lastError;
+  } else {
+    entry.lastError = state.lastError;
+  }
+  if (state.platformSendStartedAt !== undefined) {
+    entry.platformSendStartedAt = state.platformSendStartedAt;
+  }
+  if (state.recoveryState !== undefined) {
+    entry.recoveryState = state.recoveryState;
+  }
+  if (state.producerClaimId !== undefined) {
+    entry.producerClaimId = state.producerClaimId;
+  }
+  if (state.availableAt !== undefined) {
+    entry.availableAt = state.availableAt;
+  }
+  const { db } = openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: tmpDir } });
+  const entryJson = JSON.stringify(entry);
+  if (isPostgresSqlConnection(db)) {
+    throw new Error("Delivery queue fixture mutation requires a SQLite database");
+  }
+  db.prepare(
+    `
+      UPDATE delivery_queue_entries
+         SET retry_count = ?,
+             enqueued_at = ?,
+             last_attempt_at = ?,
+             last_error = ?,
+             platform_send_started_at = ?,
+             recovery_state = ?,
+             entry_json = ?,
+             retention_id_prefix = @retention_id_prefix,
+             retention_max_age_ms = @retention_max_age_ms,
+             retention_max_entries = @retention_max_entries,
+             updated_at = ?
+       WHERE queue_name = ? AND id = ?
+    `,
+  ).run(
+    deriveDeliveryQueueRetentionColumns(id, entryJson),
+    state.retryCount,
+    state.enqueuedAt ?? Number(entry.enqueuedAt ?? 0),
+    state.lastAttemptAt ?? null,
+    state.lastError ?? null,
+    state.platformSendStartedAt ?? null,
+    state.recoveryState ?? null,
+    entryJson,
+    Date.now(),
+    OUTBOUND_DELIVERY_QUEUE_NAME,
+    id,
+  );
 }
 
 export function createRecoveryLog(): RecoveryLogger & {
@@ -71,3 +203,10 @@ export function createRecoveryLog(): RecoveryLogger & {
 export function asDeliverFn(deliver: ReturnType<typeof vi.fn>): DeliverFn {
   return deliver as DeliverFn;
 }
+
+export const RECOVERY_SUMMARY = {
+  empty: { recovered: 0, failed: 0, skippedMaxRetries: 0, deferredBackoff: 0 },
+  failed: { recovered: 0, failed: 1, skippedMaxRetries: 0, deferredBackoff: 0 },
+  recovered: { recovered: 1, failed: 0, skippedMaxRetries: 0, deferredBackoff: 0 },
+  recoveredWithDeferred: { recovered: 1, failed: 0, skippedMaxRetries: 0, deferredBackoff: 1 },
+} as const;

@@ -1,125 +1,59 @@
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { clampThinkingLevel, type Model } from "openclaw/plugin-sdk/llm";
+import { registerSingleProviderPlugin } from "openclaw/plugin-sdk/plugin-test-runtime";
+import { describeVllmProviderDiscoveryContract } from "openclaw/plugin-sdk/provider-test-contracts";
+import { describe, expect, it } from "vitest";
+import vllmPlugin from "./index.js";
 
-const buildVllmProviderMock = vi.hoisted(() => vi.fn());
-type DiscoverOpenAICompatibleSelfHostedProviderParams = {
-  buildProvider: (args: { apiKey?: string }) => Promise<Record<string, unknown>>;
-  ctx: {
-    resolveProviderApiKey: () => {
-      apiKey?: string;
+describeVllmProviderDiscoveryContract({
+  load: () => import("./index.js"),
+});
+
+describe("vLLM provider registration", () => {
+  it.each([
+    ["xhigh", "HIGH"],
+    ["max", "MAX"],
+  ] as const)("preserves mapped %s through session capability clamping", async (level, effort) => {
+    const provider = await registerSingleProviderPlugin(vllmPlugin);
+    const model: Model<"openai-completions"> = {
+      id: "qwen3:8b",
+      name: "Qwen",
+      provider: "vllm",
+      api: "openai-completions",
+      baseUrl: "http://localhost:8000/v1",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      maxTokens: 1024,
+      compat: {
+        thinkingFormat: "qwen-chat-template",
+        supportedReasoningEfforts: ["LOW", "HIGH", "MAX"],
+        reasoningEffortMap: { low: "LOW", xhigh: "HIGH", max: "MAX" },
+      },
     };
-    resolveProviderAuth: () => {
-      discoveryApiKey?: string;
-    };
-  };
-  providerId: string;
-};
-const discoverOpenAICompatibleSelfHostedProviderMock = vi.hoisted(() =>
-  vi.fn(async (params: DiscoverOpenAICompatibleSelfHostedProviderParams) => ({
-    provider: {
-      ...(await params.buildProvider({
-        apiKey: params.ctx.resolveProviderAuth().discoveryApiKey,
-      })),
-      apiKey: params.ctx.resolveProviderApiKey().apiKey,
-    },
-  })),
-);
-
-vi.mock("./api.js", () => ({
-  VLLM_DEFAULT_API_KEY_ENV_VAR: "VLLM_API_KEY",
-  VLLM_DEFAULT_BASE_URL: "http://127.0.0.1:8000/v1",
-  VLLM_MODEL_PLACEHOLDER: "meta-llama/Meta-Llama-3-8B-Instruct",
-  VLLM_PROVIDER_LABEL: "vLLM",
-  buildVllmProvider: (...args: unknown[]) => buildVllmProviderMock(...args),
-}));
-
-vi.mock("openclaw/plugin-sdk/provider-setup", () => ({
-  discoverOpenAICompatibleSelfHostedProvider: (
-    params: DiscoverOpenAICompatibleSelfHostedProviderParams,
-  ) => discoverOpenAICompatibleSelfHostedProviderMock(params),
-}));
-
-type ProviderDiscoveryRun = (ctx: {
-  config: Record<string, unknown>;
-  env: NodeJS.ProcessEnv;
-  resolveProviderApiKey: () => {
-    apiKey: string | undefined;
-    discoveryApiKey?: string;
-  };
-  resolveProviderAuth: () => {
-    apiKey: string | undefined;
-    discoveryApiKey?: string;
-    mode: "api_key" | "oauth" | "token" | "none";
-    source: "env" | "profile" | "none";
-  };
-}) => Promise<unknown>;
-
-type RegisteredVllmProvider = {
-  id: string;
-  discovery?: {
-    order?: string;
-    run: ProviderDiscoveryRun;
-  };
-};
-
-describe("vllm provider discovery contract", () => {
-  beforeEach(() => {
-    buildVllmProviderMock.mockReset();
-    discoverOpenAICompatibleSelfHostedProviderMock.mockClear();
+    const normalized = provider.normalizeResolvedModel?.({
+      provider: "vllm",
+      modelId: model.id,
+      model,
+    });
+    const prepared = { ...model, thinkingLevelMap: normalized?.thinkingLevelMap };
+    const selected = clampThinkingLevel(prepared, level);
+    expect(selected).toBe(level);
+    expect(prepared.thinkingLevelMap?.[level]).toBe(effort);
   });
 
-  it("keeps self-hosted discovery provider-owned", async () => {
-    const { default: plugin } = await import("./index.js");
-    let provider: RegisteredVllmProvider | undefined;
-    plugin.register({
-      registerProvider: (registeredProvider) => {
-        provider = registeredProvider as RegisteredVllmProvider;
-      },
-    } as OpenClawPluginApi);
-    expect(provider?.id).toBe("vllm");
-    expect(provider?.discovery?.order).toBe("late");
-    const discovery = provider?.discovery;
-    expect(discovery).toBeDefined();
+  it("exposes the binary thinking profile hook", async () => {
+    const provider = await registerSingleProviderPlugin(vllmPlugin);
 
-    buildVllmProviderMock.mockResolvedValueOnce({
-      baseUrl: "http://127.0.0.1:8000/v1",
-      api: "openai-completions",
-      models: [{ id: "meta-llama/Meta-Llama-3-8B-Instruct", name: "Meta Llama 3" }],
-    });
-
-    await expect(
-      discovery!.run({
-        config: {},
-        env: {
-          VLLM_API_KEY: "env-vllm-key",
-        } as NodeJS.ProcessEnv,
-        resolveProviderApiKey: () => ({
-          apiKey: "VLLM_API_KEY",
-          discoveryApiKey: "env-vllm-key",
-        }),
-        resolveProviderAuth: () => ({
-          apiKey: "VLLM_API_KEY",
-          discoveryApiKey: "env-vllm-key",
-          mode: "api_key",
-          source: "env",
-        }),
+    expect(
+      provider.resolveThinkingProfile?.({
+        provider: "vllm",
+        modelId: "Qwen/Qwen3-8B",
+        reasoning: true,
+        compat: { thinkingFormat: "qwen-chat-template" },
       }),
-    ).resolves.toEqual({
-      provider: {
-        baseUrl: "http://127.0.0.1:8000/v1",
-        api: "openai-completions",
-        apiKey: "VLLM_API_KEY",
-        models: [{ id: "meta-llama/Meta-Llama-3-8B-Instruct", name: "Meta Llama 3" }],
-      },
+    ).toEqual({
+      levels: [{ id: "off" }, { id: "low", label: "on" }],
+      defaultLevel: "off",
     });
-    expect(buildVllmProviderMock).toHaveBeenCalledWith({
-      apiKey: "env-vllm-key",
-    });
-    expect(discoverOpenAICompatibleSelfHostedProviderMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        providerId: "vllm",
-        buildProvider: expect.any(Function),
-      }),
-    );
   });
 });

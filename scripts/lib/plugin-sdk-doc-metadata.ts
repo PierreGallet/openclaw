@@ -1,3 +1,4 @@
+// Plugin Sdk Doc Metadata script supports OpenClaw repository automation.
 export type PluginSdkDocCategory =
   | "channel"
   | "core"
@@ -11,13 +12,18 @@ type PluginSdkDocMetadata = {
 };
 
 export const pluginSdkDocMetadata = {
-  index: {
-    category: "legacy",
+  "gateway-ingress": {
+    category: "core",
   },
-  "channel-runtime": {
-    category: "legacy",
+  "database-engine-runtime": { category: "runtime" },
+  "database-engine-worker-runtime": { category: "runtime" },
+  "control-ui-link-reader": {
+    category: "core",
   },
   core: {
+    category: "core",
+  },
+  health: {
     category: "core",
   },
   "approval-runtime": {
@@ -32,6 +38,9 @@ export const pluginSdkDocMetadata = {
   "approval-delivery-runtime": {
     category: "runtime",
   },
+  "approval-gateway-runtime": {
+    category: "runtime",
+  },
   "approval-native-runtime": {
     category: "runtime",
   },
@@ -41,50 +50,32 @@ export const pluginSdkDocMetadata = {
   "plugin-entry": {
     category: "core",
   },
-  "plugin-test-api": {
-    category: "utilities",
-  },
-  "plugin-test-contracts": {
-    category: "utilities",
-  },
-  "plugin-test-runtime": {
-    category: "utilities",
-  },
   "channel-actions": {
     category: "channel",
   },
   "channel-config-schema": {
     category: "channel",
   },
-  "channel-config-schema-legacy": {
-    category: "channel",
-  },
   "channel-contract": {
-    category: "channel",
-  },
-  "channel-contract-testing": {
     category: "channel",
   },
   "channel-pairing": {
     category: "channel",
   },
-  "channel-reply-pipeline": {
+  "channel-ingress-runtime": {
+    category: "channel",
+  },
+  "channel-outbound": {
     category: "channel",
   },
   "channel-setup": {
     category: "channel",
   },
-  "command-auth": {
-    category: "channel",
-  },
-  zalouser: {
+  "channel-dm-policy": {
     category: "channel",
   },
   "command-status": {
     category: "channel",
-  },
-  "command-status-runtime": {
-    category: "runtime",
   },
   "secret-input": {
     category: "channel",
@@ -92,14 +83,35 @@ export const pluginSdkDocMetadata = {
   "webhook-ingress": {
     category: "channel",
   },
-  "provider-onboard": {
-    category: "provider",
-  },
-  "provider-selection-runtime": {
-    category: "provider",
+  "widget-html": {
+    category: "utilities",
   },
   "runtime-store": {
     category: "runtime",
+  },
+  "plugin-command-runtime": {
+    category: "runtime",
+  },
+  "session-store-runtime": {
+    category: "runtime",
+  },
+  "conversation-binding-inspection-runtime": {
+    category: "runtime",
+  },
+  "agent-scope-runtime": {
+    category: "runtime",
+  },
+  "agent-runtime": {
+    category: "runtime",
+  },
+  "agent-harness-runtime": {
+    category: "runtime",
+  },
+  "agent-workspace-runtime": {
+    category: "runtime",
+  },
+  "speech-settings": {
+    category: "provider",
   },
   "allow-from": {
     category: "utilities",
@@ -107,34 +119,9 @@ export const pluginSdkDocMetadata = {
   "reply-payload": {
     category: "utilities",
   },
-  testing: {
-    category: "utilities",
-  },
-  "channel-test-helpers": {
-    category: "utilities",
-  },
-  "agent-runtime-test-contracts": {
-    category: "utilities",
-  },
-  "channel-target-testing": {
-    category: "utilities",
-  },
-  "provider-test-contracts": {
-    category: "utilities",
-  },
-  "provider-http-test-mocks": {
-    category: "utilities",
-  },
-  "test-env": {
-    category: "utilities",
-  },
-  "test-fixtures": {
+  "media-local-roots": {
     category: "utilities",
   },
 } as const satisfies Record<string, PluginSdkDocMetadata>;
 
 export type PluginSdkDocEntrypoint = keyof typeof pluginSdkDocMetadata;
-
-export function resolvePluginSdkDocImportSpecifier(entrypoint: PluginSdkDocEntrypoint): string {
-  return entrypoint === "index" ? "openclaw/plugin-sdk" : `openclaw/plugin-sdk/${entrypoint}`;
-}

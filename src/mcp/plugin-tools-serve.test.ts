@@ -1,17 +1,36 @@
+// Plugin MCP serve tests cover serving plugin tools over MCP.
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  consumeAdjustedParamsForToolCall,
+  type HookContext,
+  wrapToolWithBeforeToolCallHook,
+} from "../agents/agent-tools.before-tool-call.js";
+import {
+  consumeTrackedToolExecutionStarted,
+  resetAdjustedParamsByToolCallIdForTests,
+} from "../agents/agent-tools.before-tool-call.state.js";
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import {
   initializeGlobalHookRunner,
   resetGlobalHookRunner,
 } from "../plugins/hook-runner-global.js";
-import { createMockPluginRegistry } from "../plugins/hooks.test-helpers.js";
+import { createMockPluginRegistry } from "../plugins/hooks.test-fixtures.js";
+import { PluginApprovalResolutions } from "../plugins/types.js";
 import { createPluginToolsMcpHandlers } from "./plugin-tools-handlers.js";
 
 const callGatewayTool = vi.hoisted(() => vi.fn());
 const connectToolsMcpServerToStdioMock = vi.hoisted(() => vi.fn());
-const createToolsMcpServerMock = vi.hoisted(() => vi.fn(() => ({ close: vi.fn() })));
+const createToolsMcpServerMock = vi.hoisted(() =>
+  vi.fn<typeof import("./tools-stdio-server.js").createToolsMcpServer>(),
+);
 const getRuntimeConfigMock = vi.hoisted(() => vi.fn(() => ({ plugins: { enabled: true } })));
-const ensureStandalonePluginToolRegistryLoadedMock = vi.hoisted(() => vi.fn());
+const acquireStandalonePluginToolRegistryMock = vi.hoisted(() =>
+  vi.fn<typeof import("../plugins/tools.js").acquireStandalonePluginToolRegistry>(),
+);
+const releasePluginToolsMock = vi.hoisted(() => vi.fn(async () => {}));
 const resolvePluginToolsMock = vi.hoisted(() => vi.fn<() => AnyAgentTool[]>(() => []));
 const routeLogsToStderrMock = vi.hoisted(() => vi.fn());
 
@@ -19,8 +38,10 @@ vi.mock("../agents/tools/gateway.js", () => ({
   callGatewayTool,
 }));
 
+// mock-isolation: MCP tool fixtures provide config without starting a real config owner.
 vi.mock("../config/config.js", () => ({
   getRuntimeConfig: getRuntimeConfigMock,
+  captureRuntimeConfigAsyncReader: () => async () => getRuntimeConfigMock(),
 }));
 
 vi.mock("../logging/console.js", async (importOriginal) => {
@@ -35,14 +56,36 @@ vi.mock("../plugins/tools.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../plugins/tools.js")>();
   return {
     ...actual,
-    ensureStandalonePluginToolRegistryLoaded: ensureStandalonePluginToolRegistryLoadedMock,
-    resolvePluginTools: resolvePluginToolsMock,
+    acquireStandalonePluginToolRegistry: acquireStandalonePluginToolRegistryMock,
   };
 });
 
-vi.mock("./tools-stdio-server.js", () => ({
-  connectToolsMcpServerToStdio: connectToolsMcpServerToStdioMock,
-  createToolsMcpServer: createToolsMcpServerMock,
+vi.mock("./tools-stdio-server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./tools-stdio-server.js")>();
+  createToolsMcpServerMock.mockImplementation(actual.createToolsMcpServer);
+  const serve: typeof actual.serveRegisteredToolsMcpServer = async (params) => {
+    const { LegacyPluginSdkResourceHost } = await import("../plugins/legacy-sdk-resource-host.js");
+    const host = new LegacyPluginSdkResourceHost();
+    const acquisition = await host.run(params.acquireRegistry);
+    const server = params.createServer(acquisition.resolveTools(), host);
+    try {
+      await connectToolsMcpServerToStdioMock(server);
+    } finally {
+      await server.close();
+      await acquisition.release();
+      await host.close();
+    }
+  };
+  return {
+    ...actual,
+    createToolsMcpServer: createToolsMcpServerMock,
+    serveRegisteredToolsMcpServer: serve,
+  };
+});
+
+acquireStandalonePluginToolRegistryMock.mockImplementation(async () => ({
+  resolveTools: resolvePluginToolsMock,
+  release: releasePluginToolsMock,
 }));
 
 afterEach(() => {
@@ -50,44 +93,91 @@ afterEach(() => {
   callGatewayTool.mockReset();
   connectToolsMcpServerToStdioMock.mockReset();
   createToolsMcpServerMock.mockClear();
-  ensureStandalonePluginToolRegistryLoadedMock.mockReset();
+  acquireStandalonePluginToolRegistryMock.mockReset().mockImplementation(async () => ({
+    resolveTools: resolvePluginToolsMock,
+    release: releasePluginToolsMock,
+  }));
+  releasePluginToolsMock.mockClear();
   getRuntimeConfigMock.mockClear();
   resolvePluginToolsMock.mockReset();
   resolvePluginToolsMock.mockReturnValue([]);
   routeLogsToStderrMock.mockReset();
+  resetAdjustedParamsByToolCallIdForTests();
   resetGlobalHookRunner();
 });
 
+function createTool(
+  name: string,
+  execute: AnyAgentTool["execute"],
+  parameters = Type.Object({}),
+  description = name,
+): AnyAgentTool {
+  return { name, label: name, description, parameters, execute };
+}
+
+function requireFirstMockCall(calls: readonly unknown[][], label: string): unknown[] {
+  const call = calls.at(0);
+  if (!call) {
+    throw new Error(`expected ${label} call`);
+  }
+  return call;
+}
+
+function requireToolPolicyParams(mock: ReturnType<typeof vi.fn>) {
+  const params = requireFirstMockCall(mock.mock.calls, "plugin tool policy")[0] as
+    | { toolAllowlist?: string[]; toolDenylist?: string[] }
+    | undefined;
+  if (!params) {
+    throw new Error("expected plugin tool policy params");
+  }
+  return params;
+}
+
 describe("plugin tools MCP server", () => {
-  it("routes logs to stderr before resolving tools for stdio", async () => {
-    const { servePluginToolsMcp } = await import("./plugin-tools-serve.js");
-    resolvePluginToolsMock.mockReturnValue([
-      {
-        name: "memory_recall",
-        label: "Recall memory",
-        description: "Recall stored memory",
-        parameters: { type: "object", properties: {} },
-        execute: vi.fn(),
-      },
-    ]);
+  it.each([
+    { agentSessionKey: "agent:research:acp:session-1", agentId: undefined, owner: "research" },
+    { agentSessionKey: "global", agentId: "work", owner: "work" },
+  ])(
+    "passes $agentSessionKey owner into plugin tool factories",
+    async ({ agentSessionKey, agentId, owner }) => {
+      const { acquirePluginToolsForMcp } = await import("./plugin-tools-serve.js");
+      const runtimeRegistry = createMockPluginRegistry([]);
+      acquireStandalonePluginToolRegistryMock.mockResolvedValue({
+        registry: runtimeRegistry,
+        resolveTools: resolvePluginToolsMock,
+        release: releasePluginToolsMock,
+      });
+      const config = { plugins: { enabled: true } } as never;
 
-    await servePluginToolsMcp();
+      const acquisition = await acquirePluginToolsForMcp({ config, agentSessionKey, agentId });
+      acquisition.resolveTools();
+      await acquisition.release();
 
-    expect(routeLogsToStderrMock).toHaveBeenCalledTimes(1);
-    expect(ensureStandalonePluginToolRegistryLoadedMock).toHaveBeenCalledWith({
-      context: { config: { plugins: { enabled: true } } },
-    });
-    expect(resolvePluginToolsMock).toHaveBeenCalledTimes(1);
-    expect(ensureStandalonePluginToolRegistryLoadedMock.mock.invocationCallOrder[0]).toBeLessThan(
-      resolvePluginToolsMock.mock.invocationCallOrder[0] ?? 0,
-    );
-    expect(routeLogsToStderrMock.mock.invocationCallOrder[0]).toBeLessThan(
-      resolvePluginToolsMock.mock.invocationCallOrder[0] ?? 0,
-    );
-    expect(connectToolsMcpServerToStdioMock).toHaveBeenCalledOnce();
+      const expectedContext = {
+        config,
+        agentId: owner,
+        sessionKey: agentSessionKey,
+      };
+      expect(acquireStandalonePluginToolRegistryMock).toHaveBeenCalledWith({
+        context: expectedContext,
+        suppressNameConflicts: true,
+      });
+      expect(resolvePluginToolsMock).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("rejects a non-agent session identity from the managed bridge", async () => {
+    const { acquirePluginToolsForMcp } = await import("./plugin-tools-serve.js");
+
+    await expect(
+      acquirePluginToolsForMcp({
+        config: { plugins: { enabled: true } } as never,
+        agentSessionKey: "research-session",
+      }),
+    ).rejects.toThrow("must be a canonical agent session key");
   });
 
-  it("threads global plugin tool policy into plugin resolution", async () => {
+  it("threads agentless global plugin tool policy into plugin resolution", async () => {
     getRuntimeConfigMock.mockReturnValueOnce({
       plugins: { enabled: true },
       tools: {
@@ -99,63 +189,128 @@ describe("plugin tools MCP server", () => {
 
     await servePluginToolsMcp();
 
-    expect(ensureStandalonePluginToolRegistryLoadedMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        toolAllowlist: expect.arrayContaining(["memory_search"]),
-        toolDenylist: ["memory_forget"],
-      }),
-    );
-    expect(resolvePluginToolsMock).toHaveBeenCalledWith(
-      expect.objectContaining({
-        toolAllowlist: expect.arrayContaining(["memory_search"]),
-        toolDenylist: ["memory_forget"],
-      }),
-    );
+    const loadPolicy = requireToolPolicyParams(acquireStandalonePluginToolRegistryMock);
+    expect(loadPolicy.toolAllowlist).toContain("memory_search");
+    expect(loadPolicy.toolDenylist).toEqual(["memory_forget"]);
   });
 
-  it("lists registered plugin tools and serializes non-array tool content", async () => {
-    const execute = vi.fn().mockResolvedValue({
-      content: "Stored.",
+  it("enforces global and managed-agent plugin tool policy", async () => {
+    const deniedExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "denied executor ran" }],
     });
-    const tool = {
-      name: "memory_recall",
-      description: "Recall stored memory",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-        },
-        required: ["query"],
-      },
-      execute,
-    } as unknown as AnyAgentTool;
+    const allowedExecute = vi.fn().mockResolvedValue({
+      content: [{ type: "text", text: "allowed executor ran" }],
+    });
+    resolvePluginToolsMock.mockReturnValue([
+      createTool("plugin_allowed", allowedExecute),
+      createTool("plugin_denied", deniedExecute),
+    ]);
+    const { acquirePluginToolsForMcp } = await import("./plugin-tools-serve.js");
 
-    const handlers = createPluginToolsMcpHandlers([tool]);
-    const listed = await handlers.listTools();
-    expect(listed.tools).toEqual([
-      expect.objectContaining({
-        name: "memory_recall",
-        description: "Recall stored memory",
-        inputSchema: expect.objectContaining({
-          type: "object",
-          required: ["query"],
-        }),
-      }),
+    const acquisition = await acquirePluginToolsForMcp({
+      config: {
+        plugins: { enabled: true },
+        tools: {
+          allow: ["plugin_allowed", "plugin_denied"],
+          deny: ["plugin_globally_denied"],
+        },
+        agents: {
+          entries: {
+            research: {
+              tools: { allow: ["plugin_allowed"], deny: ["plugin_denied"] },
+            },
+          },
+        },
+      } as never,
+      agentSessionKey: "agent:research:acp:session-1",
+    });
+    const handlers = createPluginToolsMcpHandlers(acquisition.resolveTools());
+
+    try {
+      await expect(handlers.listTools()).resolves.toMatchObject({
+        tools: [{ name: "plugin_allowed" }],
+      });
+      await expect(handlers.callTool({ name: "plugin_denied" })).resolves.toMatchObject({
+        isError: true,
+        content: [{ text: "Unknown tool: plugin_denied" }],
+      });
+      expect(deniedExecute).not.toHaveBeenCalled();
+
+      await expect(handlers.callTool({ name: "plugin_allowed" })).resolves.toMatchObject({
+        content: [{ text: "allowed executor ran" }],
+      });
+      expect(allowedExecute).toHaveBeenCalledOnce();
+
+      expect(requireToolPolicyParams(acquireStandalonePluginToolRegistryMock)).toMatchObject({
+        toolAllowlist: ["plugin_allowed", "plugin_denied"],
+        toolDenylist: ["plugin_globally_denied", "plugin_denied"],
+      });
+    } finally {
+      await acquisition.release();
+    }
+  });
+
+  it("uses unique ids and releases execution tracking through the scheduler alias", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const executeSuccess = vi.fn().mockResolvedValue({ content: "Stored." });
+    const executeFailure = vi.fn().mockRejectedValue(new Error("unavailable"));
+    const handlers = createPluginToolsMcpHandlers([
+      createTool("automations", executeSuccess),
+      createTool("memory_forget", executeFailure),
     ]);
 
-    const result = await handlers.callTool({
-      name: "memory_recall",
-      arguments: { query: "remember this" },
-    });
-    expect(execute).toHaveBeenCalledWith(
-      expect.stringMatching(/^mcp-\d+$/),
-      {
-        query: "remember this",
-      },
-      undefined,
-      undefined,
+    for (let index = 0; index < 32; index += 1) {
+      await handlers.callTool({ name: "cron", arguments: { index } });
+      await handlers.callTool({ name: "memory_forget", arguments: { index } });
+    }
+
+    expect(executeSuccess).toHaveBeenCalledTimes(32);
+    expect(executeFailure).toHaveBeenCalledTimes(32);
+    const toolCallIds = [...executeSuccess.mock.calls, ...executeFailure.mock.calls].map(
+      ([toolCallId]) => String(toolCallId),
     );
-    expect(result.content).toEqual([{ type: "text", text: "Stored." }]);
+    expect(new Set(toolCallIds).size).toBe(toolCallIds.length);
+    for (const toolCallId of toolCallIds) {
+      expect(consumeTrackedToolExecutionStarted(toolCallId)).toBeUndefined();
+      expect(consumeAdjustedParamsForToolCall(toolCallId)).toBeUndefined();
+    }
+  });
+
+  it("delivers source-shaped images through a real MCP client", async () => {
+    const execute = vi.fn().mockResolvedValue({
+      content: [
+        { type: "text", text: "browser screenshot" },
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/png",
+            data: "iVBORw0KGgo=",
+          },
+        },
+      ],
+    });
+    const tool = createTool("browser_screenshot", execute);
+    const { createToolsMcpServer } =
+      await vi.importActual<typeof import("./tools-stdio-server.js")>("./tools-stdio-server.js");
+    const server = createToolsMcpServer({ name: "plugin-tools-image-test", tools: [tool] });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client(
+      { name: "plugin-tools-image-test-client", version: "0.0.0" },
+      { capabilities: {} },
+    );
+
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const result = await client.callTool({ name: "browser_screenshot", arguments: {} });
+      expect(result.content).toEqual([
+        { type: "text", text: "browser screenshot" },
+        { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 
   it("serializes plugin tool results that do not use the MCP content envelope", async () => {
@@ -163,17 +318,11 @@ describe("plugin tools MCP server", () => {
       provider: "kitchen-sink-search",
       results: [{ title: "Kitchen Sink image fixture" }],
     });
-    const tool = {
-      name: "kitchen_sink_search",
-      description: "Search Kitchen Sink fixture content",
-      parameters: {
-        type: "object",
-        properties: {
-          query: { type: "string" },
-        },
-      },
+    const tool = createTool(
+      "kitchen_sink_search",
       execute,
-    } as unknown as AnyAgentTool;
+      Type.Object({ query: Type.Optional(Type.String()) }),
+    );
 
     const handlers = createPluginToolsMcpHandlers([tool]);
     const result = await handlers.callTool({
@@ -191,32 +340,37 @@ describe("plugin tools MCP server", () => {
     ]);
   });
 
-  it("returns MCP errors for unknown tools and thrown tool errors", async () => {
-    const failingTool = {
-      name: "memory_forget",
-      description: "Forget memory",
-      parameters: { type: "object", properties: {} },
-      execute: vi.fn().mockRejectedValue(new Error("boom")),
-    } as unknown as AnyAgentTool;
-
-    const handlers = createPluginToolsMcpHandlers([failingTool]);
-    const unknown = await handlers.callTool({
-      name: "missing_tool",
-      arguments: {},
+  it("releases run-scoped adjusted arguments after a pre-wrapped direct MCP call", async () => {
+    const runId = "run-direct-mcp";
+    const execute = vi.fn().mockResolvedValue({ content: "Stored." });
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_tool_call",
+          handler: async () => ({ params: { text: "adjusted" } }),
+        },
+      ]),
+    );
+    const tool = wrapToolWithBeforeToolCallHook(createTool("memory_store", execute), {
+      runId,
+      sessionKey: "session-direct-mcp",
     });
-    expect(unknown.isError).toBe(true);
-    expect(unknown.content).toEqual([{ type: "text", text: "Unknown tool: missing_tool" }]);
 
-    const failed = await handlers.callTool({
-      name: "memory_forget",
-      arguments: {},
+    const handlers = createPluginToolsMcpHandlers([tool]);
+    await handlers.callTool({
+      name: "memory_store",
+      arguments: { text: "original" },
     });
-    expect(failed.isError).toBe(true);
-    expect(failed.content).toEqual([{ type: "text", text: "Tool error: boom" }]);
+
+    const executeCall = requireFirstMockCall(execute.mock.calls, "plugin tool execute");
+    const toolCallId = String(executeCall[0]);
+    expect(executeCall[1]).toEqual({ text: "adjusted" });
+    expect(consumeAdjustedParamsForToolCall(toolCallId, runId)).toBeUndefined();
   });
 
-  it("blocks tool execution when before_tool_call requires approval on the MCP bridge", async () => {
+  it("reports approval requirements without opening plugin approvals on the MCP bridge", async () => {
     let hookCalls = 0;
+    const onResolution = vi.fn();
     const execute = vi.fn().mockResolvedValue({
       content: "Stored.",
     });
@@ -231,19 +385,14 @@ describe("plugin tools MCP server", () => {
                 pluginId: "test-plugin",
                 title: "Approval required",
                 description: "Approval required",
+                onResolution,
               },
             };
           },
         },
       ]),
     );
-    callGatewayTool.mockRejectedValueOnce(new Error("gateway unavailable"));
-    const tool = {
-      name: "memory_store",
-      description: "Store memory",
-      parameters: { type: "object", properties: {} },
-      execute,
-    } as unknown as AnyAgentTool;
+    const tool = createTool("memory_store", execute);
 
     const handlers = createPluginToolsMcpHandlers([tool]);
     const result = await handlers.callTool({
@@ -251,10 +400,67 @@ describe("plugin tools MCP server", () => {
       arguments: { text: "remember this" },
     });
     expect(hookCalls).toBe(1);
+    expect(callGatewayTool).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     expect(result.isError).toBe(true);
-    expect(result.content).toEqual([
-      { type: "text", text: "Tool error: Plugin approval required (gateway unavailable)" },
-    ]);
+    expect(result.content).toEqual([{ type: "text", text: "Tool error: Approval required" }]);
+    expect(onResolution).toHaveBeenCalledWith(PluginApprovalResolutions.CANCELLED);
+  });
+
+  it("switches pre-wrapped plugin tools to approval report mode on the MCP bridge", async () => {
+    const onResolution = vi.fn();
+    const execute = vi.fn().mockResolvedValue({
+      content: "Stored.",
+    });
+    const originalContext = {
+      agentId: "agent-with-plugins",
+      sessionKey: "session-with-plugins",
+    } satisfies HookContext;
+    initializeGlobalHookRunner(
+      createMockPluginRegistry([
+        {
+          hookName: "before_tool_call",
+          handler: async (_event, ctx) => {
+            const hookContext = ctx as HookContext | undefined;
+            if (hookContext?.sessionKey !== originalContext.sessionKey) {
+              return undefined;
+            }
+            return {
+              requireApproval: {
+                pluginId: "test-plugin",
+                title: "Approval required",
+                description: "Approval required",
+                onResolution,
+              },
+            };
+          },
+        },
+      ]),
+    );
+    callGatewayTool.mockRejectedValue(new Error("gateway unavailable"));
+    const tool = wrapToolWithBeforeToolCallHook(
+      createTool("memory_store", execute),
+      originalContext,
+    );
+
+    const handlers = createPluginToolsMcpHandlers([tool]);
+    const result = await handlers.callTool({
+      name: "memory_store",
+      arguments: { text: "remember this" },
+    });
+    expect(callGatewayTool).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    expect(result.content).toEqual([{ type: "text", text: "Tool error: Approval required" }]);
+    expect(onResolution).toHaveBeenCalledTimes(1);
+    expect(onResolution).toHaveBeenLastCalledWith(PluginApprovalResolutions.CANCELLED);
+
+    await expect(tool.execute("agent-tool-call", { text: "remember this" })).rejects.toThrow(
+      "Plugin approval required (gateway unavailable)",
+    );
+    expect(callGatewayTool).toHaveBeenCalledTimes(1);
+    expect(onResolution).toHaveBeenCalledTimes(2);
+    expect(onResolution).toHaveBeenLastCalledWith(PluginApprovalResolutions.CANCELLED);
+    expect(execute).not.toHaveBeenCalled();
   });
 });

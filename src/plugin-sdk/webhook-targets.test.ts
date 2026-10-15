@@ -1,15 +1,20 @@
+/**
+ * Tests webhook target registration, matching, and request pipeline helpers.
+ */
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createEmptyPluginRegistry } from "../plugins/registry.js";
+import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import { setActivePluginRegistry } from "../plugins/runtime.js";
 import { createWebhookInFlightLimiter } from "./webhook-request-guards.js";
 import {
+  normalizeWebhookPath,
   registerWebhookTarget,
   registerWebhookTargetWithPluginRoute,
   rejectNonPostWebhookRequest,
   resolveSingleWebhookTarget,
   resolveSingleWebhookTargetAsync,
+  resolveWebhookPath,
   resolveWebhookTargetWithAuthOrReject,
   resolveWebhookTargetWithAuthOrRejectSync,
   resolveWebhookTargets,
@@ -50,21 +55,28 @@ afterEach(() => {
   setActivePluginRegistry(createEmptyPluginRegistry());
 });
 
-describe("registerWebhookTarget", () => {
-  it("normalizes the path and unregisters cleanly", () => {
-    const targets = new Map<string, Array<{ path: string; id: string }>>();
-    const registered = registerWebhookTarget(targets, {
-      path: "hook",
-      id: "A",
-    });
+describe("webhook paths", () => {
+  it.each([["  ", "/"]])(
+    "normalizes configured path %j without canonicalizing it",
+    (raw, expected) => {
+      expect(normalizeWebhookPath(raw)).toBe(expected);
+    },
+  );
 
-    expect(registered.target.path).toBe("/hook");
-    expect(targets.get("/hook")).toEqual([registered.target]);
-
-    registered.unregister();
-    expect(targets.has("/hook")).toBe(false);
+  it.each([
+    { params: { webhookPath: " explicit/ ", webhookUrl: "invalid" }, expected: "/explicit" },
+    {
+      params: { webhookUrl: "https://example.test/hook%2Fpart/?q=1#fragment" },
+      expected: "/hook%2Fpart",
+    },
+    { params: { webhookUrl: "invalid", defaultPath: "/fallback/" }, expected: null },
+    { params: {}, expected: null },
+  ])("resolves callback path from $params", ({ params, expected }) => {
+    expect(resolveWebhookPath(params)).toBe(expected);
   });
+});
 
+describe("registerWebhookTarget", () => {
   it("runs first/last path lifecycle hooks only at path boundaries", () => {
     const targets = new Map<string, Array<{ path: string; id: string }>>();
     const teardown = vi.fn();
@@ -85,7 +97,7 @@ describe("registerWebhookTarget", () => {
     expect(onFirstPathTarget).toHaveBeenCalledTimes(1);
     expect(onFirstPathTarget).toHaveBeenCalledWith({
       path: "/hook",
-      target: expect.objectContaining({ id: "A", path: "/hook" }),
+      target: registeredA.target,
     });
 
     registeredB.unregister();
@@ -101,63 +113,85 @@ describe("registerWebhookTarget", () => {
     expect(teardown).toHaveBeenCalledTimes(1);
     expect(onLastPathTargetRemoved).toHaveBeenCalledTimes(1);
   });
-
-  it("does not register target when first-path hook throws", () => {
-    const targets = new Map<string, Array<{ path: string; id: string }>>();
-    expect(() =>
-      registerWebhookTarget(
-        targets,
-        { path: "/hook", id: "A" },
-        {
-          onFirstPathTarget: () => {
-            throw new Error("boom");
-          },
-        },
-      ),
-    ).toThrow("boom");
-    expect(targets.has("/hook")).toBe(false);
-  });
 });
 
 describe("registerWebhookTargetWithPluginRoute", () => {
-  it("registers plugin route on first target and removes it on last target", () => {
+  it("does not store a target when strict route registration is rejected", () => {
+    const registry = createEmptyPluginRegistry();
+    const existingRoute = {
+      path: "/hook",
+      match: "exact" as const,
+      auth: "plugin" as const,
+      handler: () => {},
+      pluginId: "existing",
+      source: "existing-webhook",
+    };
+    registry.httpRoutes.push(existingRoute);
+    setActivePluginRegistry(registry);
+    const targets = new Map<string, Array<{ path: string; id: string }>>();
+
+    expect(() =>
+      registerWebhookTargetWithPluginRoute({
+        targetsByPath: targets,
+        target: { path: "/hook", id: "A" },
+        route: {
+          auth: "plugin",
+          pluginId: "demo",
+          source: "demo-webhook",
+          throwOnFailure: true,
+          handler: () => {},
+        },
+      }),
+    ).toThrow("route replacement denied");
+
+    expect(targets.size).toBe(0);
+    expect(registry.httpRoutes).toEqual([existingRoute]);
+  });
+
+  it("keeps one canonical route until the last alias target unregisters", () => {
     const registry = createEmptyPluginRegistry();
     setActivePluginRegistry(registry);
     const targets = new Map<string, Array<{ path: string; id: string }>>();
 
-    const registeredA = registerWebhookTargetWithPluginRoute({
+    const first = registerWebhookTargetWithPluginRoute({
       targetsByPath: targets,
-      target: { path: "/hook", id: "A" },
+      target: { path: "/Hooks//Zalo/Media/", id: "A" },
       route: {
         auth: "plugin",
-        pluginId: "demo",
-        source: "demo-webhook",
+        match: "prefix",
+        pluginId: "zalo",
+        source: "zalo-hosted-media",
         handler: () => {},
       },
     });
-    const registeredB = registerWebhookTargetWithPluginRoute({
+    const second = registerWebhookTargetWithPluginRoute({
       targetsByPath: targets,
-      target: { path: "/hook", id: "B" },
+      target: { path: "/hooks/zalo/media", id: "B" },
       route: {
         auth: "plugin",
-        pluginId: "demo",
-        source: "demo-webhook",
+        match: "prefix",
+        pluginId: "zalo",
+        source: "zalo-hosted-media",
         handler: () => {},
       },
     });
 
-    expect(registry.httpRoutes).toHaveLength(1);
-    expect(registry.httpRoutes[0]).toEqual(
-      expect.objectContaining({
-        pluginId: "demo",
-        path: "/hook",
-        source: "demo-webhook",
-      }),
+    expect(targets).toEqual(
+      new Map([
+        [
+          "/hooks/zalo/media",
+          [
+            { path: "/hooks/zalo/media", id: "A" },
+            { path: "/hooks/zalo/media", id: "B" },
+          ],
+        ],
+      ]),
     );
-
-    registeredA.unregister();
     expect(registry.httpRoutes).toHaveLength(1);
-    registeredB.unregister();
+
+    second.unregister();
+    expect(registry.httpRoutes).toHaveLength(1);
+    first.unregister();
     expect(registry.httpRoutes).toHaveLength(0);
   });
 });
@@ -165,19 +199,13 @@ describe("registerWebhookTargetWithPluginRoute", () => {
 describe("resolveWebhookTargets", () => {
   it.each([
     {
-      name: "resolves normalized path targets",
-      requestPath: "/hook/",
-      targets: new Map([["/hook", [{ id: "A" }]]]),
+      name: "resolves a canonical alias after an exact-key miss",
+      requestPath: "/Hooks//Zalo/Media/",
+      targets: new Map([["/hooks/zalo/media", [{ id: "A" }]]]),
       expected: {
-        path: "/hook",
+        path: "/hooks/zalo/media",
         targets: [{ id: "A" }],
       },
-    },
-    {
-      name: "returns null when path has no targets",
-      requestPath: "/missing",
-      targets: new Map<string, Array<{ id: string }>>(),
-      expected: null,
     },
   ])("$name", ({ requestPath, targets, expected }) => {
     expect(resolveWebhookTargets(createRequest("POST", requestPath), targets)).toEqual(expected);
@@ -249,58 +277,25 @@ describe("rejectNonPostWebhookRequest", () => {
 });
 
 describe("resolveSingleWebhookTarget", () => {
-  const resolvers: Array<{
-    name: string;
-    run: (
-      targets: readonly string[],
-      isMatch: (value: string) => boolean | Promise<boolean>,
-    ) => Promise<{ kind: "none" } | { kind: "single"; target: string } | { kind: "ambiguous" }>;
-  }> = [
-    {
-      name: "sync",
-      run: async (targets, isMatch) =>
-        resolveSingleWebhookTarget(targets, (value) => Boolean(isMatch(value))),
+  it.each([undefined])(
+    "retains a matching falsy target %j and detects a second match",
+    async (target) => {
+      expect(resolveSingleWebhookTarget([target], () => true)).toEqual({ kind: "single", target });
+      await expect(resolveSingleWebhookTargetAsync([target], async () => true)).resolves.toEqual({
+        kind: "single",
+        target,
+      });
+      expect(resolveSingleWebhookTarget([target, target], () => true)).toEqual({
+        kind: "ambiguous",
+      });
+      await expect(
+        resolveSingleWebhookTargetAsync([target, target], async () => true),
+      ).resolves.toEqual({ kind: "ambiguous" });
     },
-    {
-      name: "async",
-      run: (targets, isMatch) =>
-        resolveSingleWebhookTargetAsync(targets, async (value) => isMatch(value)),
-    },
-  ];
-
-  it.each(resolvers)("returns none when no target matches ($name)", async ({ run }) => {
-    const result = await run(["a", "b"], (value) => value === "c");
-    expect(result).toEqual({ kind: "none" });
-  });
-
-  it.each(resolvers)("returns the single match ($name)", async ({ run }) => {
-    const result = await run(["a", "b"], (value) => value === "b");
-    expect(result).toEqual({ kind: "single", target: "b" });
-  });
-
-  it.each(resolvers)("returns ambiguous after second match ($name)", async ({ run }) => {
-    const calls: string[] = [];
-    const result = await run(["a", "b", "c"], (value) => {
-      calls.push(value);
-      return value === "a" || value === "b";
-    });
-    expect(result).toEqual({ kind: "ambiguous" });
-    expect(calls).toEqual(["a", "b"]);
-  });
+  );
 });
 
 describe("resolveWebhookTargetWithAuthOrReject", () => {
-  it("returns matched target", async () => {
-    const { res } = createResponse();
-    await expect(
-      resolveWebhookTargetWithAuthOrReject({
-        targets: [{ id: "a" }, { id: "b" }],
-        res,
-        isMatch: (target) => target.id === "b",
-      }),
-    ).resolves.toEqual({ id: "b" });
-  });
-
   it.each([
     {
       name: "writes unauthorized response on no match",

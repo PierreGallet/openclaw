@@ -1,3 +1,4 @@
+// Qa Lab tests cover cli plugin behavior.
 import { Command } from "commander";
 import type { QaRunnerCliContribution } from "openclaw/plugin-sdk/qa-runner-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -45,6 +46,10 @@ const {
   runQaCredentialsListCommand,
   runQaCredentialsRemoveCommand,
   runQaCoverageReportCommand,
+  runQaJsonlReplayCommand,
+  runQaLabSelfCheckCommand,
+  runQaManualLaneCommand,
+  runQaProfileCommand,
   runQaProviderServerCommand,
   runQaSuiteCommand,
   runQaTelegramCommand,
@@ -57,6 +62,10 @@ const {
   runQaCredentialsListCommand: vi.fn(),
   runQaCredentialsRemoveCommand: vi.fn(),
   runQaCoverageReportCommand: vi.fn(),
+  runQaJsonlReplayCommand: vi.fn(),
+  runQaLabSelfCheckCommand: vi.fn(),
+  runQaManualLaneCommand: vi.fn(),
+  runQaProfileCommand: vi.fn(),
   runQaProviderServerCommand: vi.fn(),
   runQaSuiteCommand: vi.fn(),
   runQaTelegramCommand: vi.fn(),
@@ -72,7 +81,26 @@ const { listQaRunnerCliContributions } = vi.hoisted(() => ({
   ]),
 }));
 
-vi.mock("openclaw/plugin-sdk/qa-runner-runtime", () => ({
+function requireQaTelegramOptions() {
+  const [call] = runQaTelegramCommand.mock.calls;
+  if (!call) {
+    throw new Error("expected qa telegram command call");
+  }
+  const [options] = call;
+  return options;
+}
+
+function requireQaSuiteOptions() {
+  const [call] = runQaSuiteCommand.mock.calls;
+  if (!call) {
+    throw new Error("expected qa suite command call");
+  }
+  const [options] = call;
+  return options;
+}
+
+vi.mock("openclaw/plugin-sdk/qa-runner-runtime", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/qa-runner-runtime")>()),
   listQaRunnerCliContributions,
 }));
 
@@ -92,6 +120,10 @@ vi.mock("./cli.runtime.js", () => ({
   runQaCredentialsListCommand,
   runQaCredentialsRemoveCommand,
   runQaCoverageReportCommand,
+  runQaJsonlReplayCommand,
+  runQaLabSelfCheckCommand,
+  runQaManualLaneCommand,
+  runQaProfileCommand,
   runQaProviderServerCommand,
   runQaSuiteCommand,
 }));
@@ -100,13 +132,31 @@ import { registerQaLabCli } from "./cli.js";
 
 describe("qa cli registration", () => {
   let program: Command;
+  let previousExitCode: typeof process.exitCode;
+  let stderrWrite: ReturnType<typeof vi.spyOn>;
+
+  function parseQa(args: string[]) {
+    return program.parseAsync(["node", "openclaw", "qa", ...args]);
+  }
+
+  async function expectQaFailure(args: string[], message: string) {
+    await parseQa(args);
+    expect(stderrWrite).toHaveBeenCalledWith(expect.stringContaining(message));
+    expect(process.exitCode).toBe(1);
+  }
 
   beforeEach(() => {
+    previousExitCode = process.exitCode;
+    stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     program = new Command();
     runQaCredentialsAddCommand.mockReset();
     runQaCredentialsListCommand.mockReset();
     runQaCredentialsRemoveCommand.mockReset();
     runQaCoverageReportCommand.mockReset();
+    runQaJsonlReplayCommand.mockReset();
+    runQaLabSelfCheckCommand.mockReset();
+    runQaManualLaneCommand.mockReset();
+    runQaProfileCommand.mockReset();
     runQaProviderServerCommand.mockReset();
     runQaSuiteCommand.mockReset();
     runQaTelegramCommand.mockReset();
@@ -121,28 +171,208 @@ describe("qa cli registration", () => {
   });
 
   afterEach(() => {
+    process.exitCode = previousExitCode;
+    stderrWrite.mockRestore();
     vi.clearAllMocks();
+  });
+
+  it("prints QA profile runtime failures", async () => {
+    const message = "--output-dir must be a relative path inside the repo root.";
+    runQaProfileCommand.mockRejectedValueOnce(new Error(message));
+
+    await expectQaFailure(
+      [
+        "run",
+        "--qa-profile",
+        "smoke-ci",
+        "--output-dir",
+        "/tmp/qa-out",
+        "--scenario",
+        "memory-dreaming-sweep",
+      ],
+      message,
+    );
+  });
+
+  it("prints SDK runner runtime failures", async () => {
+    const message = "Telegram QA could not acquire its test credential.";
+    runQaTelegramCommand.mockRejectedValueOnce(new Error(message));
+
+    await expectQaFailure(["telegram"], message);
   });
 
   it("registers discovered and built-in live transport subcommands", () => {
     const qa = program.commands.find((command) => command.name() === "qa");
-    expect(qa).toBeDefined();
-    expect(qa?.commands.map((command) => command.name())).toEqual(
-      expect.arrayContaining([
-        TEST_QA_RUNNER.commandName,
-        "telegram",
-        "mantis",
-        "credentials",
-        "coverage",
-      ]),
+    if (!qa) {
+      throw new Error("expected qa command");
+    }
+    const commandNames = qa.commands.map((command) => command.name());
+    expect(commandNames).toContain(TEST_QA_RUNNER.commandName);
+    expect(commandNames).toContain("telegram");
+    expect(commandNames).toContain("mantis");
+    expect(commandNames).toContain("credentials");
+    expect(commandNames).toContain("coverage");
+  });
+  it("keeps qa run without a profile on the self-check command", async () => {
+    await parseQa([
+      "run",
+      "--repo-root",
+      "/tmp/openclaw-repo",
+      "--output",
+      ".artifacts/qa-self-check.md",
+    ]);
+
+    expect(runQaLabSelfCheckCommand).toHaveBeenCalledWith({
+      repoRoot: "/tmp/openclaw-repo",
+      output: ".artifacts/qa-self-check.md",
+    });
+    expect(runQaProfileCommand).not.toHaveBeenCalled();
+  });
+
+  it("routes qa run qa-profile flags into the taxonomy-backed profile command", async () => {
+    await parseQa([
+      "run",
+      "--repo-root",
+      "/tmp/openclaw-repo",
+      "--output-dir",
+      ".artifacts/qa-e2e/smoke-ci",
+      "--qa-profile",
+      "smoke-ci",
+      "--surface",
+      "channels",
+      "--category",
+      "channels.conversation-routing-and-delivery",
+      "--scenario",
+      "dm-chat-baseline",
+      "--evidence-mode",
+      "slim",
+      "--transport",
+      "qa-channel",
+      "--provider-mode",
+      "mock-openai",
+      "--model",
+      "openai/gpt-5.6-luna",
+      "--alt-model",
+      "anthropic/claude-sonnet-4-6",
+      "--concurrency",
+      "2",
+      "--allow-failures",
+      "--fast",
+    ]);
+
+    expect(runQaProfileCommand).toHaveBeenCalledWith({
+      repoRoot: "/tmp/openclaw-repo",
+      outputDir: ".artifacts/qa-e2e/smoke-ci",
+      profile: "smoke-ci",
+      surface: "channels",
+      category: "channels.conversation-routing-and-delivery",
+      scenarioIds: ["dm-chat-baseline"],
+      evidenceMode: "slim",
+      transportId: "qa-channel",
+      providerMode: "mock-openai",
+      primaryModel: "openai/gpt-5.6-luna",
+      alternateModel: "anthropic/claude-sonnet-4-6",
+      concurrency: 2,
+      allowFailures: true,
+      fastMode: true,
+    });
+    expect(runQaLabSelfCheckCommand).not.toHaveBeenCalled();
+  });
+
+  it("forwards fail-fast to taxonomy-backed QA profile runs", async () => {
+    await parseQa(["run", "--qa-profile", "smoke-ci", "--fail-fast"]);
+
+    expect(runQaProfileCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ failFast: true, profile: "smoke-ci" }),
     );
+    expect(runQaLabSelfCheckCommand).not.toHaveBeenCalled();
+  });
+
+  it.each([["--scenario", ["dm-chat-baseline"]]])(
+    "rejects qa run profile-only flag %s without --qa-profile",
+    async (flag, values) => {
+      await expectQaFailure(["run", flag, ...values], `qa run ${flag} requires --qa-profile`);
+
+      expect(runQaLabSelfCheckCommand).not.toHaveBeenCalled();
+      expect(runQaProfileCommand).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([["--evidence-mode", "compact"], ["--exclude-test-execution-evidence"]])(
+    "maps deprecated compact evidence flag %s to slim",
+    async (...flags) => {
+      await parseQa(["run", "--qa-profile", "release", ...flags.filter(Boolean)]);
+
+      expect(runQaProfileCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          evidenceMode: "slim",
+          profile: "release",
+        }),
+      );
+    },
+  );
+
+  it("rejects conflicting deprecated evidence flags", async () => {
+    await expectQaFailure(
+      [
+        "run",
+        "--qa-profile",
+        "release",
+        "--evidence-mode",
+        "full",
+        "--exclude-test-execution-evidence",
+      ],
+      "--exclude-test-execution-evidence conflicts with --evidence-mode full",
+    );
+
+    expect(runQaProfileCommand).not.toHaveBeenCalled();
+  });
+
+  it("rejects unknown qa evidence modes", async () => {
+    const invalidProgram = new Command();
+    invalidProgram.exitOverride();
+    invalidProgram.configureOutput({
+      writeErr: () => {},
+      writeOut: () => {},
+    });
+    registerQaLabCli(invalidProgram);
+
+    await expect(
+      invalidProgram.parseAsync([
+        "node",
+        "openclaw",
+        "qa",
+        "run",
+        "--qa-profile",
+        "smoke-ci",
+        "--evidence-mode",
+        "tiny",
+      ]),
+    ).rejects.toThrow("--evidence-mode must be one of full, slim.");
+
+    expect(runQaLabSelfCheckCommand).not.toHaveBeenCalled();
+    expect(runQaProfileCommand).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty qa run --qa-profile instead of falling back to self-check", async () => {
+    await expectQaFailure(["run", "--qa-profile", ""], "--qa-profile must not be empty.");
+
+    expect(runQaLabSelfCheckCommand).not.toHaveBeenCalled();
+    expect(runQaProfileCommand).not.toHaveBeenCalled();
+  });
+
+  it("rejects self-check output flags in qa run profile mode", async () => {
+    await expectQaFailure(
+      ["run", "--qa-profile", "smoke-ci", "--output", ".artifacts/qa-self-check.md"],
+      "qa run --output is only valid for the self-check mode",
+    );
+
+    expect(runQaLabSelfCheckCommand).not.toHaveBeenCalled();
+    expect(runQaProfileCommand).not.toHaveBeenCalled();
   });
 
   it("routes mantis discord-smoke flags into the mantis runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "mantis",
       "discord-smoke",
       "--repo-root",
@@ -174,10 +404,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes mantis before/after flags into the mantis runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "mantis",
       "run",
       "--transport",
@@ -210,6 +437,7 @@ describe("qa cli registration", () => {
       providerMode: "live-frontier",
       repoRoot: "/tmp/openclaw-repo",
       scenario: "discord-status-reactions-tool-only",
+      signal: expect.any(AbortSignal),
       skipBuild: true,
       skipInstall: true,
       transport: "discord",
@@ -217,10 +445,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes mantis desktop browser smoke flags into the mantis runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "mantis",
       "desktop-browser-smoke",
       "--repo-root",
@@ -262,15 +487,7 @@ describe("qa cli registration", () => {
   });
 
   it("does not shadow mantis desktop browser runtime env defaults", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
-      "mantis",
-      "desktop-browser-smoke",
-      "--repo-root",
-      "/tmp/openclaw-repo",
-    ]);
+    await parseQa(["mantis", "desktop-browser-smoke", "--repo-root", "/tmp/openclaw-repo"]);
 
     expect(runMantisDesktopBrowserSmokeCommand).toHaveBeenCalledWith({
       browserUrl: undefined,
@@ -288,10 +505,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes mantis Slack desktop smoke flags into the mantis runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "mantis",
       "slack-desktop-smoke",
       "--repo-root",
@@ -302,10 +516,14 @@ describe("qa cli registration", () => {
       "/tmp/crabbox",
       "--provider",
       "hetzner",
+      "--market",
+      "on-demand",
       "--machine-class",
       "beast",
       "--lease-id",
       "cbx_123abc",
+      "--fresh-pr",
+      "openclaw/openclaw#85141",
       "--idle-timeout",
       "45m",
       "--ttl",
@@ -315,9 +533,9 @@ describe("qa cli registration", () => {
       "--provider-mode",
       "live-frontier",
       "--model",
-      "openai/gpt-5.4",
+      "openai/gpt-5.6-luna",
       "--alt-model",
-      "openai/gpt-5.4",
+      "openai/gpt-5.6-luna",
       "--scenario",
       "slack-canary",
       "--credential-source",
@@ -329,18 +547,20 @@ describe("qa cli registration", () => {
     ]);
 
     expect(runMantisSlackDesktopSmokeCommand).toHaveBeenCalledWith({
-      alternateModel: "openai/gpt-5.4",
+      alternateModel: "openai/gpt-5.6-luna",
       crabboxBin: "/tmp/crabbox",
       credentialRole: "maintainer",
       credentialSource: "env",
       fastMode: true,
+      freshPr: "openclaw/openclaw#85141",
       gatewaySetup: undefined,
       idleTimeout: "45m",
       keepLease: true,
       leaseId: "cbx_123abc",
       machineClass: "beast",
+      market: "on-demand",
       outputDir: ".artifacts/qa-e2e/mantis/slack-desktop",
-      primaryModel: "openai/gpt-5.4",
+      primaryModel: "openai/gpt-5.6-luna",
       provider: "hetzner",
       providerMode: "live-frontier",
       repoRoot: "/tmp/openclaw-repo",
@@ -352,10 +572,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes coverage report flags into the qa runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "coverage",
       "--repo-root",
       "/tmp/openclaw-repo",
@@ -368,31 +585,71 @@ describe("qa cli registration", () => {
       repoRoot: "/tmp/openclaw-repo",
       output: ".artifacts/qa-coverage.md",
       json: true,
+      tools: false,
+      match: [],
     });
   });
 
-  it("delegates discovered qa runner registration through the generic host seam", () => {
-    const [{ registration }] = listQaRunnerCliContributions.mock.results[0]?.value;
-    expect(registration.register).toHaveBeenCalledTimes(1);
+  it("routes tool coverage report flags into the qa runtime command", async () => {
+    await parseQa([
+      "coverage",
+      "--repo-root",
+      "/tmp/openclaw-repo",
+      "--tools",
+      "--summary",
+      ".artifacts/runtime-summary.json",
+    ]);
+
+    expect(runQaCoverageReportCommand).toHaveBeenCalledWith({
+      repoRoot: "/tmp/openclaw-repo",
+      tools: true,
+      json: false,
+      summary: ".artifacts/runtime-summary.json",
+      match: [],
+    });
   });
 
-  it("keeps Telegram credential flags on the shared host CLI", () => {
-    const qa = program.commands.find((command) => command.name() === "qa");
-    const telegram = qa?.commands.find((command) => command.name() === "telegram");
-    const optionNames = telegram?.options.map((option) => option.long) ?? [];
+  it("routes coverage match queries into the qa runtime command", async () => {
+    await parseQa(["coverage", "--match", "image roundtrip", "--match", "native"]);
 
-    expect(optionNames).toEqual(
-      expect.arrayContaining(["--credential-source", "--credential-role"]),
-    );
+    expect(runQaCoverageReportCommand).toHaveBeenCalledWith({
+      tools: false,
+      json: false,
+      match: ["image roundtrip", "native"],
+    });
+  });
+
+  it("routes JSONL replay flags into the qa runtime command", async () => {
+    await parseQa([
+      "jsonl-replay",
+      "--repo-root",
+      "/tmp/openclaw-repo",
+      "--transcripts",
+      "qa/scenarios/jsonl-replay",
+      "--runtime-pair",
+      "openclaw,codex",
+      "--provider-mode",
+      "mock-openai",
+      "--output-dir",
+      ".artifacts/qa-e2e/jsonl-replay-test",
+    ]);
+
+    expect(runQaJsonlReplayCommand).toHaveBeenCalledWith({
+      repoRoot: "/tmp/openclaw-repo",
+      transcripts: "qa/scenarios/jsonl-replay",
+      runtimePair: "openclaw,codex",
+      providerMode: "mock-openai",
+      outputDir: ".artifacts/qa-e2e/jsonl-replay-test",
+    });
   });
 
   it("registers standalone provider server commands from the provider registry", async () => {
     const qa = program.commands.find((command) => command.name() === "qa");
-    expect(qa?.commands.map((command) => command.name())).toEqual(
-      expect.arrayContaining(["mock-openai", "aimock"]),
-    );
+    const commandNames = qa?.commands.map((command) => command.name()) ?? [];
+    expect(commandNames).toContain("mock-openai");
+    expect(commandNames).toContain("aimock");
 
-    await program.parseAsync(["node", "openclaw", "qa", "aimock", "--port", "44080"]);
+    await parseQa(["aimock", "--port", "44080"]);
 
     expect(runQaProviderServerCommand).toHaveBeenCalledWith("aimock", {
       host: "127.0.0.1",
@@ -400,14 +657,41 @@ describe("qa cli registration", () => {
     });
   });
 
+  it("normalizes signed decimal QA numeric option values through the shared parser", async () => {
+    await parseQa(["aimock", "--port", "+044080"]);
+
+    expect(runQaProviderServerCommand).toHaveBeenCalledWith("aimock", {
+      host: "127.0.0.1",
+      port: 44080,
+    });
+  });
+
+  it.each([
+    [["qa", "suite", "--concurrency", "1.5"], "--concurrency must be a positive integer."],
+    [["qa", "suite", "--cpus", "0x4"], "--cpus must be a positive integer."],
+    [["qa", "aimock", "--port", "1e4"], "--port must be a positive integer."],
+    [["qa", "ui", "--port", "65536"], "--port must be a TCP port between 1 and 65535."],
+  ])("rejects invalid QA numeric option %j", async (args, message) => {
+    const invalidProgram = new Command();
+    invalidProgram.exitOverride();
+    invalidProgram.configureOutput({
+      writeErr: () => {},
+      writeOut: () => {},
+    });
+    registerQaLabCli(invalidProgram);
+
+    await expect(invalidProgram.parseAsync(["node", "openclaw", ...args])).rejects.toThrow(message);
+  });
+
   it("shows an enable hint when a discovered runner plugin is installed but blocked", async () => {
     listQaRunnerCliContributions.mockReset().mockReturnValue([createBlockedQaRunnerContribution()]);
-    const blockedProgram = new Command();
-    registerQaLabCli(blockedProgram);
+    program = new Command();
+    registerQaLabCli(program);
 
-    await expect(
-      blockedProgram.parseAsync(["node", "openclaw", "qa", TEST_QA_RUNNER.commandName]),
-    ).rejects.toThrow(`Enable or allow plugin "${TEST_QA_RUNNER.pluginId}"`);
+    await expectQaFailure(
+      [TEST_QA_RUNNER.commandName],
+      `Enable or allow plugin "${TEST_QA_RUNNER.pluginId}"`,
+    );
   });
 
   it("rejects discovered runners that collide with built-in qa subcommands", () => {
@@ -421,7 +705,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes telegram CLI defaults into the lane runtime", async () => {
-    await program.parseAsync(["node", "openclaw", "qa", "telegram"]);
+    await parseQa(["telegram"]);
 
     expect(runQaTelegramCommand).toHaveBeenCalledWith({
       repoRoot: undefined,
@@ -429,40 +713,68 @@ describe("qa cli registration", () => {
       providerMode: "live-frontier",
       primaryModel: undefined,
       alternateModel: undefined,
-      fastMode: false,
+      fastMode: undefined,
       allowFailures: false,
       scenarioIds: [],
+      listScenarios: false,
       sutAccountId: "sut",
       credentialSource: undefined,
       credentialRole: undefined,
     });
   });
 
-  it("forwards --allow-failures for telegram runs", async () => {
-    await program.parseAsync(["node", "openclaw", "qa", "telegram", "--allow-failures"]);
+  it.each([
+    ["suite", ["qa", "suite"]],
+    ["profile", ["qa", "run", "--qa-profile", "smoke-ci"]],
+    ["manual", ["qa", "manual", "--message", "hello"]],
+  ])("preserves omitted --fast intent for %s runs", async (_name, args) => {
+    await program.parseAsync(["node", "openclaw", ...args]);
 
-    expect(runQaTelegramCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allowFailures: true,
-      }),
-    );
+    const call =
+      runQaSuiteCommand.mock.calls[0]?.[0] ??
+      runQaProfileCommand.mock.calls[0]?.[0] ??
+      runQaManualLaneCommand.mock.calls[0]?.[0];
+    expect(call?.fastMode).toBeUndefined();
+  });
+
+  it("forwards --list-scenarios for telegram runs", async () => {
+    await parseQa(["telegram", "--list-scenarios"]);
+
+    const options = requireQaTelegramOptions();
+    expect(options.listScenarios).toBe(true);
+  });
+
+  it("forwards --allow-failures for telegram runs", async () => {
+    await parseQa(["telegram", "--allow-failures"]);
+
+    const options = requireQaTelegramOptions();
+    expect(options.allowFailures).toBe(true);
   });
 
   it("forwards --allow-failures for suite runs", async () => {
-    await program.parseAsync(["node", "openclaw", "qa", "suite", "--allow-failures"]);
+    await parseQa(["suite", "--allow-failures"]);
 
-    expect(runQaSuiteCommand).toHaveBeenCalledWith(
-      expect.objectContaining({
-        allowFailures: true,
-      }),
-    );
+    const options = requireQaSuiteOptions();
+    expect(options.allowFailures).toBe(true);
+    expect(options.providerMode).toBeUndefined();
+  });
+
+  it("forwards --fail-fast to the suite runner", async () => {
+    const runner = "multipass";
+    await parseQa(["suite", "--runner", runner, "--fail-fast"]);
+
+    expect(requireQaSuiteOptions()).toEqual(expect.objectContaining({ failFast: true, runner }));
+  });
+
+  it("forwards --runtime-pair-lane for suite runs", async () => {
+    await parseQa(["suite", "--runtime-pair-lane", "core", "--runtime-pair-lane", "extended,soak"]);
+
+    const options = requireQaSuiteOptions();
+    expect(options.runtimePairLane).toEqual(["core", "extended,soak"]);
   });
 
   it("routes credential add flags into the qa runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "credentials",
       "add",
       "--kind",
@@ -495,10 +807,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes credential remove flags into the qa runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
+    await parseQa([
       "credentials",
       "remove",
       "--credential-id",
@@ -520,15 +829,7 @@ describe("qa cli registration", () => {
   });
 
   it("routes credential list defaults into the qa runtime command", async () => {
-    await program.parseAsync([
-      "node",
-      "openclaw",
-      "qa",
-      "credentials",
-      "list",
-      "--kind",
-      "telegram",
-    ]);
+    await parseQa(["credentials", "list", "--kind", "telegram"]);
 
     expect(runQaCredentialsListCommand).toHaveBeenCalledWith({
       kind: "telegram",

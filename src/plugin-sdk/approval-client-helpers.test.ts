@@ -1,10 +1,14 @@
+/**
+ * Tests approval client helper filters and target recipient matching.
+ */
 import { describe, expect, it } from "vitest";
 import {
   createChannelExecApprovalProfile,
+  createChannelExecApprovalProfileAsync,
   isChannelExecApprovalClientEnabledFromConfig,
   isChannelExecApprovalTargetRecipient,
 } from "./approval-client-helpers.js";
-import type { OpenClawConfig } from "./config-runtime.js";
+import type { OpenClawConfig } from "./config-contracts.js";
 
 describe("isChannelExecApprovalTargetRecipient", () => {
   it("matches targets by channel and account", () => {
@@ -169,5 +173,20 @@ describe("createChannelExecApprovalProfile", () => {
         },
       }),
     ).toBe(true);
+  });
+});
+
+describe("createChannelExecApprovalProfileAsync", () => {
+  it("awaits account eligibility while preserving synchronous configured sender authorization", async () => {
+    const profile = createChannelExecApprovalProfileAsync({
+      resolveConfig: () => ({ enabled: true }),
+      resolveApprovers: () => ["owner"],
+      isTargetRecipient: ({ senderId }) => senderId === "target",
+      matchesRequestAccount: async ({ accountId }) => accountId === "work",
+    });
+    const request = { id: "req-1", request: { command: "pwd" }, createdAtMs: 0, expiresAtMs: 1000 };
+    expect(profile.isAuthorizedSender({ cfg: {}, senderId: "target" })).toBe(true);
+    expect(await profile.shouldHandleRequest({ cfg: {}, accountId: "other", request })).toBe(false);
+    expect(await profile.shouldHandleRequest({ cfg: {}, accountId: "work", request })).toBe(true);
   });
 });

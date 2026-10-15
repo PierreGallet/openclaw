@@ -1,14 +1,45 @@
-import http from "node:http";
-import https from "node:https";
+// Exercises managed proxy lifecycle ownership, env inheritance, Proxyline
+// reuse, loopback bypass policy, TLS trust, and cleanup behavior.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../undici-global-dispatcher.js", () => ({
-  forceResetGlobalDispatcher: vi.fn(),
+const {
+  installGlobalProxyMock,
+  proxylineRegisterBypassMock,
+  proxylineStopMock,
+  proxylineUnregisterBypassMock,
+} = vi.hoisted(() => {
+  const proxylineStopMockLocal = vi.fn();
+  const proxylineUnregisterBypassMockLocal = vi.fn();
+  const proxylineRegisterBypassMockLocal = vi.fn(() => proxylineUnregisterBypassMockLocal);
+  return {
+    proxylineRegisterBypassMock: proxylineRegisterBypassMockLocal,
+    proxylineStopMock: proxylineStopMockLocal,
+    proxylineUnregisterBypassMock: proxylineUnregisterBypassMockLocal,
+    installGlobalProxyMock: vi.fn(() => ({
+      active: true,
+      createNodeAgent: vi.fn(),
+      createUndiciDispatcher: vi.fn(),
+      createWebSocketAgent: vi.fn(),
+      explain: vi.fn(),
+      mode: "managed",
+      registerBypass: proxylineRegisterBypassMockLocal,
+      stop: proxylineStopMockLocal,
+      withBypass: vi.fn(),
+    })),
+  };
+});
+const forceResetGlobalDispatcherMock = vi.hoisted(() => vi.fn());
+
+vi.mock("../proxyline-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../proxyline-runtime.js")>()),
+  loadProxyline: () => ({ installGlobalProxy: installGlobalProxyMock }),
 }));
 
-vi.mock("global-agent", () => ({
-  bootstrap: vi.fn(),
-  createGlobalProxyAgent: vi.fn(),
+vi.mock("../undici-global-dispatcher.js", () => ({
+  forceResetGlobalDispatcher: forceResetGlobalDispatcherMock,
 }));
 
 vi.mock("../../../logger.js", () => ({
@@ -16,21 +47,39 @@ vi.mock("../../../logger.js", () => ({
   logWarn: vi.fn(),
 }));
 
-import { bootstrap as bootstrapGlobalAgent } from "global-agent";
 import { logInfo, logWarn } from "../../../logger.js";
-import { forceResetGlobalDispatcher } from "../undici-global-dispatcher.js";
-import { _resetActiveManagedProxyStateForTests } from "./active-proxy-state.js";
+import { getActiveManagedProxyTlsOptions, getActiveManagedProxyUrl } from "./active-proxy-state.js";
 import {
-  _resetGlobalAgentBootstrapForTests,
-  dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane,
-  startProxy,
+  ensureInheritedManagedProxyRoutingActive,
+  registerManagedProxyBrowserCdpBypass,
+  registerManagedProxyGatewayLoopbackBypass,
+  startProxy as startProxyRuntime,
   stopProxy,
+  type ProxyHandle,
 } from "./proxy-lifecycle.js";
+import { stopMockedProxylineHandles } from "./proxyline.test-support.js";
 
-const mockForceResetGlobalDispatcher = vi.mocked(forceResetGlobalDispatcher);
-const mockBootstrapGlobalAgent = vi.mocked(bootstrapGlobalAgent);
 const mockLogInfo = vi.mocked(logInfo);
 const mockLogWarn = vi.mocked(logWarn);
+const activeProxyHandles: ProxyHandle[] = [];
+
+async function startProxy(
+  config: Parameters<typeof startProxyRuntime>[0],
+): Promise<Awaited<ReturnType<typeof startProxyRuntime>>> {
+  const handle = await startProxyRuntime(config);
+  if (handle) {
+    activeProxyHandles.push(handle);
+  }
+  return handle;
+}
+
+function expectProxyHandle(handle: Awaited<ReturnType<typeof startProxy>>): ProxyHandle {
+  if (handle === null) {
+    throw new Error("Expected managed proxy handle");
+  }
+  expect(handle.proxyUrl).not.toBe("");
+  return handle;
+}
 
 describe("startProxy", () => {
   const savedEnv: Record<string, string | undefined> = {};
@@ -43,41 +92,35 @@ describe("startProxy", () => {
     "ALL_PROXY",
     "no_proxy",
     "NO_PROXY",
-    "GLOBAL_AGENT_HTTP_PROXY",
-    "GLOBAL_AGENT_HTTPS_PROXY",
-    "GLOBAL_AGENT_FORCE_GLOBAL_AGENT",
-    "GLOBAL_AGENT_NO_PROXY",
     "OPENCLAW_PROXY_ACTIVE",
+    "OPENCLAW_PROXY_CA_FILE",
+    "OPENCLAW_PROXY_LOOPBACK_MODE",
     "OPENCLAW_PROXY_URL",
   ];
-  const originalHttpRequest = http.request;
-  const originalHttpGet = http.get;
-  const originalHttpGlobalAgent = http.globalAgent;
-  const originalHttpsRequest = https.request;
-  const originalHttpsGet = https.get;
-  const originalHttpsGlobalAgent = https.globalAgent;
+  const tempDirs: string[] = [];
 
   beforeEach(() => {
     for (const key of envKeysToClean) {
       savedEnv[key] = process.env[key];
       delete process.env[key];
     }
-    mockForceResetGlobalDispatcher.mockReset();
-    mockBootstrapGlobalAgent.mockReset();
     mockLogInfo.mockReset();
     mockLogWarn.mockReset();
-    _resetGlobalAgentBootstrapForTests();
-    _resetActiveManagedProxyStateForTests();
-    (global as Record<string, unknown>)["GLOBAL_AGENT"] = undefined;
-    http.request = originalHttpRequest;
-    http.get = originalHttpGet;
-    http.globalAgent = originalHttpGlobalAgent;
-    https.request = originalHttpsRequest;
-    https.get = originalHttpsGet;
-    https.globalAgent = originalHttpsGlobalAgent;
+    installGlobalProxyMock.mockClear();
+    proxylineRegisterBypassMock.mockClear();
+    proxylineStopMock.mockClear();
+    proxylineUnregisterBypassMock.mockClear();
+    forceResetGlobalDispatcherMock.mockClear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const handle of activeProxyHandles.splice(0).toReversed()) {
+      await stopProxy(handle);
+    }
+    stopMockedProxylineHandles(installGlobalProxyMock.mock.results);
+    for (const dir of tempDirs.splice(0)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
     for (const key of envKeysToClean) {
       if (savedEnv[key] === undefined) {
         delete process.env[key];
@@ -85,270 +128,186 @@ describe("startProxy", () => {
         process.env[key] = savedEnv[key];
       }
     }
-    (global as Record<string, unknown>)["GLOBAL_AGENT"] = undefined;
-    http.request = originalHttpRequest;
-    http.get = originalHttpGet;
-    http.globalAgent = originalHttpGlobalAgent;
-    https.request = originalHttpsRequest;
-    https.get = originalHttpsGet;
-    https.globalAgent = originalHttpsGlobalAgent;
+    expect(getActiveManagedProxyUrl()).toBeUndefined();
   });
+
+  function writeTempCa(contents = "proxy-ca"): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "openclaw-proxy-lifecycle-ca-"));
+    tempDirs.push(dir);
+    const caFile = path.join(dir, "proxy-ca.pem");
+    writeFileSync(caFile, contents, "utf8");
+    return caFile;
+  }
 
   it("returns null silently and does not touch env when not explicitly enabled", async () => {
     const handle = await startProxy(undefined);
 
     expect(handle).toBeNull();
     expect(process.env["http_proxy"]).toBeUndefined();
-    expect(process.env["GLOBAL_AGENT_HTTP_PROXY"]).toBeUndefined();
-    expect(mockForceResetGlobalDispatcher).not.toHaveBeenCalled();
-    expect(mockBootstrapGlobalAgent).not.toHaveBeenCalled();
+    expect(installGlobalProxyMock).not.toHaveBeenCalled();
     expect(mockLogInfo).not.toHaveBeenCalled();
     expect(mockLogWarn).not.toHaveBeenCalled();
   });
 
-  it("throws when enabled without a proxy URL", async () => {
-    await expect(startProxy({ enabled: true })).rejects.toThrow(
-      "proxy: enabled but no HTTP proxy URL is configured",
-    );
-
-    expect(process.env["http_proxy"]).toBeUndefined();
-    expect(mockLogWarn).not.toHaveBeenCalled();
-  });
-
-  it("exposes the active managed proxy URL", async () => {
-    const { getActiveManagedProxyUrl } = await import("./active-proxy-state.js");
-
-    expect(getActiveManagedProxyUrl()).toBeUndefined();
-
-    const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
-
-    expect(getActiveManagedProxyUrl()?.href).toBe("http://127.0.0.1:3128/");
-
-    await stopProxy(handle);
-
-    expect(getActiveManagedProxyUrl()).toBeUndefined();
-  });
-
-  it("uses OPENCLAW_PROXY_URL when config proxyUrl is omitted", async () => {
-    process.env["OPENCLAW_PROXY_URL"] = "http://127.0.0.1:3128";
-
-    const handle = await startProxy({ enabled: true });
-
-    expect(handle?.proxyUrl).toBe("http://127.0.0.1:3128");
-    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
-  });
-
-  it("prefers config proxyUrl over OPENCLAW_PROXY_URL", async () => {
-    process.env["OPENCLAW_PROXY_URL"] = "http://127.0.0.1:3128";
-
-    const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3129",
-    });
-
-    expect(handle?.proxyUrl).toBe("http://127.0.0.1:3129");
-    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3129");
-  });
-
-  it("throws for HTTPS proxy URLs from OPENCLAW_PROXY_URL", async () => {
+  it("uses HTTPS proxy URLs from OPENCLAW_PROXY_URL", async () => {
     process.env["OPENCLAW_PROXY_URL"] = "https://127.0.0.1:3128";
 
-    await expect(startProxy({ enabled: true })).rejects.toThrow("http:// forward proxy");
+    const handle = await startProxy({});
 
-    expect(process.env["HTTP_PROXY"]).toBeUndefined();
-    expect(mockLogWarn).not.toHaveBeenCalled();
+    expect(expectProxyHandle(handle).proxyUrl).toBe("https://127.0.0.1:3128");
+    expect(process.env["HTTP_PROXY"]).toBe("https://127.0.0.1:3128");
+    expect(installGlobalProxyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mode: "managed",
+        proxyUrl: "https://127.0.0.1:3128",
+      }),
+    );
   });
 
-  it("sets both undici and global-agent proxy env vars", async () => {
+  it("passes configured proxy CA trust to Proxyline", async () => {
+    const caFile = writeTempCa("active-proxy-ca");
+
     const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
+      proxyUrl: "https://127.0.0.1:3128",
+      tls: { caFile },
     });
 
-    expect(handle).not.toBeNull();
-    expect(process.env["http_proxy"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["https_proxy"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["HTTPS_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["GLOBAL_AGENT_HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["GLOBAL_AGENT_HTTPS_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["GLOBAL_AGENT_FORCE_GLOBAL_AGENT"]).toBe("true");
-    expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBe("1");
+    expect(getActiveManagedProxyTlsOptions()).toEqual({ ca: "active-proxy-ca" });
+    expect(process.env["OPENCLAW_PROXY_CA_FILE"]).toBe(caFile);
+    expect(installGlobalProxyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        proxyTls: { ca: "active-proxy-ca" },
+      }),
+    );
+
+    await stopProxy(expectProxyHandle(handle));
+  });
+
+  it("loads inherited HTTPS proxy CA trust for child routing", () => {
+    const caFile = writeTempCa("inherited-https-proxy-ca");
+    process.env["OPENCLAW_PROXY_ACTIVE"] = "1";
+    process.env["OPENCLAW_PROXY_LOOPBACK_MODE"] = "gateway-only";
+    process.env["HTTP_PROXY"] = "https://proxy.example:8443";
+    process.env["OPENCLAW_PROXY_CA_FILE"] = caFile;
+
+    ensureInheritedManagedProxyRoutingActive();
+
+    expect(process.env["NO_PROXY"]).toContain("127.0.0.1");
+    expect(process.env["no_proxy"]).toBe(process.env["NO_PROXY"]);
+    expect(getActiveManagedProxyTlsOptions()).toBeUndefined();
+    expect(installGlobalProxyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ifActive: "reuse-compatible",
+        mode: "managed",
+        proxyTls: { ca: "inherited-https-proxy-ca" },
+        proxyUrl: "https://proxy.example:8443",
+      }),
+    );
+  });
+
+  it("persists loopbackMode in env for forked child CLIs", async () => {
+    const { getActiveManagedProxyLoopbackMode } = await import("./active-proxy-state.js");
+    const handle = await startProxy({
+      proxyUrl: "http://127.0.0.1:3128",
+      loopbackMode: "block",
+    });
+
+    expect(process.env["OPENCLAW_PROXY_LOOPBACK_MODE"]).toBe("block");
+    expect(getActiveManagedProxyLoopbackMode()).toBe("block");
+
+    await stopProxy(handle);
+    process.env["OPENCLAW_PROXY_ACTIVE"] = "1";
+    process.env["OPENCLAW_PROXY_LOOPBACK_MODE"] = "proxy";
+
+    expect(getActiveManagedProxyLoopbackMode()).toBe("proxy");
   });
 
   it("redacts proxy credentials before logging the active proxy URL", async () => {
-    await startProxy({
-      enabled: true,
-      proxyUrl: "http://user:pass@127.0.0.1:3128",
-    });
+    const proxyUrl = new URL("http://127.0.0.1:3128");
+    proxyUrl.username = "user";
+    proxyUrl.password = "pass";
+    await startProxy({ proxyUrl: proxyUrl.href });
 
     expect(mockLogInfo).toHaveBeenCalledWith(
       "proxy: routing process HTTP traffic through external proxy http://127.0.0.1:3128",
     );
-    expect(mockLogInfo).not.toHaveBeenCalledWith(expect.stringContaining("user:pass"));
+    expect(
+      mockLogInfo.mock.calls.some((call) =>
+        call.some((value) => typeof value === "string" && value.includes("user:pass")),
+      ),
+    ).toBe(false);
   });
 
-  it("clears NO_PROXY so internal destinations do not bypass the filtering proxy", async () => {
+  it("replaces ambient NO_PROXY with only runtime loopback destinations", async () => {
     process.env["NO_PROXY"] = "127.0.0.1,localhost,corp.example.com";
     process.env["no_proxy"] = "localhost";
-    process.env["GLOBAL_AGENT_NO_PROXY"] = "localhost";
 
     await startProxy({
-      enabled: true,
       proxyUrl: "http://127.0.0.1:3128",
     });
 
-    expect(process.env["no_proxy"]).toBe("");
-    expect(process.env["NO_PROXY"]).toBe("");
-    expect(process.env["GLOBAL_AGENT_NO_PROXY"]).toBe("");
+    expect(process.env["NO_PROXY"]).toContain("127.0.0.1,localhost");
+    expect(process.env["NO_PROXY"]).toContain("::1");
+    expect(process.env["NO_PROXY"]).not.toContain("corp.example.com");
+    expect(process.env["no_proxy"]).toBe(process.env["NO_PROXY"]);
   });
 
-  it("activates undici and global-agent routing", async () => {
-    await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
+  it("reuses inherited Proxyline routing and replaces it when startProxy takes ownership", async () => {
+    process.env["OPENCLAW_PROXY_ACTIVE"] = "1";
+    process.env["OPENCLAW_PROXY_LOOPBACK_MODE"] = "gateway-only";
+    process.env["HTTP_PROXY"] = "http://127.0.0.1:3111";
 
-    expect(mockForceResetGlobalDispatcher).toHaveBeenCalledOnce();
-    expect(mockBootstrapGlobalAgent).toHaveBeenCalledOnce();
-  });
+    ensureInheritedManagedProxyRoutingActive();
 
-  it("restores previous proxy env and global-agent state on stop", async () => {
-    process.env["HTTP_PROXY"] = "http://previous.example.com:8080";
-    process.env["NO_PROXY"] = "corp.example.com";
-    process.env["GLOBAL_AGENT_HTTP_PROXY"] = "http://previous-global.example.com:8080";
-    process.env["GLOBAL_AGENT_HTTPS_PROXY"] = "http://previous-global.example.com:8443";
-    process.env["GLOBAL_AGENT_NO_PROXY"] = "global.corp.example.com";
-    (global as Record<string, unknown>)["GLOBAL_AGENT"] = {
-      HTTP_PROXY: "",
-      HTTPS_PROXY: "",
-    };
+    expect(installGlobalProxyMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ifActive: "reuse-compatible",
+        mode: "managed",
+        proxyUrl: "http://127.0.0.1:3111",
+        undici: expect.objectContaining({ allowH2: false }),
+      }),
+    );
+    expect(proxylineStopMock).not.toHaveBeenCalled();
 
     const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
+      proxyUrl: "http://127.0.0.1:3222",
     });
 
-    expect(handle).not.toBeNull();
-    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["NO_PROXY"]).toBe("");
-    mockForceResetGlobalDispatcher.mockClear();
+    expect(installGlobalProxyMock).toHaveBeenCalledTimes(2);
+    const installCalls = installGlobalProxyMock.mock.calls as unknown[][];
+    expect(installCalls[1]?.[0]).toEqual(
+      expect.objectContaining({
+        ifActive: "replace",
+        mode: "managed",
+        proxyUrl: "http://127.0.0.1:3222",
+        undici: expect.objectContaining({ allowH2: false }),
+      }),
+    );
+    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3222");
 
-    await stopProxy(handle);
+    await stopProxy(expectProxyHandle(handle));
 
-    expect(process.env["HTTP_PROXY"]).toBe("http://previous.example.com:8080");
-    expect(process.env["NO_PROXY"]).toBe("corp.example.com");
-    expect(process.env["GLOBAL_AGENT_HTTP_PROXY"]).toBe("http://previous-global.example.com:8080");
-    expect(process.env["GLOBAL_AGENT_HTTPS_PROXY"]).toBe("http://previous-global.example.com:8443");
-    expect(process.env["GLOBAL_AGENT_NO_PROXY"]).toBe("global.corp.example.com");
-    expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBeUndefined();
-    const agent = (global as Record<string, unknown>)["GLOBAL_AGENT"] as Record<string, unknown>;
-    expect(agent["HTTP_PROXY"]).toBe("http://previous-global.example.com:8080");
-    expect(agent["HTTPS_PROXY"]).toBe("http://previous-global.example.com:8443");
-    expect(agent["NO_PROXY"]).toBe("global.corp.example.com");
-    expect(agent["forceGlobalAgent"]).toBeUndefined();
-    expect(mockForceResetGlobalDispatcher).toHaveBeenCalledOnce();
-  });
-
-  it("restores node http and https globals on stop", async () => {
-    const patchedHttpRequest = vi.fn() as unknown as typeof http.request;
-    const patchedHttpGet = vi.fn() as unknown as typeof http.get;
-    const patchedHttpsRequest = vi.fn() as unknown as typeof https.request;
-    const patchedHttpsGet = vi.fn() as unknown as typeof https.get;
-    const patchedHttpAgent = new http.Agent();
-    const patchedHttpsAgent = new https.Agent();
-    mockBootstrapGlobalAgent.mockImplementationOnce(() => {
-      http.request = patchedHttpRequest;
-      http.get = patchedHttpGet;
-      http.globalAgent = patchedHttpAgent;
-      https.request = patchedHttpsRequest;
-      https.get = patchedHttpsGet;
-      https.globalAgent = patchedHttpsAgent;
-      (global as Record<string, unknown>)["GLOBAL_AGENT"] = {
-        HTTP_PROXY: "",
-        HTTPS_PROXY: "",
-      };
-    });
-
-    const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
-
-    expect(http.request).toBe(patchedHttpRequest);
-
-    await stopProxy(handle);
-
-    expect(http.request).toBe(originalHttpRequest);
-    expect(http.get).toBe(originalHttpGet);
-    expect(http.globalAgent).toBe(originalHttpGlobalAgent);
-    expect(https.request).toBe(originalHttpsRequest);
-    expect(https.get).toBe(originalHttpsGet);
-    expect(https.globalAgent).toBe(originalHttpsGlobalAgent);
-    expect((global as Record<string, unknown>)["GLOBAL_AGENT"]).toBeUndefined();
-  });
-
-  it("keeps same-url overlapping handles active until the final stop", async () => {
-    const patchedHttpRequest = vi.fn() as unknown as typeof http.request;
-    const patchedHttpGet = vi.fn() as unknown as typeof http.get;
-    const patchedHttpsRequest = vi.fn() as unknown as typeof https.request;
-    const patchedHttpsGet = vi.fn() as unknown as typeof https.get;
-    mockBootstrapGlobalAgent.mockImplementationOnce(() => {
-      http.request = patchedHttpRequest;
-      http.get = patchedHttpGet;
-      https.request = patchedHttpsRequest;
-      https.get = patchedHttpsGet;
-      (global as Record<string, unknown>)["GLOBAL_AGENT"] = {
-        HTTP_PROXY: "",
-        HTTPS_PROXY: "",
-      };
-    });
-
-    const firstHandle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
-    const secondHandle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
-
-    expect(mockForceResetGlobalDispatcher).toHaveBeenCalledOnce();
-    expect(mockBootstrapGlobalAgent).toHaveBeenCalledOnce();
-    expect(http.request).toBe(patchedHttpRequest);
-    expect(https.request).toBe(patchedHttpsRequest);
-    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
+    expect(proxylineStopMock).toHaveBeenCalledOnce();
+    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3111");
     expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBe("1");
-
-    await stopProxy(secondHandle);
-
-    expect(http.request).toBe(patchedHttpRequest);
-    expect(https.request).toBe(patchedHttpsRequest);
-    expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBe("1");
-
-    await stopProxy(firstHandle);
-
-    expect(http.request).toBe(originalHttpRequest);
-    expect(http.get).toBe(originalHttpGet);
-    expect(https.request).toBe(originalHttpsRequest);
-    expect(https.get).toBe(originalHttpsGet);
-    expect(process.env["HTTP_PROXY"]).toBeUndefined();
-    expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBeUndefined();
+    expect(installGlobalProxyMock).toHaveBeenCalledTimes(3);
+    expect(installCalls[2]?.[0]).toEqual(
+      expect.objectContaining({
+        ifActive: "reuse-compatible",
+        mode: "managed",
+        proxyUrl: "http://127.0.0.1:3111",
+        undici: expect.objectContaining({ allowH2: false }),
+      }),
+    );
   });
 
   it("rejects overlapping handles with different managed proxy URLs", async () => {
     const firstHandle = await startProxy({
-      enabled: true,
       proxyUrl: "http://127.0.0.1:3128",
     });
 
     await expect(
       startProxy({
-        enabled: true,
         proxyUrl: "http://127.0.0.1:3129",
       }),
     ).rejects.toThrow("cannot activate a managed proxy");
@@ -359,196 +318,64 @@ describe("startProxy", () => {
     await stopProxy(firstHandle);
   });
 
-  it("restores env and throws when undici activation fails", async () => {
-    mockForceResetGlobalDispatcher.mockImplementationOnce(() => {
-      throw new Error("dispatcher failed");
+  it("rejects overlapping handles with the same proxy URL but different loopback modes", async () => {
+    const firstHandle = await startProxy({
+      proxyUrl: "http://127.0.0.1:3128",
+      loopbackMode: "gateway-only",
     });
 
     await expect(
       startProxy({
-        enabled: true,
         proxyUrl: "http://127.0.0.1:3128",
+        loopbackMode: "block",
       }),
-    ).rejects.toThrow("failed to activate external proxy routing");
+    ).rejects.toThrow("cannot activate a managed proxy with a different proxy.loopbackMode");
 
-    expect(process.env["http_proxy"]).toBeUndefined();
-    expect(process.env["GLOBAL_AGENT_FORCE_GLOBAL_AGENT"]).toBeUndefined();
-  });
-
-  it("restores env and throws when global-agent bootstrap fails", async () => {
-    mockBootstrapGlobalAgent.mockImplementationOnce(() => {
-      throw new Error("bootstrap failed");
-    });
-
-    await expect(
-      startProxy({
-        enabled: true,
-        proxyUrl: "http://127.0.0.1:3128",
-      }),
-    ).rejects.toThrow("failed to activate external proxy routing");
-
-    expect(process.env["http_proxy"]).toBeUndefined();
-    expect(process.env["GLOBAL_AGENT_FORCE_GLOBAL_AGENT"]).toBeUndefined();
-  });
-
-  it("temporarily restores the original node HTTP stack for Gateway loopback control-plane setup", async () => {
-    const patchedHttpRequest = vi.fn() as unknown as typeof http.request;
-    const patchedHttpGet = vi.fn() as unknown as typeof http.get;
-    mockBootstrapGlobalAgent.mockImplementationOnce(() => {
-      http.request = patchedHttpRequest;
-      http.get = patchedHttpGet;
-      (global as Record<string, unknown>)["GLOBAL_AGENT"] = {
-        HTTP_PROXY: "",
-        HTTPS_PROXY: "",
-      };
-    });
-
-    const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
-
-    expect(http.request).toBe(patchedHttpRequest);
-
-    const requestDuringBypass = dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-      "ws://127.0.0.1:18789",
-      () => http.request,
-    );
-
-    expect(requestDuringBypass).toBe(originalHttpRequest);
-    expect(http.request).toBe(patchedHttpRequest);
-
-    await stopProxy(handle);
-  });
-
-  it("allows the Gateway control-plane bypass for literal loopback IPs and localhost", () => {
-    expect(
-      dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-        "ws://127.0.0.1:18789",
-        () => "ok",
-      ),
-    ).toBe("ok");
-    expect(
-      dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane("ws://[::1]:18789", () => "ok"),
-    ).toBe("ok");
-    expect(
-      dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-        "ws://localhost:18789",
-        () => "ok",
-      ),
-    ).toBe("ok");
-    expect(
-      dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-        "ws://localhost.:18789",
-        () => "ok",
-      ),
-    ).toBe("ok");
-  });
-
-  it("rejects dangerous Gateway control-plane bypass for non-loopback URLs", () => {
-    expect(() =>
-      dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-        "wss://gateway.example.com",
-        () => undefined,
-      ),
-    ).toThrow("loopback-only");
-  });
-
-  it("temporarily clears inherited proxy env for Gateway control-plane setup", () => {
-    process.env["http_proxy"] = "http://lower-http.example.com:8080";
-    process.env["https_proxy"] = "http://lower-https.example.com:8080";
-    process.env["HTTP_PROXY"] = "http://upper-http.example.com:8080";
-    process.env["HTTPS_PROXY"] = "http://upper-https.example.com:8080";
-    process.env["all_proxy"] = "http://lower-all.example.com:8080";
-    process.env["ALL_PROXY"] = "http://upper-all.example.com:8080";
-    process.env["NO_PROXY"] = "localhost";
-    process.env["no_proxy"] = "127.0.0.1";
-    process.env["GLOBAL_AGENT_HTTP_PROXY"] = "http://global-http.example.com:8080";
-    process.env["GLOBAL_AGENT_HTTPS_PROXY"] = "http://global-https.example.com:8080";
-    process.env["GLOBAL_AGENT_NO_PROXY"] = "localhost";
-    process.env["GLOBAL_AGENT_FORCE_GLOBAL_AGENT"] = "true";
-    process.env["OPENCLAW_PROXY_ACTIVE"] = "1";
-
-    const during = dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-      "ws://localhost:18789",
-      () => ({
-        httpProxy: process.env["HTTP_PROXY"],
-        httpsProxy: process.env["HTTPS_PROXY"],
-        allProxy: process.env["ALL_PROXY"],
-        lowerAllProxy: process.env["all_proxy"],
-        noProxy: process.env["NO_PROXY"],
-        globalProxy: process.env["GLOBAL_AGENT_HTTP_PROXY"],
-        proxyActive: process.env["OPENCLAW_PROXY_ACTIVE"],
-      }),
-    );
-
-    expect(during).toEqual({
-      httpProxy: undefined,
-      httpsProxy: undefined,
-      allProxy: undefined,
-      lowerAllProxy: undefined,
-      noProxy: undefined,
-      globalProxy: undefined,
-      proxyActive: undefined,
-    });
-    expect(process.env["HTTP_PROXY"]).toBe("http://upper-http.example.com:8080");
-    expect(process.env["HTTPS_PROXY"]).toBe("http://upper-https.example.com:8080");
-    expect(process.env["ALL_PROXY"]).toBe("http://upper-all.example.com:8080");
-    expect(process.env["all_proxy"]).toBe("http://lower-all.example.com:8080");
-    expect(process.env["NO_PROXY"]).toBe("localhost");
-    expect(process.env["GLOBAL_AGENT_HTTP_PROXY"]).toBe("http://global-http.example.com:8080");
-    expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBe("1");
-  });
-
-  it("temporarily clears managed proxy env while restoring the original HTTP stack", async () => {
-    const patchedHttpRequest = vi.fn() as unknown as typeof http.request;
-    mockBootstrapGlobalAgent.mockImplementationOnce(() => {
-      http.request = patchedHttpRequest;
-      (global as Record<string, unknown>)["GLOBAL_AGENT"] = {
-        HTTP_PROXY: "",
-        HTTPS_PROXY: "",
-      };
-    });
-
-    const handle = await startProxy({
-      enabled: true,
-      proxyUrl: "http://127.0.0.1:3128",
-    });
-    process.env["ALL_PROXY"] = "http://inherited-all.example.com:8080";
-
-    const during = dangerouslyBypassManagedProxyForGatewayLoopbackControlPlane(
-      "ws://127.0.0.1:18789",
-      () => ({
-        httpRequest: http.request,
-        httpProxy: process.env["HTTP_PROXY"],
-        allProxy: process.env["ALL_PROXY"],
-        proxyActive: process.env["OPENCLAW_PROXY_ACTIVE"],
-      }),
-    );
-
-    expect(during).toEqual({
-      httpRequest: originalHttpRequest,
-      httpProxy: undefined,
-      allProxy: undefined,
-      proxyActive: undefined,
-    });
-    expect(http.request).toBe(patchedHttpRequest);
     expect(process.env["HTTP_PROXY"]).toBe("http://127.0.0.1:3128");
-    expect(process.env["ALL_PROXY"]).toBe("http://inherited-all.example.com:8080");
     expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBe("1");
 
-    await stopProxy(handle);
+    await stopProxy(firstHandle);
+  });
+
+  it("restores env and throws when Proxyline activation fails", async () => {
+    installGlobalProxyMock.mockImplementationOnce(() => {
+      throw new Error("install failed");
+    });
+
+    await expect(
+      startProxy({
+        proxyUrl: "http://127.0.0.1:3128",
+      }),
+    ).rejects.toThrow("failed to activate external proxy routing");
+
+    expect(process.env["http_proxy"]).toBeUndefined();
+    expect(process.env["OPENCLAW_PROXY_ACTIVE"]).toBeUndefined();
+  });
+
+  it("blocks Gateway bypass registration when active proxy loopbackMode is block", async () => {
+    const handle = await startProxy({
+      proxyUrl: "http://127.0.0.1:3128",
+      loopbackMode: "block",
+    });
+
+    try {
+      expect(process.env.NO_PROXY).toBe("");
+      expect(process.env.no_proxy).toBe("");
+      expect(() => registerManagedProxyGatewayLoopbackBypass("ws://127.0.0.1:18789")).toThrow(
+        "blocked by proxy.loopbackMode",
+      );
+    } finally {
+      await stopProxy(handle);
+    }
   });
 
   it("kill restores env synchronously during hard process exit", async () => {
     process.env["NO_PROXY"] = "corp.example.com";
     const handle = await startProxy({
-      enabled: true,
       proxyUrl: "http://127.0.0.1:3128",
     });
 
-    expect(handle).not.toBeNull();
-    handle?.kill("SIGTERM");
+    expectProxyHandle(handle).kill("SIGTERM");
 
     expect(process.env["HTTP_PROXY"]).toBeUndefined();
     expect(process.env["NO_PROXY"]).toBe("corp.example.com");
@@ -556,5 +383,10 @@ describe("startProxy", () => {
 
   it("stopProxy is a no-op when handle is null", async () => {
     await expect(stopProxy(null)).resolves.toBeUndefined();
+  });
+
+  it("returns undefined when no managed proxy is active (bypass is a no-op)", () => {
+    expect(registerManagedProxyBrowserCdpBypass("http://127.0.0.1:18800")).toBeUndefined();
+    expect(proxylineRegisterBypassMock).not.toHaveBeenCalled();
   });
 });

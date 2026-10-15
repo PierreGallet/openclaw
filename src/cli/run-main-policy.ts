@@ -1,36 +1,122 @@
-import type { OpenClawConfig } from "../config/types.openclaw.js";
-import {
-  resolveManifestCommandAliasOwnerInRegistry,
-  type PluginManifestCommandAliasRecord,
-  type PluginManifestCommandAliasRegistry,
-} from "../plugins/manifest-command-aliases.js";
+// Main CLI startup policy helpers for fast paths, proxy startup, aliases, and missing commands.
+import { existsSync } from "node:fs";
+import path from "node:path";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalLowercaseString,
-} from "../shared/string-coerce.js";
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
+import { resolveStateDir } from "../config/paths.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { getCommandPositionalsWithRootOptions } from "../infra/cli-root-options.js";
+import { isTruthyEnvValue } from "../infra/env.js";
+import { tryProcessCwd } from "../infra/safe-cwd.js";
+import type {
+  resolveManifestCommandAliasOwner,
+  resolveManifestCliCommandSurfaceOwner,
+  resolveManifestToolOwner,
+} from "../plugins/manifest-command-aliases.runtime.js";
 import { resolveCliArgvInvocation } from "./argv-invocation.js";
+import { isSimpleCommandHelpInvocation, rewriteUpdateFlagArgv } from "./argv.js";
 import {
   resolveCliCommandPathPolicy,
   resolveCliNetworkProxyPolicy,
 } from "./command-path-policy.js";
 import { isReservedNonPluginCommandRoot } from "./command-registration-policy.js";
+import {
+  consumeGatewayFastPathRootOptionToken,
+  consumeGatewayRunOptionToken,
+} from "./gateway-run-argv.js";
+import { getCoreCliParentDefaultHelpCommands } from "./program/core-command-descriptors.js";
+import { getSubCliParentDefaultHelpCommands } from "./program/subcli-descriptors.js";
 
-const ROOT_HELP_ALIASES = new Set(["tools"]);
+const ROOT_HELP_ALIASES = new Set(["tools", "help"]);
+const SETUP_ONBOARD_CONFIGURE_HELP_COMMANDS = new Set(["setup", "onboard", "configure"]);
+const BARE_PARENT_DEFAULT_HELP_COMMANDS = new Set([
+  ...getCoreCliParentDefaultHelpCommands(),
+  ...getSubCliParentDefaultHelpCommands(),
+]);
+const CLI_PROXY_ENV_KEYS = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+] as const;
 
-export function rewriteUpdateFlagArgv(argv: string[]): string[] {
-  const index = argv.indexOf("--update");
-  if (index === -1) {
-    return argv;
+export function shouldLoadCliDotEnv(loadGlobalEnv: boolean): boolean {
+  const cwd = tryProcessCwd();
+  if (cwd && existsSync(path.join(cwd, ".env"))) {
+    return true;
+  }
+  return loadGlobalEnv && existsSync(path.join(resolveStateDir(), ".env"));
+}
+
+export function isGatewayRunFastPathArgv(argv: string[]): boolean {
+  const invocation = resolveCliArgvInvocation(argv);
+  if (invocation.hasHelpOrVersion) {
+    return false;
+  }
+  const args = argv.slice(2);
+  let sawGateway = false;
+  let sawRun = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg || arg === "--") {
+      return false;
+    }
+    const rootConsumed = consumeGatewayFastPathRootOptionToken(args, index);
+    if (rootConsumed > 0) {
+      index += rootConsumed - 1;
+      continue;
+    }
+    if (!sawGateway) {
+      if (arg !== "gateway") {
+        return false;
+      }
+      sawGateway = true;
+      continue;
+    }
+    const consumed = consumeGatewayRunOptionToken(args, index);
+    if (consumed > 0) {
+      index += consumed - 1;
+      continue;
+    }
+    if (!sawRun && arg === "run") {
+      sawRun = true;
+      continue;
+    }
+    return false;
   }
 
-  const next = [...argv];
-  next.splice(index, 1, "update");
-  return next;
+  return sawGateway;
+}
+
+export function isRemoteAgentDispatchInvocation(argv: string[], primary: string | null): boolean {
+  return primary === "agent" && !argv.includes("--local");
+}
+
+export function isAgentExecInvocation(commandPath: string[]): boolean {
+  return commandPath[0] === "agent" && commandPath[1] === "exec";
+}
+
+function isBareParentDefaultHelpArgv(argv: string[]): boolean {
+  const invocation = resolveCliArgvInvocation(argv);
+  const [primary, extra] = invocation.commandPath;
+  return !invocation.hasHelpOrVersion && primary !== undefined && extra === undefined
+    ? BARE_PARENT_DEFAULT_HELP_COMMANDS.has(primary)
+    : false;
 }
 
 export function shouldEnsureCliPath(argv: string[]): boolean {
   const invocation = resolveCliArgvInvocation(argv);
-  if (invocation.hasHelpOrVersion || shouldStartCrestodianForBareRoot(argv)) {
+  if (
+    invocation.hasHelpOrVersion ||
+    shouldHandleBareRoot(argv) ||
+    isBareParentDefaultHelpArgv(argv)
+  ) {
     return false;
   }
   return resolveCliCommandPathPolicy(invocation.commandPath).ensureCliPath;
@@ -46,39 +132,27 @@ export function shouldUseRootHelpFastPath(
     (invocation.isRootHelpInvocation ||
       (invocation.commandPath.length === 1 &&
         ROOT_HELP_ALIASES.has(invocation.commandPath[0] ?? "") &&
-        invocation.hasHelpOrVersion) ||
-      (invocation.commandPath.length === 1 &&
-        invocation.commandPath[0] === "help" &&
         invocation.hasHelpOrVersion))
   );
 }
 
-export function shouldUseBrowserHelpFastPath(
+export function shouldUseSetupOnboardConfigureHelpFastPath(
   argv: string[],
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
   if (env.OPENCLAW_DISABLE_CLI_STARTUP_HELP_FAST_PATH === "1") {
     return false;
   }
-  const invocation = resolveCliArgvInvocation(argv);
-  return (
-    invocation.commandPath.length === 1 &&
-    invocation.commandPath[0] === "browser" &&
-    invocation.hasHelpOrVersion
-  );
+  return isSimpleCommandHelpInvocation(argv, SETUP_ONBOARD_CONFIGURE_HELP_COMMANDS);
 }
 
-export function shouldStartCrestodianForBareRoot(argv: string[]): boolean {
-  const invocation = resolveCliArgvInvocation(argv);
-  return invocation.commandPath.length === 0 && !invocation.hasHelpOrVersion;
-}
-
-export function shouldStartCrestodianForModernOnboard(argv: string[]): boolean {
-  const invocation = resolveCliArgvInvocation(argv);
+export function shouldHandleBareRoot(argv: string[]): boolean {
   return (
-    invocation.commandPath[0] === "onboard" &&
-    argv.includes("--modern") &&
-    !invocation.hasHelpOrVersion
+    getCommandPositionalsWithRootOptions(argv, {
+      commandPath: [],
+      maxPositionals: 1,
+      mode: "command-path",
+    })?.length === 0
   );
 }
 
@@ -89,19 +163,45 @@ export function shouldStartProxyForCli(argv: string[]): boolean {
   if (invocation.hasHelpOrVersion || !primary) {
     return false;
   }
+  if (isBareParentDefaultHelpArgv(policyArgv)) {
+    return false;
+  }
   return resolveCliNetworkProxyPolicy(policyArgv) === "default";
+}
+
+export function isDebugProxyCaptureEnvEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    isTruthyEnvValue(env.OPENCLAW_DEBUG_PROXY_ENABLED) ||
+    isTruthyEnvValue(env.OPENCLAW_DEBUG_PROXY_REQUIRE)
+  );
+}
+
+export function shouldBootstrapCliProxyBeforeFastPath(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (isDebugProxyCaptureEnvEnabled(env)) {
+    return true;
+  }
+  return CLI_PROXY_ENV_KEYS.some((key) => normalizeOptionalString(env[key]) !== undefined);
+}
+
+function formatExcludedPluginCommand(command: string, owner: string): string {
+  return owner === command
+    ? `The \`openclaw ${command}\` command is unavailable because ` +
+        `\`plugins.allow\` excludes "${command}". Add "${command}" to ` +
+        `\`plugins.allow\` if you want that bundled plugin CLI surface.`
+    : `"${command}" is not a plugin; it is a command provided by the ` +
+        `"${owner}" plugin. Add "${owner}" to \`plugins.allow\` ` +
+        `instead of "${command}".`;
 }
 
 export function resolveMissingPluginCommandMessage(
   pluginId: string,
   config?: OpenClawConfig,
   options?: {
-    registry?: PluginManifestCommandAliasRegistry;
-    resolveCommandAliasOwner?: (params: {
-      command: string | undefined;
-      config?: OpenClawConfig;
-      registry?: PluginManifestCommandAliasRegistry;
-    }) => PluginManifestCommandAliasRecord | undefined;
+    resolveCommandAliasOwner?: typeof resolveManifestCommandAliasOwner;
+    resolveToolOwner?: typeof resolveManifestToolOwner;
+    resolveCliCommandSurfaceOwner?: typeof resolveManifestCliCommandSurfaceOwner;
   },
 ): string | null {
   const normalizedPluginId = normalizeLowercaseStringOrEmpty(pluginId);
@@ -115,24 +215,14 @@ export function resolveMissingPluginCommandMessage(
           .map((entry) => normalizeOptionalLowercaseString(entry))
           .filter(Boolean)
       : [];
-  const commandAlias = options?.registry
-    ? resolveManifestCommandAliasOwnerInRegistry({
-        command: normalizedPluginId,
-        registry: options.registry,
-      })
-    : options?.resolveCommandAliasOwner?.({
-        command: normalizedPluginId,
-        config,
-        ...(options?.registry ? { registry: options.registry } : {}),
-      });
+  const commandAlias = options?.resolveCommandAliasOwner?.({
+    command: normalizedPluginId,
+    config,
+  });
   const parentPluginId = commandAlias?.pluginId;
   if (parentPluginId) {
     if (allow.length > 0 && !allow.includes(parentPluginId)) {
-      return (
-        `"${normalizedPluginId}" is not a plugin; it is a command provided by the ` +
-        `"${parentPluginId}" plugin. Add "${parentPluginId}" to \`plugins.allow\` ` +
-        `instead of "${normalizedPluginId}".`
-      );
+      return formatExcludedPluginCommand(normalizedPluginId, parentPluginId);
     }
     if (config?.plugins?.entries?.[parentPluginId]?.enabled === false) {
       return (
@@ -168,15 +258,54 @@ export function resolveMissingPluginCommandMessage(
     return null;
   }
 
+  const toolOwner = options?.resolveToolOwner?.({
+    toolName: normalizedPluginId,
+    config,
+  });
+  if (toolOwner) {
+    // Availability metadata does not override the owning plugin's allowlist or disablement.
+    const ownerEnabled =
+      config?.plugins?.entries?.[toolOwner.pluginId]?.enabled !== false &&
+      (allow.length === 0 || allow.includes(toolOwner.pluginId));
+    if (ownerEnabled) {
+      // Per-account / per-tool runtime gates (e.g. Feishu's
+      // channels.feishu.enabled / tools.<x> toggles) are not declarable as
+      // manifest configSignals, so a positive manifest-availability signal
+      // proves "could be loaded if config permits", not "currently registered".
+      // Soften the wording when the runtime resolver could only prove
+      // manifest-level ownership.
+      if (toolOwner.availability === "manifest-only") {
+        return (
+          `"${normalizedPluginId}" may be provided by the "${toolOwner.pluginId}" plugin ` +
+          `as an agent tool, not a CLI subcommand. ` +
+          "Run `openclaw --help` to see available CLI subcommands."
+        );
+      }
+      return (
+        `"${normalizedPluginId}" is an agent tool available from the "${toolOwner.pluginId}" plugin, ` +
+        `not a CLI subcommand. Use it from an agent turn (model tool-use), not the CLI. ` +
+        "Run `openclaw --help` to see available CLI subcommands."
+      );
+    }
+  }
+
   if (allow.length > 0 && !allow.includes(normalizedPluginId)) {
     if (parentPluginId && allow.includes(parentPluginId)) {
       return null;
     }
-    return (
-      `The \`openclaw ${normalizedPluginId}\` command is unavailable because ` +
-      `\`plugins.allow\` excludes "${normalizedPluginId}". Add "${normalizedPluginId}" to ` +
-      `\`plugins.allow\` if you want that bundled plugin CLI surface.`
-    );
+    const cliCommandSurfaceOwner = options?.resolveCliCommandSurfaceOwner?.({
+      command: normalizedPluginId,
+      config,
+    });
+    const normalizedCliCommandSurfaceOwner =
+      normalizeOptionalLowercaseString(cliCommandSurfaceOwner);
+    if (!normalizedCliCommandSurfaceOwner) {
+      return null;
+    }
+    if (allow.includes(normalizedCliCommandSurfaceOwner)) {
+      return null;
+    }
+    return formatExcludedPluginCommand(normalizedPluginId, normalizedCliCommandSurfaceOwner);
   }
   if (config?.plugins?.entries?.[normalizedPluginId]?.enabled === false) {
     return (

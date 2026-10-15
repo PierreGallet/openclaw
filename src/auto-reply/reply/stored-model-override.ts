@@ -1,59 +1,51 @@
-import { resolvePersistedOverrideModelRef } from "../../agents/model-selection.js";
-import { resolveSessionParentSessionKey } from "../../channels/plugins/session-conversation.js";
+// Detects stale heartbeat fallback pins from the identities their producers selected.
+import { buildModelCatalogRef } from "@openclaw/model-catalog-core/model-catalog-refs";
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { hasSessionAutoModelFallbackProvenance } from "../../agents/agent-scope.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
-import { normalizeOptionalString } from "../../shared/string-coerce.js";
+import type { StoredModelOverride } from "../../sessions/stored-model-overrides.js";
 
-export type StoredModelOverride = {
-  provider?: string;
-  model: string;
-  source: "session" | "parent";
-};
-
-function resolveParentSessionKeyCandidate(params: {
-  sessionKey?: string;
-  parentSessionKey?: string;
-}): string | null {
-  const explicit = normalizeOptionalString(params.parentSessionKey);
-  if (explicit && explicit !== params.sessionKey) {
-    return explicit;
-  }
-  const derived = resolveSessionParentSessionKey(params.sessionKey);
-  if (derived && derived !== params.sessionKey) {
-    return derived;
-  }
-  return null;
-}
-
-export function resolveStoredModelOverride(params: {
+/** Detects heartbeat auto-fallback overrides that no longer match the primary model. */
+export function isStaleHeartbeatAutoFallbackOverride(params: {
+  isHeartbeat?: boolean;
+  hasResolvedHeartbeatModelOverride?: boolean;
   sessionEntry?: SessionEntry;
-  sessionStore?: Record<string, SessionEntry>;
-  sessionKey?: string;
-  parentSessionKey?: string;
+  storedOverride?: StoredModelOverride | null;
   defaultProvider: string;
-}): StoredModelOverride | null {
-  const direct = resolvePersistedOverrideModelRef({
-    defaultProvider: params.defaultProvider,
-    overrideProvider: params.sessionEntry?.providerOverride,
-    overrideModel: params.sessionEntry?.modelOverride,
-  });
-  if (direct) {
-    return { ...direct, source: "session" };
+  defaultModel: string;
+  primaryProvider?: string;
+  primaryModel?: string;
+}): boolean {
+  if (params.isHeartbeat !== true || params.hasResolvedHeartbeatModelOverride === true) {
+    return false;
   }
-  const parentKey = resolveParentSessionKeyCandidate({
-    sessionKey: params.sessionKey,
-    parentSessionKey: params.parentSessionKey,
-  });
-  if (!parentKey || !params.sessionStore) {
-    return null;
+  if (params.storedOverride?.source !== "session") {
+    return false;
   }
-  const parentEntry = params.sessionStore[parentKey];
-  const parentOverride = resolvePersistedOverrideModelRef({
-    defaultProvider: params.defaultProvider,
-    overrideProvider: parentEntry?.providerOverride,
-    overrideModel: parentEntry?.modelOverride,
-  });
-  if (!parentOverride) {
-    return null;
+  const entry = params.sessionEntry;
+  if (!entry) {
+    return false;
   }
-  return { ...parentOverride, source: "parent" };
+  const recoveredAutoFallbackOverride =
+    entry.modelOverrideSource === undefined && hasSessionAutoModelFallbackProvenance(entry);
+  // Older sessions may lack modelOverrideSource; provenance recovers the auto-fallback state.
+  if (entry.modelOverrideSource !== "auto" && !recoveredAutoFallbackOverride) {
+    return false;
+  }
+
+  // These are prepared identities, including the encoded notice. Alias expansion or
+  // self-provider stripping would conflate distinct models such as custom/custom/model.
+  const primaryProvider = params.primaryProvider ?? params.defaultProvider;
+  const primaryModel = params.primaryModel ?? params.defaultModel;
+  const originModel = normalizeOptionalString(entry.modelOverrideFallbackOriginModel);
+  if (originModel) {
+    const originProvider =
+      normalizeOptionalString(entry.modelOverrideFallbackOriginProvider) ?? params.defaultProvider;
+    return originProvider !== primaryProvider || originModel !== primaryModel;
+  }
+  const noticeSelectedKey = normalizeOptionalString(entry.fallbackNotice?.selectedModel);
+  return noticeSelectedKey
+    ? noticeSelectedKey !== buildModelCatalogRef(primaryProvider, primaryModel)
+    : (params.storedOverride.provider ?? params.defaultProvider) !== primaryProvider ||
+        params.storedOverride.model !== primaryModel;
 }

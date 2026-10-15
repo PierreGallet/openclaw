@@ -1,4 +1,6 @@
+// Public config facade for IO, mutation, runtime snapshots, paths, and shared config types.
 export {
+  captureRuntimeConfigAsyncReader,
   clearConfigCache,
   ConfigRuntimeRefreshError,
   clearRuntimeConfigSnapshot,
@@ -8,9 +10,11 @@ export {
   getRuntimeConfigSnapshotMetadata,
   getRuntimeConfigSnapshot,
   getRuntimeConfigSourceSnapshot,
+  readRuntimeConfig,
   projectConfigOntoRuntimeSourceSnapshot,
   loadConfig,
   readBestEffortConfig,
+  readBestEffortConfigSnapshot,
   readSourceConfigBestEffort,
   parseConfigJson5,
   promoteConfigSnapshotToLastKnownGood,
@@ -30,9 +34,12 @@ export {
   writeConfigFile,
 } from "./io.js";
 export {
+  getRuntimeConfigAppliedHash,
   hashRuntimeConfigValue,
   resolveConfigWriteAfterWrite,
   resolveConfigWriteFollowUp,
+  setAppliedRuntimeConfigSnapshot,
+  setRuntimeConfigAppliedHash,
 } from "./runtime-snapshot.js";
 export type {
   ConfigWriteAfterWrite,
@@ -40,10 +47,38 @@ export type {
   RuntimeConfigSnapshotMetadata,
 } from "./runtime-snapshot.js";
 export type {
+  BestEffortConfigSnapshot,
+  ConfigSnapshotReadOptions,
   ConfigWriteNotification,
+  ConfigWriteResult,
   ReadConfigFileSnapshotWithPluginMetadataResult,
 } from "./io.js";
-export { ConfigMutationConflictError, mutateConfigFile, replaceConfigFile } from "./mutate.js";
+export {
+  ConfigMutationConflictError,
+  mutateConfigFile,
+  mutateConfigFileWithRetry,
+  replaceConfigFile,
+  transformConfigFile,
+  transformConfigFileWithRetry,
+  withConfigMutationExclusive,
+} from "./mutate.js";
+export type {
+  ConfigMutationCommit,
+  ConfigMutationCommitParams,
+  ConfigMutationCommitResult,
+  ConfigMutationContext,
+  ConfigMutationIO,
+  ConfigReplaceResult,
+  ConfigMutationResult,
+  ConfigTransformResult,
+  TransformConfigFileParams,
+  TransformConfigFileWithRetryParams,
+} from "./mutate.js";
+export {
+  assertConfigWriteAllowedInCurrentMode,
+  ConfigReadOnlyError,
+  NixModeConfigMutationError,
+} from "./config-write-guard.js";
 export * from "./paths.js";
 export * from "./recovery-policy.js";
 export * from "./runtime-overrides.js";

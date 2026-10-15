@@ -1,165 +1,138 @@
+// Media defaults honor provider metadata, configured models, and execution aliases.
 import { describe, expect, it, vi } from "vitest";
+import type { MediaUnderstandingCapability, MediaUnderstandingProvider } from "./types.js";
 
 const mediaMetadataPlugins = vi.hoisted(() => [
   {
     contracts: {
-      mediaUnderstandingProviders: [
-        "anthropic",
-        "google",
-        "minimax",
-        "minimax-portal",
-        "mistral",
-        "moonshot",
-        "openai",
-        "openai-codex",
-        "opencode",
-        "opencode-go",
-        "openrouter",
-        "qwen",
-        "xai",
-        "zai",
-      ],
+      mediaUnderstandingProviders: ["google", "minimax", "minimax-portal", "openrouter"],
     },
     mediaUnderstandingProviderMetadata: {
-      anthropic: {
+      google: { capabilities: ["image"], autoPriority: { image: 30 } },
+      minimax: {
         capabilities: ["image"],
-        autoPriority: { image: 20 },
-        nativeDocumentInputs: ["pdf"],
+        autoPriority: { image: 40 },
+        documentModels: { pdf: { textExtraction: "MiniMax-M2.7", image: false } },
       },
-      google: {
-        capabilities: ["image", "audio", "video"],
-        defaultModels: {
-          image: "gemini-3-flash-preview",
-          audio: "gemini-3-flash-preview",
-          video: "gemini-3-flash-preview",
-        },
-        autoPriority: { image: 30, audio: 40, video: 10 },
-        nativeDocumentInputs: ["pdf"],
-      },
-      minimax: { capabilities: ["image"], autoPriority: { image: 40 } },
       "minimax-portal": {
         capabilities: ["image"],
-        defaultModels: { image: "MiniMax-VL-01" },
         autoPriority: { image: 50 },
+        documentModels: { pdf: { textExtraction: "MiniMax-M2.7", image: false } },
       },
-      mistral: {
-        capabilities: ["audio"],
-        defaultModels: { audio: "voxtral-mini-latest" },
-        autoPriority: { audio: 50 },
-      },
-      moonshot: {
-        capabilities: ["image", "video"],
-        defaultModels: { image: "kimi-k2.6", video: "kimi-k2.6" },
-        autoPriority: { video: 30 },
-      },
-      openai: {
-        capabilities: ["image", "audio"],
-        defaultModels: { image: "gpt-5.4-mini", audio: "gpt-4o-transcribe" },
-        autoPriority: { image: 10, audio: 10 },
-      },
-      "openai-codex": {
-        capabilities: ["image"],
-        defaultModels: { image: "gpt-5.5" },
-        autoPriority: { image: 20 },
-      },
-      opencode: { capabilities: ["image"], defaultModels: { image: "gpt-5-nano" } },
-      "opencode-go": { capabilities: ["image"], defaultModels: { image: "kimi-k2.6" } },
       openrouter: { capabilities: ["image"], defaultModels: { image: "auto" } },
-      qwen: { capabilities: ["video"], autoPriority: { video: 20 } },
-      xai: { capabilities: ["audio"], autoPriority: { audio: 25 } },
-      zai: { capabilities: ["image"], autoPriority: { image: 60 } },
     },
   },
 ]);
 
-vi.mock("../plugins/plugin-registry.js", () => ({
-  loadPluginManifestRegistryForPluginRegistry: () => ({
-    plugins: mediaMetadataPlugins,
-    diagnostics: [],
-  }),
-  loadPluginRegistrySnapshotWithMetadata: () => ({
-    source: "derived",
-    snapshot: { plugins: [] },
-    diagnostics: [],
-  }),
-}));
-
-vi.mock("../plugins/manifest-contract-eligibility.js", () => ({
-  loadManifestMetadataSnapshot: () => ({
-    index: { plugins: [] },
-    plugins: mediaMetadataPlugins,
-  }),
-}));
-
-vi.mock("../plugins/current-plugin-metadata-snapshot.js", () => ({
-  getCurrentPluginMetadataSnapshot: () => ({
-    plugins: mediaMetadataPlugins,
-  }),
-}));
+vi.mock("../plugins/manifest-contract-eligibility.js", () => {
+  const manifestRegistry = { plugins: mediaMetadataPlugins, diagnostics: [] };
+  return {
+    loadManifestMetadataSnapshot: () => ({
+      index: { plugins: [] },
+      plugins: mediaMetadataPlugins,
+      manifestRegistry,
+    }),
+  };
+});
 
 import {
   providerSupportsNativePdfDocument,
   resolveAutoMediaKeyProviders,
   resolveDefaultMediaModel,
+  resolveDocumentMediaModel,
 } from "./defaults.js";
 
 describe("resolveDefaultMediaModel", () => {
-  it("resolves bundled audio defaults from provider metadata", () => {
-    expect(resolveDefaultMediaModel({ providerId: "mistral", capability: "audio" })).toBe(
-      "voxtral-mini-latest",
-    );
-  });
+  it("prefers configured image models before manifest defaults", () => {
+    const cfg = {
+      models: {
+        providers: {
+          openrouter: {
+            models: [{ id: "google/gemini-2.5-flash", input: ["text", "image"] }],
+          },
+        },
+      },
+    } as never;
 
-  it("resolves bundled image defaults beyond the historical core set", () => {
-    expect(resolveDefaultMediaModel({ providerId: "minimax-portal", capability: "image" })).toBe(
-      "MiniMax-VL-01",
+    expect(resolveDefaultMediaModel({ providerId: "openrouter", capability: "image", cfg })).toBe(
+      "google/gemini-2.5-flash",
     );
-    expect(resolveDefaultMediaModel({ providerId: "openai-codex", capability: "image" })).toBe(
-      "gpt-5.5",
-    );
-    expect(resolveDefaultMediaModel({ providerId: "moonshot", capability: "image" })).toBe(
-      "kimi-k2.6",
-    );
-    expect(resolveDefaultMediaModel({ providerId: "openrouter", capability: "image" })).toBe(
-      "auto",
-    );
-    expect(resolveDefaultMediaModel({ providerId: "opencode", capability: "image" })).toBe(
-      "gpt-5-nano",
-    );
-    expect(resolveDefaultMediaModel({ providerId: "opencode-go", capability: "image" })).toBe(
-      "kimi-k2.6",
-    );
+    expect(
+      resolveDefaultMediaModel({
+        providerId: "openrouter",
+        capability: "image",
+        cfg,
+        includeConfiguredImageModels: false,
+      }),
+    ).toBe("auto");
   });
 });
 
 describe("resolveAutoMediaKeyProviders", () => {
-  it("keeps the bundled audio fallback order", () => {
-    expect(resolveAutoMediaKeyProviders({ capability: "audio" })).toEqual([
-      "openai",
-      "xai",
-      "google",
-      "mistral",
-    ]);
-  });
+  it.each<MediaUnderstandingCapability>(["video"])(
+    "orders %s priorities without conflating declared capabilities and runtime hooks",
+    (capability) => {
+      const hooks = {
+        describeImage: async () => ({ text: "image" }),
+        transcribeAudio: async () => ({ text: "audio" }),
+        describeVideo: async () => ({ text: "video" }),
+      };
+      const providers: MediaUnderstandingProvider[] = [
+        { id: "z-tie", capabilities: [capability], autoPriority: { [capability]: 2 } },
+        { id: "a-tie", capabilities: [capability], autoPriority: { [capability]: 2 } },
+        { id: "zero", capabilities: [capability], autoPriority: { [capability]: 0 } },
+        { id: "negative", capabilities: [capability], autoPriority: { [capability]: -2 } },
+        { id: "nan", capabilities: [capability], autoPriority: { [capability]: Number.NaN } },
+        { id: "infinity", capabilities: [capability], autoPriority: { [capability]: Infinity } },
+        { id: "declared-empty", capabilities: [], autoPriority: { [capability]: -10 }, ...hooks },
+        { id: "hook-only", autoPriority: { [capability]: 1 }, ...hooks },
+        { id: "no-hook", autoPriority: { [capability]: -20 } },
+        { id: "gemini", capabilities: [capability], autoPriority: { [capability]: 3 } },
+        { id: "google", capabilities: [capability], autoPriority: { [capability]: 4 } },
+      ];
+      const providerRegistry = new Map(providers.map((provider) => [provider.id, provider]));
 
-  it("keeps the bundled image fallback order", () => {
-    expect(resolveAutoMediaKeyProviders({ capability: "image" })).toEqual([
-      "openai",
-      "anthropic",
-      "openai-codex",
-      "google",
-      "minimax",
-      "minimax-portal",
-      "zai",
-    ]);
-  });
+      expect(resolveAutoMediaKeyProviders({ capability, providerRegistry })).toEqual([
+        "negative",
+        "zero",
+        "hook-only",
+        "a-tie",
+        "z-tie",
+        "google",
+        "google",
+      ]);
+      expect([...providerRegistry.values()]).toEqual(providers);
+    },
+  );
 
-  it("keeps the bundled video fallback order", () => {
-    expect(resolveAutoMediaKeyProviders({ capability: "video" })).toEqual([
-      "google",
-      "qwen",
-      "moonshot",
-    ]);
+  it("preserves configured MiniMax CN aliases for image auto discovery", () => {
+    const providers = resolveAutoMediaKeyProviders({
+      capability: "image",
+      cfg: {
+        models: {
+          providers: {
+            "minimax-cn": {
+              models: [{ id: "MiniMax-M2.7", input: ["text", "image"] }],
+            },
+            "minimax-portal-cn": {
+              models: [{ id: "MiniMax-M2.7", input: ["text", "image"] }],
+            },
+            gemini: {
+              models: [{ id: "gemini-3-flash-preview", input: ["text", "image"] }],
+            },
+          },
+        },
+      } as never,
+    });
+
+    expect(providers).toContain("minimax-cn");
+    expect(providers).toContain("minimax-portal-cn");
+    expect(providers).not.toContain("gemini");
+    expect(providers).toContain("google");
+    expect(providers.indexOf("minimax-cn")).toBeLessThan(providers.indexOf("minimax"));
+    expect(providers.indexOf("minimax-portal-cn")).toBeLessThan(
+      providers.indexOf("minimax-portal"),
+    );
   });
 });
 
@@ -179,5 +152,31 @@ describe("providerSupportsNativePdfDocument", () => {
     expect(providerSupportsNativePdfDocument({ providerId: "openai", providerRegistry })).toBe(
       false,
     );
+  });
+});
+
+describe("resolveDocumentMediaModel", () => {
+  it("reads document model hints from provider metadata", () => {
+    expect(
+      resolveDocumentMediaModel({
+        providerId: "minimax-portal-cn",
+        document: "pdf",
+        mode: "textExtraction",
+      }),
+    ).toBe("MiniMax-M2.7");
+    expect(
+      resolveDocumentMediaModel({
+        providerId: "minimax",
+        document: "pdf",
+        mode: "image",
+      }),
+    ).toBe(false);
+    expect(
+      resolveDocumentMediaModel({
+        providerId: "openai",
+        document: "pdf",
+        mode: "textExtraction",
+      }),
+    ).toBeUndefined();
   });
 });

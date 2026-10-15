@@ -1,4 +1,4 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDiscordPluginBase, discordConfigAdapter } from "./shared.js";
 
@@ -8,7 +8,7 @@ afterEach(() => {
 
 describe("createDiscordPluginBase", () => {
   it("owns Discord native command name overrides", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
 
     expect(
       plugin.commands?.resolveNativeCommandName?.({
@@ -22,25 +22,17 @@ describe("createDiscordPluginBase", () => {
         defaultName: "status",
       }),
     ).toBe("status");
-  });
-
-  it("exposes security checks on the setup surface", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
-
-    expect(plugin.security?.resolveDmPolicy).toBeTypeOf("function");
-    expect(plugin.security?.collectWarnings).toBeTypeOf("function");
-    expect(plugin.security?.collectAuditFindings).toBeTypeOf("function");
-  });
-
-  it("hydrates announce delivery targets from stored session routing", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
-
-    expect(plugin.meta.preferSessionLookupForAnnounceTarget).toBe(true);
+    expect(
+      plugin.commands?.resolveNativeCommandName?.({
+        commandKey: "login",
+        defaultName: "login",
+      }),
+    ).toBe("login");
   });
 
   it("reports duplicate-token accounts as disabled to gateway startup", () => {
     vi.stubEnv("DISCORD_BOT_TOKEN", "same-token");
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
     const cfg = {
       channels: {
         discord: {
@@ -63,8 +55,8 @@ describe("createDiscordPluginBase", () => {
     expect(plugin.config.isEnabled?.(workAccount, cfg)).toBe(true);
   });
 
-  it("describes unresolved SecretRef tokens without marking them startup-configured", () => {
-    const plugin = createDiscordPluginBase({ setup: {} as never });
+  it("describes unresolved SecretRef tokens as startup-configured so startup reports the resolver error", () => {
+    const plugin = createDiscordPluginBase({ setupContract: {} as never });
     const cfg = {
       channels: {
         discord: {
@@ -79,31 +71,14 @@ describe("createDiscordPluginBase", () => {
     expect(account.token).toBe("");
     expect(account.tokenSource).toBe("config");
     expect(account.tokenStatus).toBe("configured_unavailable");
-    expect(plugin.config.isConfigured?.(account, cfg)).toBe(false);
-    expect(described?.configured).toBe(false);
+    expect(plugin.config.isConfigured?.(account, cfg)).toBe(true);
+    expect(described?.configured).toBe(true);
     expect(described?.tokenStatus).toBe("configured_unavailable");
   });
 });
 
 describe("discordConfigAdapter", () => {
-  it("resolves top-level allowFrom before legacy dm.allowFrom", () => {
-    const cfg = {
-      channels: {
-        discord: {
-          accounts: {
-            default: {
-              allowFrom: ["123"],
-              dm: { allowFrom: ["456"] },
-            },
-          },
-        },
-      },
-    } as OpenClawConfig;
-
-    expect(discordConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual(["123"]);
-  });
-
-  it("falls back to legacy dm.allowFrom", () => {
+  it("ignores retired nested dm.allowFrom", () => {
     const cfg = {
       channels: {
         discord: {
@@ -116,44 +91,7 @@ describe("discordConfigAdapter", () => {
       },
     } as OpenClawConfig;
 
-    expect(discordConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual(["456"]);
-  });
-
-  it("prefers account legacy dm.allowFrom over inherited root allowFrom", () => {
-    const cfg = {
-      channels: {
-        discord: {
-          allowFrom: ["root"],
-          accounts: {
-            work: {
-              dm: { allowFrom: ["account-legacy"] },
-            },
-          },
-        },
-      },
-    } as OpenClawConfig;
-
-    expect(discordConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "work" })).toEqual([
-      "account-legacy",
-    ]);
-  });
-
-  it("coerces numeric allowFrom entries at the config boundary", () => {
-    const cfg = {
-      channels: {
-        discord: {
-          accounts: {
-            default: {
-              allowFrom: [123456789],
-            },
-          },
-        },
-      },
-    } as unknown as OpenClawConfig;
-
-    expect(discordConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual([
-      "123456789",
-    ]);
+    expect(discordConfigAdapter.resolveAllowFrom?.({ cfg, accountId: "default" })).toEqual([]);
   });
 
   it("keeps read-only accessors from resolving token SecretRefs", () => {

@@ -1,62 +1,71 @@
 import { vi } from "vitest";
-import type { OpenClawConfig, RuntimeEnv } from "../../runtime-api.js";
-import type { MSTeamsMessageHandlerDeps } from "../monitor-handler.js";
+import type { OpenClawConfig, PluginRuntime, RuntimeEnv } from "../../runtime-api.js";
 import { installMSTeamsTestRuntime } from "../monitor-handler.test-helpers.js";
+import type { MSTeamsMessageHandlerDeps } from "../monitor-handler.types.js";
 
 export const channelConversationId = "19:general@thread.tacv2";
 
 type MessageHandlerDepsOptions = {
-  enqueueSystemEvent?: ReturnType<typeof vi.fn>;
+  accountId?: string;
   readAllowFromStore?: ReturnType<typeof vi.fn>;
-  upsertPairingRequest?: ReturnType<typeof vi.fn>;
-  recordInboundSession?: ReturnType<typeof vi.fn>;
-  resolveAgentRoute?: (params: { peer: { kind: string; id: string } }) => unknown;
+  resolveAgentRoute?: (params: {
+    accountId?: string | null;
+    peer: { kind: string; id: string };
+  }) => unknown;
+  hasControlCommand?: PluginRuntime["channel"]["text"]["hasControlCommand"];
+  createInboundDebouncer?: PluginRuntime["channel"]["debounce"]["createInboundDebouncer"];
+  resolveInboundDebounceMs?: PluginRuntime["channel"]["debounce"]["resolveInboundDebounceMs"];
+  resolveStorePath?: () => string | undefined;
+  runPrepared?: NonNullable<Parameters<typeof installMSTeamsTestRuntime>[0]>["runPrepared"];
 };
 
 export function createMessageHandlerDeps(
   cfg: OpenClawConfig,
   options: MessageHandlerDepsOptions = {},
 ) {
-  const enqueueSystemEvent = options.enqueueSystemEvent ?? vi.fn();
+  const accountId = options.accountId ?? "default";
+  const enqueueSystemEvent = vi.fn();
   const readAllowFromStore = options.readAllowFromStore ?? vi.fn(async () => []);
-  const upsertPairingRequest = options.upsertPairingRequest ?? vi.fn(async () => null);
-  const recordInboundSession =
-    options.recordInboundSession ?? vi.fn(async (_params: { sessionKey: string }) => undefined);
+  const upsertPairingRequest = vi.fn(async () => null);
+  const recordInboundSession = vi.fn(async (_params: { sessionKey: string }) => undefined);
   const resolveAgentRoute =
     options.resolveAgentRoute ??
     vi.fn(({ peer }: { peer: { kind: string; id: string } }) => ({
       sessionKey: `agent:main:msteams:${peer.kind}:${peer.id}`,
       agentId: "main",
-      accountId: "default",
+      accountId,
       mainSessionKey: "agent:main:main",
       lastRoutePolicy: "session" as const,
       matchedBy: "default" as const,
     }));
-
   installMSTeamsTestRuntime({
     enqueueSystemEvent,
     readAllowFromStore,
     upsertPairingRequest,
     recordInboundSession,
     resolveAgentRoute,
+    hasControlCommand: options.hasControlCommand,
+    createInboundDebouncer: options.createInboundDebouncer,
+    resolveInboundDebounceMs: options.resolveInboundDebounceMs,
     resolveTextChunkLimit: () => 4000,
-    resolveStorePath: () => "/tmp/test-store",
+    resolveStorePath: options.resolveStorePath ?? (() => "/tmp/test-store"),
+    runPrepared: options.runPrepared,
   });
 
   const conversationStore = {
-    get: vi.fn(async () => null),
+    get: vi.fn<MSTeamsMessageHandlerDeps["conversationStore"]["get"]>(async () => null),
     upsert: vi.fn(async () => undefined),
     list: vi.fn(async () => []),
     remove: vi.fn(async () => false),
     findPreferredDmByUserId: vi.fn(async () => null),
-    findByUserId: vi.fn(async () => null),
   } satisfies MSTeamsMessageHandlerDeps["conversationStore"];
 
   const deps: MSTeamsMessageHandlerDeps = {
     cfg,
     runtime: { error: vi.fn() } as unknown as RuntimeEnv,
+    accountId,
     appId: "test-app",
-    adapter: {} as MSTeamsMessageHandlerDeps["adapter"],
+    app: {} as MSTeamsMessageHandlerDeps["app"],
     tokenProvider: {
       getAccessToken: vi.fn(async () => "token"),
     },

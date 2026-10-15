@@ -1,5 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Doctor legacy-state e2e tests cover yes-mode state migrations without interactive prompts.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import "../test-utils/prepare-compiled-subprocesses.js";
 import type { ProviderPlugin } from "../plugins/types.js";
+import { captureEnv } from "../test-utils/env.js";
 import {
   arrangeLegacyStateMigrationTest,
   confirm,
@@ -8,11 +11,12 @@ import {
   mockDoctorConfigSnapshot,
   serviceIsLoaded,
   serviceRestart,
-  writeConfigFile,
+  transformConfigFile,
 } from "./doctor.e2e-harness.js";
 
 const providerRuntimeMocks = vi.hoisted(() => ({
-  resolvePluginProviders: vi.fn((_params?: unknown): ProviderPlugin[] => []),
+  useMockProviders: false,
+  resolvePluginProvidersCore: vi.fn((_params?: unknown): ProviderPlugin[] => []),
 }));
 
 vi.mock("../plugins/providers.runtime.js", async () => {
@@ -21,48 +25,132 @@ vi.mock("../plugins/providers.runtime.js", async () => {
   );
   return {
     ...actual,
-    resolvePluginProviders: providerRuntimeMocks.resolvePluginProviders,
+    resolvePluginProvidersCore: (
+      params: Parameters<typeof actual.resolvePluginProvidersCore>[0],
+    ): ProviderPlugin[] =>
+      providerRuntimeMocks.useMockProviders
+        ? providerRuntimeMocks.resolvePluginProvidersCore(params)
+        : actual.resolvePluginProvidersCore(params),
   };
 });
 
 let doctorCommand: typeof import("./doctor.js").doctorCommand;
 let healthCommand: typeof import("./health.js").healthCommand;
+type MaintenancePhase = "loading" | "loaded" | "entered" | "settled" | "rejected";
+let observeMaintenance: ((phase: MaintenancePhase) => void) | undefined;
 
 describe("doctor command", () => {
   beforeEach(async () => {
+    observeMaintenance = undefined;
     vi.resetModules();
+    vi.doMock("./doctor-maintenance.js", async (importOriginal) => {
+      const loading = observeMaintenance;
+      loading?.("loading");
+      const actual = await importOriginal<typeof import("./doctor-maintenance.js")>();
+      loading?.("loaded");
+      return {
+        ...actual,
+        beginDoctorMaintenance: (params: Parameters<typeof actual.beginDoctorMaintenance>[0]) => {
+          const observe = observeMaintenance;
+          observe?.("entered");
+          const pending = actual.beginDoctorMaintenance(params);
+          if (observe) {
+            void pending.then(
+              () => observe("settled"),
+              () => observe("rejected"),
+            );
+          }
+          return pending;
+        },
+      };
+    });
     vi.doUnmock("../flows/doctor-health-contributions.js");
+    // Prepare the real owners and nested check descriptors as fixture code;
+    // detectors and repairs still run inside the unchanged command deadline.
+    await import("./doctor-maintenance.js");
+    const { resolveDoctorContributionHealthChecks } =
+      await import("../flows/doctor-health-contributions.js");
+    await resolveDoctorContributionHealthChecks();
     ({ doctorCommand } = await import("./doctor.js"));
     ({ healthCommand } = await import("./health.js"));
     vi.clearAllMocks();
-    providerRuntimeMocks.resolvePluginProviders.mockReturnValue([]);
+    providerRuntimeMocks.useMockProviders = false;
+    providerRuntimeMocks.resolvePluginProvidersCore.mockReturnValue([]);
   });
 
-  it("runs legacy state migrations in yes mode without prompting", async () => {
-    const { doctorCommand, runtime, runLegacyStateMigrations } =
-      await arrangeLegacyStateMigrationTest();
+  afterEach(() => {
+    observeMaintenance = undefined;
+    vi.doUnmock("./doctor-maintenance.js");
+  });
 
-    await (doctorCommand as (runtime: unknown, opts: Record<string, unknown>) => Promise<void>)(
-      runtime,
-      { yes: true },
-    );
+  it("runs legacy state migrations in yes mode without prompting", async ({ signal }) => {
+    const startedAt = performance.now();
+    const maintenance: { phase: MaintenancePhase; elapsedMs: number }[] = [];
+    let migrationCalls: (() => number) | undefined;
+    let doctorSettled = false;
+    observeMaintenance = (phase) => {
+      maintenance.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) });
+    };
+    const reportInterruption = () => {
+      console.error("Doctor yes-mode interrupted before test settlement", {
+        maintenance,
+        legacyMigrationCalls: migrationCalls?.(),
+        doctorSettled,
+      });
+    };
+    signal.addEventListener("abort", reportInterruption, { once: true });
+    try {
+      const {
+        doctorCommand: doctorCommandValue,
+        runtime,
+        runLegacyStateMigrations,
+      } = await arrangeLegacyStateMigrationTest();
+      migrationCalls = () => runLegacyStateMigrations.mock.calls.length;
+      try {
+        await (
+          doctorCommandValue as (runtime: unknown, opts: Record<string, unknown>) => Promise<void>
+        )(runtime, { yes: true });
+      } finally {
+        doctorSettled = true;
+      }
 
-    expect(runLegacyStateMigrations).toHaveBeenCalledTimes(1);
-    expect(confirm).not.toHaveBeenCalled();
+      expect(runLegacyStateMigrations).toHaveBeenCalledTimes(1);
+      expect(confirm).not.toHaveBeenCalled();
+    } finally {
+      signal.removeEventListener("abort", reportInterruption);
+      observeMaintenance = undefined;
+    }
   }, 30_000);
 
-  it("runs legacy state migrations in non-interactive mode without prompting", async () => {
-    const { doctorCommand, runtime, runLegacyStateMigrations } =
-      await arrangeLegacyStateMigrationTest();
+  it("refuses doctor repair mode in Nix before repair side effects", async () => {
+    const savedEnv = captureEnv(["OPENCLAW_NIX_MODE"]);
+    process.env.OPENCLAW_NIX_MODE = "1";
+    try {
+      mockDoctorConfigSnapshot();
+      await expect(doctorCommand(createDoctorRuntime(), { repair: true })).rejects.toThrow(
+        "OPENCLAW_NIX_MODE=1",
+      );
+    } finally {
+      savedEnv.restore();
+    }
 
-    await (doctorCommand as (runtime: unknown, opts: Record<string, unknown>) => Promise<void>)(
-      runtime,
-      { nonInteractive: true },
-    );
+    expect(transformConfigFile).not.toHaveBeenCalled();
+  });
 
-    expect(runLegacyStateMigrations).toHaveBeenCalledTimes(1);
-    expect(confirm).not.toHaveBeenCalled();
-  }, 30_000);
+  it("refuses doctor gateway token generation in Nix before config writes", async () => {
+    const savedEnv = captureEnv(["OPENCLAW_NIX_MODE"]);
+    process.env.OPENCLAW_NIX_MODE = "1";
+    try {
+      mockDoctorConfigSnapshot();
+      await expect(
+        doctorCommand(createDoctorRuntime(), { generateGatewayToken: true }),
+      ).rejects.toThrow("OPENCLAW_NIX_MODE=1");
+    } finally {
+      savedEnv.restore();
+    }
+
+    expect(transformConfigFile).not.toHaveBeenCalled();
+  });
 
   it("skips gateway restarts in non-interactive mode", async () => {
     mockDoctorConfigSnapshot();
@@ -90,7 +178,7 @@ describe("doctor command", () => {
       },
     });
 
-    ensureAuthProfileStore.mockReturnValueOnce({
+    ensureAuthProfileStore.mockReturnValue({
       version: 1,
       profiles: {
         "anthropic:me@example.com": {
@@ -103,7 +191,8 @@ describe("doctor command", () => {
         },
       },
     });
-    providerRuntimeMocks.resolvePluginProviders.mockReturnValue([
+    providerRuntimeMocks.useMockProviders = true;
+    providerRuntimeMocks.resolvePluginProvidersCore.mockReturnValue([
       {
         id: "anthropic",
         label: "Anthropic",
@@ -112,31 +201,24 @@ describe("doctor command", () => {
       },
     ]);
 
-    const previousConfigWriteSupport =
-      process.env.OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE;
+    const savedEnv = captureEnv(["OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE"]);
     process.env.OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE = "1";
     try {
       await doctorCommand(createDoctorRuntime(), { yes: true });
     } finally {
-      if (previousConfigWriteSupport === undefined) {
-        delete process.env.OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE;
-      } else {
-        process.env.OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE =
-          previousConfigWriteSupport;
-      }
+      savedEnv.restore();
     }
 
-    const written = writeConfigFile.mock.calls
-      .map((call) => call[0] as Record<string, unknown>)
-      .find((candidate) => {
-        const auth = candidate.auth as { profiles?: unknown } | undefined;
-        return Boolean(auth?.profiles);
-      });
-    if (!written) {
-      throw new Error("Expected doctor to write migrated auth profiles");
-    }
-    const profiles = (written.auth as { profiles: Record<string, unknown> }).profiles;
-    expect(profiles["anthropic:me@example.com"]).toBeTruthy();
-    expect(profiles["anthropic:default"]).toBeUndefined();
+    const committed = await Promise.all(
+      transformConfigFile.mock.results.flatMap((result) =>
+        result.type === "return" ? [result.value] : [],
+      ),
+    );
+    const profiles = committed.findLast((result) => result.nextConfig.auth?.profiles)?.nextConfig
+      .auth?.profiles;
+    expect(profiles).toMatchObject({
+      "anthropic:me@example.com": { provider: "anthropic", mode: "oauth" },
+    });
+    expect(profiles).not.toHaveProperty("anthropic:default");
   }, 30_000);
 });

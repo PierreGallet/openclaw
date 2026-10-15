@@ -2,34 +2,76 @@
 // capability SDKs do not depend on each other.
 
 export {
+  inspectTlsCertificateError,
+  type TlsCertificateErrorDetails,
+  type TlsCertificateErrorKind,
+} from "@openclaw/ai/internal/shared";
+export {
   assertOkOrThrowHttpError,
   assertOkOrThrowProviderError,
+  assertProviderBinaryResponseContent,
+  createProviderCredentialMatcher,
   createProviderHttpError,
+  ProviderHttpError,
   extractProviderErrorDetail,
   extractProviderRequestId,
   formatProviderErrorPayload,
   formatProviderHttpErrorMessage,
+  readProviderBinaryResponse,
+  readProviderJsonArrayFieldResponse,
+  readProviderJsonObjectResponse,
+  readProviderJsonResponse,
+  readProviderTextResponse,
   readResponseTextLimited,
   truncateErrorDetail,
 } from "../agents/provider-http-errors.js";
 export {
+  readProviderResponseErrorText,
+  redactProviderResponseErrorText,
+} from "../agents/provider-request-header-redaction.js";
+export {
   buildAudioTranscriptionFormData,
   createProviderOperationDeadline,
+  createProviderOperationTimeoutError,
+  createProviderOperationTimeoutResolver,
+  fetchProviderDownloadResponse,
+  fetchProviderOperationResponse,
   fetchWithTimeout,
   fetchWithTimeoutGuarded,
   normalizeBaseUrl,
+  pollProviderOperation,
   pollProviderOperationJson,
   postJsonRequest,
   postMultipartRequest,
   postTranscriptionRequest,
   resolveProviderOperationTimeoutMs,
   resolveProviderHttpRequestConfig,
+  resolveProviderHttpRequestConfigWithOriginTrust,
   resolveAudioTranscriptionUploadFileName,
   requireTranscriptionText,
   sanitizeConfiguredModelProviderRequest,
   waitProviderOperationPollInterval,
 } from "../media-understanding/shared.js";
-export type { ProviderOperationDeadline } from "../media-understanding/shared.js";
+export { openProviderWebSocket } from "../infra/net/provider-websocket.js";
+export {
+  runHttpTlsPreflight,
+  type HttpTlsPreflightOptions,
+  type HttpTlsPreflightResult,
+} from "../infra/http-tls-preflight.js";
+export type {
+  ProviderOperationDeadline,
+  ProviderOperationTimeoutMs,
+} from "../media-understanding/shared.js";
+export {
+  executeProviderOperationWithRetry,
+  providerOperationRetryConfig,
+} from "../provider-runtime/operation-retry.js";
+export type {
+  ProviderOperationRetryStage,
+  TransientProviderRetryConfig,
+  TransientProviderRetryOptions,
+  TransientProviderRetryParams,
+} from "../provider-runtime/operation-retry.js";
 export type {
   ProviderAttributionPolicy,
   ProviderRequestCapabilities,
@@ -47,8 +89,9 @@ export type {
   ProviderRequestProxyOverride,
   ProviderRequestTlsOverride,
   ProviderRequestTransportOverrides,
-} from "../agents/provider-request-config.js";
+} from "../agents/provider-request-config.types.js";
 export { resolveProviderRequestHeaders } from "../agents/provider-request-config.js";
+export { resolveProviderTransportSsrFPolicy } from "../agents/provider-network-policy.js";
 export {
   resolveProviderEndpoint,
   resolveProviderRequestCapabilities,

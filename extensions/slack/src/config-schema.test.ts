@@ -1,3 +1,4 @@
+// Slack tests cover config schema plugin behavior.
 import { describe, expect, it } from "vitest";
 import { SlackConfigSchema } from "../config-api.js";
 
@@ -10,7 +11,7 @@ function expectSlackConfigIssue(config: unknown, path: string) {
   const res = SlackConfigSchema.safeParse(config);
   expect(res.success).toBe(false);
   if (!res.success) {
-    expect(res.error.issues.some((issue) => issue.path.join(".").includes(path))).toBe(true);
+    expect(res.error.issues.map((issue) => issue.path.join("."))).toContain(path);
   }
 }
 
@@ -24,17 +25,25 @@ describe("slack config schema", () => {
     }
   });
 
-  it("accepts historyLimit overrides per account", () => {
-    const res = SlackConfigSchema.safeParse({
-      historyLimit: 7,
-      accounts: { ops: { historyLimit: 2 } },
+  it("accepts inherited and relay companion-app transports for user postAs", () => {
+    expectSlackConfigValid({
+      postAs: "user",
+      userToken: "test-user-token",
+      appToken: "test-app-token",
+      accounts: {
+        work: {},
+      },
     });
-
-    expect(res.success).toBe(true);
-    if (res.success) {
-      expect(res.data.historyLimit).toBe(7);
-      expect(res.data.accounts?.ops?.historyLimit).toBe(2);
-    }
+    expectSlackConfigValid({
+      postAs: "user",
+      mode: "relay",
+      userToken: "test-user-token",
+      relay: {
+        url: "test-relay-url",
+        authToken: "test-relay-auth-token",
+        gatewayId: "test-gateway-id",
+      },
+    });
   });
 
   it('rejects dmPolicy="open" without allowFrom "*"', () => {
@@ -47,98 +56,30 @@ describe("slack config schema", () => {
     );
   });
 
-  it('accepts legacy dm.policy="open" with top-level allowFrom alias', () => {
-    expectSlackConfigValid({
-      dm: { policy: "open", allowFrom: ["U123"] },
-      allowFrom: ["*"],
-    });
-  });
-
-  it("accepts user token config fields", () => {
-    expectSlackConfigValid({
-      botToken: "xoxb-any",
-      appToken: "xapp-any",
-      userToken: "xoxp-any",
-      userTokenReadOnly: false,
-    });
-  });
-
-  it("accepts Socket Mode ping/pong transport tuning", () => {
-    expectSlackConfigValid({
-      mode: "socket",
-      socketMode: {
-        clientPingTimeout: 15_000,
-        serverPingTimeout: 45_000,
-        pingPongLoggingEnabled: true,
-      },
-      accounts: {
-        ops: {
-          socketMode: {
-            clientPingTimeout: 20_000,
-          },
-        },
-      },
-    });
-  });
-
-  it("rejects invalid Socket Mode ping/pong transport tuning", () => {
+  it("requires every relay connection field", () => {
+    expectSlackConfigIssue({ mode: "relay" }, "relay.url");
+    expectSlackConfigIssue(
+      { mode: "relay", relay: { url: "wss://router.example.com/gateway/ws" } },
+      "relay.authToken",
+    );
     expectSlackConfigIssue(
       {
-        socketMode: {
-          clientPingTimeout: 0,
+        mode: "relay",
+        relay: {
+          url: "wss://router.example.com/gateway/ws",
+          authToken: "test-relay-auth-token",
         },
       },
-      "socketMode.clientPingTimeout",
+      "relay.gatewayId",
     );
   });
 
-  it("accepts account-level user token config", () => {
+  it("does not require relay transport credentials when Slack is disabled", () => {
+    expectSlackConfigValid({ enabled: false, mode: "relay" });
     expectSlackConfigValid({
-      accounts: {
-        work: {
-          botToken: "xoxb-any",
-          appToken: "xapp-any",
-          userToken: "xoxp-any",
-          userTokenReadOnly: true,
-        },
-      },
-    });
-  });
-
-  it("rejects invalid userTokenReadOnly types", () => {
-    expectSlackConfigIssue(
-      {
-        botToken: "xoxb-any",
-        appToken: "xapp-any",
-        userToken: "xoxp-any",
-        userTokenReadOnly: "no",
-      },
-      "userTokenReadOnly",
-    );
-  });
-
-  it("rejects invalid userToken types", () => {
-    expectSlackConfigIssue(
-      {
-        botToken: "xoxb-any",
-        appToken: "xapp-any",
-        userToken: 123,
-      },
-      "userToken",
-    );
-  });
-
-  it("accepts HTTP mode when signing secret is configured", () => {
-    expectSlackConfigValid({
-      mode: "http",
-      signingSecret: "secret",
-    });
-  });
-
-  it("accepts HTTP mode when signing secret is configured as SecretRef", () => {
-    expectSlackConfigValid({
-      mode: "http",
-      signingSecret: { source: "env", provider: "default", id: "SLACK_SIGNING_SECRET" },
+      enabled: false,
+      mode: "relay",
+      accounts: { ops: { mode: "relay" } },
     });
   });
 
@@ -146,42 +87,34 @@ describe("slack config schema", () => {
     expectSlackConfigIssue({ mode: "http" }, "signingSecret");
   });
 
-  it("accepts account HTTP mode when base signing secret is set", () => {
+  it("skips disabled accounts inheriting HTTP mode", () => {
     expectSlackConfigValid({
-      signingSecret: "secret",
+      mode: "http",
       accounts: {
+        disabled: { enabled: false },
         ops: {
-          mode: "http",
+          botToken: "test-bot-token",
+          signingSecret: "test-ops-signing-secret",
         },
       },
     });
-  });
-
-  it("accepts account HTTP mode when account signing secret is set as SecretRef", () => {
     expectSlackConfigValid({
-      accounts: {
-        ops: {
-          mode: "http",
-          signingSecret: {
-            source: "env",
-            provider: "default",
-            id: "SLACK_OPS_SIGNING_SECRET",
-          },
-        },
-      },
+      mode: "http",
+      accounts: { ops: { enabled: false } },
     });
   });
 
-  it("rejects account HTTP mode without signing secret", () => {
-    expectSlackConfigIssue(
-      {
-        accounts: {
-          ops: {
-            mode: "http",
-          },
-        },
-      },
-      "accounts.ops.signingSecret",
-    );
+  it("reports a missing inherited HTTP signing secret on its account only", () => {
+    const result = SlackConfigSchema.safeParse({
+      mode: "http",
+      accounts: { ops: { botToken: "test-bot-token" } },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((issue) => issue.path.join("."))).toEqual([
+        "accounts.ops.signingSecret",
+      ]);
+    }
   });
 });

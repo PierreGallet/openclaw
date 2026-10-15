@@ -1,131 +1,80 @@
-import { formatCliCommand } from "../cli/command-format.js";
-import {
-  type ReadConfigFileSnapshotWithPluginMetadataResult,
-  readConfigFileSnapshotWithPluginMetadata,
-} from "../config/io.js";
-import { formatConfigIssueLines } from "../config/issue-format.js";
-import { isNixMode } from "../config/paths.js";
-import { applyPluginAutoEnable } from "../config/plugin-auto-enable.js";
-import { applyConfigOverrides } from "../config/runtime-overrides.js";
-import type { GatewayAuthConfig, GatewayTailscaleConfig } from "../config/types.gateway.js";
-import type { ConfigFileSnapshot, OpenClawConfig } from "../config/types.openclaw.js";
-import { isTruthyEnvValue } from "../infra/env.js";
+// Gateway startup config loads, repairs, validates, and activates runtime config
+// plus secrets snapshots before the server exposes user-facing surfaces.
+import { hasLegacyAuthProfileSourcesForStartup } from "../agents/auth-profiles/legacy-source-diagnostic.js";
+import { prepareSharedAuthStoreOwnership } from "../agents/auth-profiles/path-resolve.js";
+import { getRuntimeAuthProfileStoreSnapshotsRevision } from "../agents/auth-profiles/runtime-snapshots.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { measureDiagnosticsTimelineSpan } from "../infra/diagnostics-timeline.js";
+import type { PluginManifestRegistry } from "../plugins/manifest-registry.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import {
-  GATEWAY_AUTH_SURFACE_PATHS,
-  evaluateGatewayAuthSurfaceStates,
-} from "../secrets/runtime-gateway-auth-surfaces.js";
-import { resolveGatewayAuth } from "./auth.js";
-import { assertGatewayAuthNotKnownWeak } from "./known-weak-gateway-secrets.js";
+  describeSecretResolutionOperatorDiagnostic,
+  describeSecretResolutionOperatorRecovery,
+  isSecretResolutionError,
+} from "../secrets/resolve-errors.js";
 import {
-  ensureGatewayStartupAuth,
-  mergeGatewayAuthConfig,
-  mergeGatewayTailscaleConfig,
-} from "./startup-auth.js";
-
-type GatewayStartupLog = {
-  info: (message: string) => void;
-  warn: (message: string) => void;
-  error?: (message: string) => void;
-};
+  classifySecretResolutionErrorDegradations,
+  isRetryableSecretDegradationReason,
+  listSecretResolutionErrorOwners,
+} from "../secrets/runtime-degraded-state.js";
+import {
+  collectCandidateAgentDirs,
+  prepareSecretsRuntimeFastPathSnapshot,
+} from "../secrets/runtime-fast-path.js";
+import {
+  listProviderAuthDegradedOwners,
+  preparedDegradationSupportsSourceOnlyRecovery,
+  resolvePreparedSecretsStateScope,
+  type SecretsStateScope,
+} from "../secrets/runtime-provider-auth-scope.js";
+import { hasSameSecretReloadContract } from "../secrets/runtime-source-contract.js";
+import {
+  activateSecretsRuntimeSnapshotState,
+  clearSecretsRuntimeSnapshotState,
+  graftActiveSecretsRuntimeAuthState,
+  getActiveSecretsRuntimeSnapshotState,
+  getActiveSecretsRuntimeSnapshotRevisionState,
+  hasActiveSecretsRuntimeSnapshotLineage,
+  hasCurrentAuthStoreCredentialsRevision,
+  registerProviderAuthRuntimeSnapshotActivationOwner,
+} from "../secrets/runtime-state.js";
+import { logRuntimeSecretWarnings } from "../secrets/runtime-warning-log.js";
+import {
+  assertRuntimeGatewayAuthNotKnownWeak,
+  hasActiveGatewayAuthSecretRef,
+  logGatewayAuthSurfaceDiagnostics,
+  type GatewayStartupLog,
+} from "./server-startup-config-helpers.js";
+import type {
+  ActivateRuntimeSecrets,
+  RuntimeSecretsActivationParams,
+} from "./server-startup-config.types.js";
+import {
+  logPreparedSecretDegradations,
+  logThrownSecretDegradations,
+} from "./server-startup-secret-diagnostics.js";
+import { resolveGatewayStartupSourceConfig } from "./server-startup-secret-surfaces.js";
+export {
+  applyGatewayAuthOverridesForStartupPreflight,
+  loadGatewayStartupConfigSnapshot,
+  type GatewayStartupConfigSnapshotLoadResult,
+} from "./server-startup-config-helpers.js";
 
 type GatewaySecretsStateEventCode = "SECRETS_RELOADER_DEGRADED" | "SECRETS_RELOADER_RECOVERED";
-
-export type ActivateRuntimeSecrets = (
-  config: OpenClawConfig,
-  params: { reason: "startup" | "reload" | "restart-check"; activate: boolean },
-) => Promise<
-  Awaited<ReturnType<typeof import("../secrets/runtime.js").prepareSecretsRuntimeSnapshot>>
->;
 
 type PrepareRuntimeSecretsSnapshot =
   typeof import("../secrets/runtime.js").prepareSecretsRuntimeSnapshot;
 type ActivateRuntimeSecretsSnapshot =
   typeof import("../secrets/runtime.js").activateSecretsRuntimeSnapshot;
+type PreparedRuntimeSecretsSnapshot = Awaited<ReturnType<PrepareRuntimeSecretsSnapshot>>;
 
-type GatewayStartupConfigOverrides = {
-  auth?: GatewayAuthConfig;
-  tailscale?: GatewayTailscaleConfig;
-};
+type DeferredSecretsStateTransition = {
+  activationRevision: number;
+  reason: RuntimeSecretsActivationParams["reason"];
+  activationScope: SecretsStateScope;
+} & ({ kind: "degraded" } | { kind: "recovered"; degradationGeneration: number });
 
-type GatewayStartupConfigMeasure = <T>(name: string, run: () => T | Promise<T>) => Promise<T>;
-
-export type GatewayStartupConfigSnapshotLoadResult = {
-  snapshot: ConfigFileSnapshot;
-  wroteConfig: boolean;
-  pluginMetadataSnapshot?: PluginMetadataSnapshot;
-};
-
-export async function loadGatewayStartupConfigSnapshot(params: {
-  minimalTestGateway: boolean;
-  log: GatewayStartupLog;
-  measure?: GatewayStartupConfigMeasure;
-  initialSnapshotRead?: ReadConfigFileSnapshotWithPluginMetadataResult;
-}): Promise<GatewayStartupConfigSnapshotLoadResult> {
-  const measure = params.measure ?? (async (_name, run) => await run());
-  let snapshotRead =
-    params.initialSnapshotRead ??
-    (await measure("config.snapshot.read", () =>
-      readConfigFileSnapshotWithPluginMetadata({ measure }),
-    ));
-  let configSnapshot = snapshotRead.snapshot;
-  let pluginMetadataSnapshot = snapshotRead.pluginMetadataSnapshot;
-  let wroteConfig = false;
-  if (configSnapshot.legacyIssues.length > 0 && isNixMode) {
-    throw new Error(
-      "Legacy config entries detected while running in Nix mode. Update your Nix config to the latest schema and restart.",
-    );
-  }
-  if (configSnapshot.exists) {
-    assertValidGatewayStartupConfigSnapshot(configSnapshot, { includeDoctorHint: true });
-  }
-
-  const autoEnable = params.minimalTestGateway
-    ? { config: configSnapshot.config, changes: [] as string[] }
-    : await measure("config.snapshot.auto-enable", () =>
-        applyPluginAutoEnable({
-          config: configSnapshot.sourceConfig,
-          env: process.env,
-          ...(pluginMetadataSnapshot?.manifestRegistry
-            ? { manifestRegistry: pluginMetadataSnapshot.manifestRegistry }
-            : {}),
-        }),
-      );
-  if (autoEnable.changes.length === 0) {
-    return {
-      snapshot: configSnapshot,
-      wroteConfig,
-      ...(pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {}),
-    };
-  }
-
-  try {
-    const { replaceConfigFile } = await import("../config/mutate.js");
-    await replaceConfigFile({
-      nextConfig: autoEnable.config,
-      afterWrite: { mode: "auto" },
-    });
-    wroteConfig = true;
-    snapshotRead = await measure("config.snapshot.auto-enable-read", () =>
-      readConfigFileSnapshotWithPluginMetadata({ measure }),
-    );
-    configSnapshot = snapshotRead.snapshot;
-    pluginMetadataSnapshot = snapshotRead.pluginMetadataSnapshot;
-    assertValidGatewayStartupConfigSnapshot(configSnapshot);
-    params.log.info(
-      `gateway: auto-enabled plugins:\n${autoEnable.changes.map((entry) => `- ${entry}`).join("\n")}`,
-    );
-  } catch (err) {
-    params.log.warn(`gateway: failed to persist plugin auto-enable changes: ${String(err)}`);
-  }
-
-  return {
-    snapshot: configSnapshot,
-    wroteConfig,
-    ...(pluginMetadataSnapshot ? { pluginMetadataSnapshot } : {}),
-  };
-}
-
+/** Create the serialized secrets activation function used by startup and reload paths. */
 export function createRuntimeSecretsActivator(params: {
   logSecrets: GatewayStartupLog;
   emitStateEvent: (
@@ -135,21 +84,28 @@ export function createRuntimeSecretsActivator(params: {
   ) => void;
   prepareRuntimeSecretsSnapshot?: PrepareRuntimeSecretsSnapshot;
   activateRuntimeSecretsSnapshot?: ActivateRuntimeSecretsSnapshot;
+  /** Commit owner-held durable policy before publication; also reconcile the survivor on failure. */
+  beforeSnapshotPublication?: (config: OpenClawConfig | null) => Promise<void>;
+  manifestRegistry?: Pick<PluginManifestRegistry, "plugins">;
+  pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "plugins" | "manifestRegistry">;
 }): ActivateRuntimeSecrets {
-  let secretsDegraded = false;
+  let degradationGeneration = 0;
+  let degradation:
+    | {
+        generation: number;
+        config: OpenClawConfig;
+        supportsSourceOnlyRecovery: boolean;
+        scope: SecretsStateScope;
+      }
+    | undefined;
+  const deferredStateTransitions = new WeakMap<object, DeferredSecretsStateTransition>();
+  let pendingDeferredLineageRevision: number | null = null;
   let secretsActivationTail: Promise<void> = Promise.resolve();
-  let secretsRuntimePromise: Promise<typeof import("../secrets/runtime.js")> | null = null;
-  let authProfilesPromise: Promise<typeof import("../agents/auth-profiles.js")> | null = null;
-  const loadSecretsRuntime = () => {
-    secretsRuntimePromise ??= import("../secrets/runtime.js");
-    return secretsRuntimePromise;
-  };
-  const loadAuthProfiles = () => {
-    authProfilesPromise ??= import("../agents/auth-profiles.js");
-    return authProfilesPromise;
-  };
-
+  const startupManifestRegistry =
+    params.manifestRegistry ?? params.pluginMetadataSnapshot?.manifestRegistry;
   const runWithSecretsActivationLock = async <T>(operation: () => Promise<T>): Promise<T> => {
+    // Secret refresh mutates process-wide active snapshot state, so activation
+    // requests are serialized even when reload and startup probes overlap.
     const run = secretsActivationTail.then(operation, operation);
     secretsActivationTail = run.then(
       () => undefined,
@@ -158,225 +114,528 @@ export function createRuntimeSecretsActivator(params: {
     return await run;
   };
 
-  return async (config, activationParams) =>
+  const loadActivateRuntimeSecretsSnapshot = async (source?: OpenClawConfig) => {
+    if (source) {
+      const runtime = await import("../secrets/runtime.js");
+      return (snapshot: PreparedRuntimeSecretsSnapshot) =>
+        runtime.activateSecretsRuntimeSnapshotWithSource(snapshot, source);
+    }
+    if (params.activateRuntimeSecretsSnapshot) {
+      return params.activateRuntimeSecretsSnapshot;
+    }
+    return (await import("../secrets/runtime.js")).activateSecretsRuntimeSnapshot;
+  };
+
+  const supersededActivation = new Error("Secrets runtime publication was superseded.");
+  const publishSnapshot = async (
+    config: OpenClawConfig | null,
+    isCurrent: () => boolean,
+    publish: () => void,
+    checkpoint?: () => Promise<void>,
+  ): Promise<boolean> => {
+    await checkpoint?.();
+    if (!isCurrent()) {
+      return false;
+    }
+    let published = false;
+    try {
+      await params.beforeSnapshotPublication?.(config);
+      // Reconcile a delayed filesystem echo before the final synchronous publication checks.
+      await checkpoint?.();
+      if (!isCurrent()) {
+        return false;
+      }
+      publish();
+      published = true;
+      return true;
+    } finally {
+      if (!published) {
+        await params.beforeSnapshotPublication?.(
+          getActiveSecretsRuntimeSnapshotState()?.config ?? null,
+        );
+      }
+    }
+  };
+
+  const restoreSnapshot = async (
+    isOwned: () => boolean,
+    ...[snapshot, expectedRevision, ownedSnapshot, options]: Parameters<
+      ActivateRuntimeSecrets["restoreSnapshotIfCurrent"]
+    >
+  ) => {
+    const restoration = snapshot
+      ? (await import("../secrets/runtime.js")).prepareSecretsRuntimeSnapshotRestore(
+          snapshot,
+          expectedRevision,
+          ownedSnapshot,
+          options,
+        )
+      : null;
+    if (snapshot && !restoration) {
+      return false;
+    }
+    return await publishSnapshot(
+      restoration?.snapshot.config ?? null,
+      () =>
+        isOwned() &&
+        getActiveSecretsRuntimeSnapshotRevisionState() ===
+          (restoration?.expectedRevision ?? expectedRevision) &&
+        (!restoration ||
+          (hasCurrentAuthStoreCredentialsRevision(restoration.snapshot) &&
+            getRuntimeAuthProfileStoreSnapshotsRevision() ===
+              restoration.snapshot.authStoreSnapshotsRevision)),
+      () => {
+        if (restoration) {
+          activateSecretsRuntimeSnapshotState(restoration);
+        } else {
+          clearSecretsRuntimeSnapshotState();
+        }
+        options?.onActivated?.();
+      },
+    );
+  };
+
+  const publishRecovery = (
+    config: OpenClawConfig,
+    expectedGeneration?: number,
+    scope: SecretsStateScope = "full",
+  ) => {
+    if (
+      !degradation ||
+      (expectedGeneration !== undefined && degradation.generation !== expectedGeneration) ||
+      (scope === "provider-auth" && degradation.scope !== "provider-auth")
+    ) {
+      return;
+    }
+    const recoveredMessage = "Secret resolution recovered.";
+    params.logSecrets.info(`[SECRETS_RELOADER_RECOVERED] ${recoveredMessage}`);
+    params.emitStateEvent("SECRETS_RELOADER_RECOVERED", recoveredMessage, config);
+    degradation = undefined;
+  };
+
+  const recordDegradation = (
+    config: OpenClawConfig,
+    supportsSourceOnlyRecovery: boolean,
+    scope: SecretsStateScope,
+  ) => {
+    degradation = {
+      generation: ++degradationGeneration,
+      config: structuredClone(config),
+      supportsSourceOnlyRecovery:
+        (degradation?.supportsSourceOnlyRecovery ?? true) && supportsSourceOnlyRecovery,
+      scope,
+    };
+  };
+
+  const publishDegradation = (
+    prepared: PreparedRuntimeSecretsSnapshot,
+    reason: RuntimeSecretsActivationParams["reason"],
+    scope: SecretsStateScope = "full",
+    activationScope: SecretsStateScope = "full",
+  ) => {
+    logPreparedSecretDegradations(params.logSecrets, prepared.degradedOwners ?? []);
+    if (reason === "startup") {
+      return;
+    }
+    // A provider-auth-only refresh cannot erase unrelated full-reload degradation.
+    // A committed full reload may narrow full state to its remaining provider owners.
+    if (activationScope === "provider-auth" && degradation?.scope === "full") {
+      return;
+    }
+    if (!degradation) {
+      params.emitStateEvent(
+        "SECRETS_RELOADER_DEGRADED",
+        "Secret resolution degraded one or more owners; healthy owners were refreshed.",
+        prepared.config,
+      );
+    }
+    recordDegradation(
+      prepared.sourceConfig,
+      preparedDegradationSupportsSourceOnlyRecovery(prepared),
+      scope,
+    );
+  };
+
+  const finishPreparedSnapshot = async (
+    prepared: PreparedRuntimeSecretsSnapshot,
+    activationParams: RuntimeSecretsActivationParams,
+    options?: {
+      activateRuntimeSecretsSnapshot?: (snapshot: PreparedRuntimeSecretsSnapshot) => void;
+      onActivated?: () => void;
+      canActivate?: () => boolean;
+      checkpoint?: () => Promise<void>;
+      alreadyActivated?: boolean;
+      stateScope?: SecretsStateScope;
+      stateDegradedOwners?: PreparedRuntimeSecretsSnapshot["degradedOwners"];
+    },
+  ) => {
+    assertRuntimeGatewayAuthNotKnownWeak(prepared.config);
+    if (activationParams.activate && !options?.alreadyActivated) {
+      const activateRuntimeSecretsSnapshot =
+        options?.activateRuntimeSecretsSnapshot ??
+        (await loadActivateRuntimeSecretsSnapshot(activationParams.runtimeSourceConfig));
+      const revision = getActiveSecretsRuntimeSnapshotRevisionState();
+      if (
+        !(await publishSnapshot(
+          prepared.config,
+          () =>
+            getActiveSecretsRuntimeSnapshotRevisionState() === revision &&
+            hasCurrentAuthStoreCredentialsRevision(prepared) &&
+            (options?.canActivate?.() ?? true),
+          () => {
+            activateRuntimeSecretsSnapshot(prepared);
+            options?.onActivated?.();
+          },
+          options?.checkpoint,
+        ))
+      ) {
+        throw supersededActivation;
+      }
+    }
+    if (activationParams.activate) {
+      logGatewayAuthSurfaceDiagnostics(prepared, params.logSecrets);
+    }
+    logRuntimeSecretWarnings({
+      snapshot: prepared,
+      log: params.logSecrets,
+      ownerUnavailable:
+        activationParams.activate && activationParams.deferStatePublication !== true
+          ? "include"
+          : "exclude",
+    });
+    const statePrepared = options?.stateDegradedOwners
+      ? { ...prepared, degradedOwners: options.stateDegradedOwners }
+      : prepared;
+    const stateScope = options?.stateScope ?? resolvePreparedSecretsStateScope(statePrepared);
+    const activationScope = options?.stateScope ?? "full";
+    if (activationParams.activate) {
+      const transition =
+        (statePrepared.degradedOwners?.length ?? 0) > 0
+          ? { kind: "degraded" as const }
+          : degradation
+            ? { kind: "recovered" as const, degradationGeneration: degradation.generation }
+            : undefined;
+      if (transition && activationParams.deferStatePublication === true) {
+        const activationRevision = getActiveSecretsRuntimeSnapshotRevisionState();
+        deferredStateTransitions.set(prepared, {
+          ...transition,
+          activationRevision,
+          reason: activationParams.reason,
+          activationScope,
+        });
+        pendingDeferredLineageRevision = activationRevision;
+      } else if (transition?.kind === "degraded") {
+        publishDegradation(statePrepared, activationParams.reason, stateScope, activationScope);
+      } else if (transition) {
+        publishRecovery(prepared.config, undefined, stateScope);
+      }
+    }
+    return prepared;
+  };
+
+  const handleSecretsActivationError = (
+    err: unknown,
+    activationParams: RuntimeSecretsActivationParams,
+    eventConfig: OpenClawConfig,
+  ): never => {
+    const mayPublishReloadDegradation =
+      (activationParams.activate || activationParams.publishFailureAsDegraded === true) &&
+      (activationParams.canPublishFailureAsDegraded?.() ?? true);
+    const degradations = classifySecretResolutionErrorDegradations(err);
+    const retryableDegradations = degradations.filter((entry) =>
+      isRetryableSecretDegradationReason(entry.reason),
+    );
+    if (
+      retryableDegradations.length > 0 &&
+      (activationParams.reason === "startup" || mayPublishReloadDegradation)
+    ) {
+      logThrownSecretDegradations(params.logSecrets, err, retryableDegradations);
+      if (activationParams.reason !== "startup") {
+        if (!degradation) {
+          params.emitStateEvent(
+            "SECRETS_RELOADER_DEGRADED",
+            "Secret resolution failed; runtime remains on the last-known-good snapshot.",
+            eventConfig,
+          );
+        }
+        const failedOwners = listSecretResolutionErrorOwners(err).filter(
+          (owner) => owner.failureMatched,
+        );
+        const currentFailureSupportsSourceOnlyRecovery =
+          failedOwners.length > 0 &&
+          failedOwners.every(
+            (owner) => owner.source === "config" && owner.degradationState === "cold",
+          );
+        recordDegradation(eventConfig, currentFailureSupportsSourceOnlyRecovery, "full");
+      }
+    }
+    if (activationParams.reason === "startup") {
+      if (isSecretResolutionError(err) && err.code === "SECRET_REF_REDACTED_VALUE") {
+        throw new Error(
+          `Startup failed: ${describeSecretResolutionOperatorDiagnostic(err)}. ${describeSecretResolutionOperatorRecovery(err)}.`,
+          { cause: err },
+        );
+      }
+      if (degradations.length > 0) {
+        throw new Error("Startup failed: required secrets are unavailable.");
+      }
+      throw new Error(`Startup failed: required secrets are unavailable. ${String(err)}`, {
+        cause: err,
+      });
+    }
+    throw err;
+  };
+
+  const prepareRuntimeSecrets = async (
+    config: OpenClawConfig,
+    activationParams: RuntimeSecretsActivationParams,
+  ) =>
     await runWithSecretsActivationLock(async () => {
+      let activationSourceConfig = config;
       try {
+        const sourceConfig = resolveGatewayStartupSourceConfig(
+          config,
+          activationParams.env ?? process.env,
+        );
+        activationSourceConfig = sourceConfig;
+        await prepareSharedAuthStoreOwnership(activationParams.env);
+        const startupPreflight =
+          activationParams.reason === "startup" || activationParams.reason === "restart-check";
+        if (
+          activationParams.reason === "startup" &&
+          activationParams.activate &&
+          !params.prepareRuntimeSecretsSnapshot &&
+          !params.activateRuntimeSecretsSnapshot
+        ) {
+          const startupEnv = activationParams.env ?? process.env;
+          const fastPath = hasLegacyAuthProfileSourcesForStartup({
+            agentDirs: collectCandidateAgentDirs(sourceConfig, startupEnv),
+            env: startupEnv,
+          })
+            ? null
+            : prepareSecretsRuntimeFastPathSnapshot({
+                config: sourceConfig,
+                env: startupEnv,
+                ...(startupManifestRegistry ? { manifestRegistry: startupManifestRegistry } : {}),
+              });
+          if (fastPath) {
+            // The startup fast path avoids importing the full secrets runtime
+            // until refresh/preflight needs dynamic provider or auth-store work.
+            return await finishPreparedSnapshot(fastPath.snapshot, activationParams, {
+              activateRuntimeSecretsSnapshot: (snapshot) =>
+                activateSecretsRuntimeSnapshotState({
+                  snapshot,
+                  runtimeSourceConfig: activationParams.runtimeSourceConfig,
+                  refreshContext: fastPath.refreshContext,
+                  refreshHandler: {
+                    preflight: async (refreshParams) =>
+                      await (
+                        await import("../secrets/runtime.js")
+                      ).preflightActiveSecretsRuntimeSnapshotRefresh(refreshParams),
+                    refresh: async (refreshParams) =>
+                      await (
+                        await import("../secrets/runtime.js")
+                      ).refreshActiveSecretsRuntimeSnapshotForConfig(refreshParams),
+                  },
+                }),
+            });
+          }
+        }
+        const loadAuthStore = startupPreflight
+          ? (await import("../agents/auth-profiles.js"))
+              .loadAuthProfileStoreWithoutExternalProfilesAsync
+          : undefined;
         const secretsRuntime =
           params.prepareRuntimeSecretsSnapshot && params.activateRuntimeSecretsSnapshot
             ? null
-            : await loadSecretsRuntime();
+            : await import("../secrets/runtime.js");
         const prepareRuntimeSecretsSnapshot =
           params.prepareRuntimeSecretsSnapshot ?? secretsRuntime!.prepareSecretsRuntimeSnapshot;
-        const activateRuntimeSecretsSnapshot =
-          params.activateRuntimeSecretsSnapshot ?? secretsRuntime!.activateSecretsRuntimeSnapshot;
-        const startupPreflight =
-          activationParams.reason === "startup" || activationParams.reason === "restart-check";
-        const loadAuthStore = startupPreflight
-          ? (await loadAuthProfiles()).loadAuthProfileStoreWithoutExternalProfiles
-          : undefined;
-        const prepared = await prepareRuntimeSecretsSnapshot({
-          config: pruneSkippedStartupSecretSurfaces(config),
-          ...(loadAuthStore ? { loadAuthStore } : {}),
-        });
-        assertRuntimeGatewayAuthNotKnownWeak(prepared.config);
-        if (activationParams.activate) {
-          activateRuntimeSecretsSnapshot(prepared);
-          logGatewayAuthSurfaceDiagnostics(prepared, params.logSecrets);
+        const allowUnavailableSecretOwners =
+          activationParams.reason !== "startup" || getActiveSecretsRuntimeSnapshotState() === null;
+        const prepared = await measureDiagnosticsTimelineSpan(
+          "secrets.prepare",
+          () =>
+            prepareRuntimeSecretsSnapshot({
+              config: sourceConfig,
+              allowUnavailableSecretOwners,
+              ...(activationParams.env ? { env: activationParams.env } : {}),
+              includeAuthStoreRefs: activationParams.includeAuthStoreRefs,
+              forceColdRefKeys: activationParams.forceColdRefKeys,
+              ...(startupManifestRegistry ? { manifestRegistry: startupManifestRegistry } : {}),
+              ...(params.pluginMetadataSnapshot
+                ? { pluginMetadataSnapshot: params.pluginMetadataSnapshot }
+                : {}),
+              ...(loadAuthStore ? { loadAuthStore } : {}),
+            }),
+          {
+            attributes: {
+              activate: activationParams.activate,
+              gatewayAuthSecretRef: hasActiveGatewayAuthSecretRef(config),
+              reason: activationParams.reason,
+            },
+            config,
+            env: activationParams.env ?? process.env,
+            omitErrorMessage: true,
+            phase: activationParams.reason,
+          },
+        );
+        if (activationParams.includeAuthStoreRefs === false) {
+          graftActiveSecretsRuntimeAuthState(prepared);
         }
-        for (const warning of prepared.warnings) {
-          params.logSecrets.warn(`[${warning.code}] ${warning.message}`);
-        }
-        if (secretsDegraded) {
-          const recoveredMessage =
-            "Secret resolution recovered; runtime remained on last-known-good during the outage.";
-          params.logSecrets.info(`[SECRETS_RELOADER_RECOVERED] ${recoveredMessage}`);
-          params.emitStateEvent("SECRETS_RELOADER_RECOVERED", recoveredMessage, prepared.config);
-        }
-        secretsDegraded = false;
-        return prepared;
+        return await finishPreparedSnapshot(prepared, activationParams);
       } catch (err) {
-        const details = String(err);
-        if (!secretsDegraded) {
-          params.logSecrets.error?.(`[SECRETS_RELOADER_DEGRADED] ${details}`);
-          if (activationParams.reason !== "startup") {
-            params.emitStateEvent(
-              "SECRETS_RELOADER_DEGRADED",
-              `Secret resolution failed; runtime remains on last-known-good snapshot. ${details}`,
-              config,
-            );
-          }
-        } else {
-          params.logSecrets.warn(`[SECRETS_RELOADER_DEGRADED] ${details}`);
-        }
-        secretsDegraded = true;
-        if (activationParams.reason === "startup") {
-          throw new Error(`Startup failed: required secrets are unavailable. ${details}`, {
-            cause: err,
-          });
-        }
-        throw err;
+        return handleSecretsActivationError(err, activationParams, activationSourceConfig);
       }
     });
-}
 
-export function assertValidGatewayStartupConfigSnapshot(
-  snapshot: ConfigFileSnapshot,
-  options: { includeDoctorHint?: boolean } = {},
-): void {
-  if (snapshot.valid) {
-    return;
-  }
-  const issues =
-    snapshot.issues.length > 0
-      ? formatConfigIssueLines(snapshot.issues, "", { normalizeRoot: true }).join("\n")
-      : "Unknown validation issue.";
-  const doctorHint = options.includeDoctorHint
-    ? `\nRun "${formatCliCommand("openclaw doctor --fix")}" to repair, then retry.`
-    : "";
-  throw new Error(`Invalid config at ${snapshot.path}.\n${issues}${doctorHint}`);
-}
+  const activatePreparedSnapshot: ActivateRuntimeSecrets["activatePreparedSnapshot"] = async (
+    snapshot,
+    activationParams,
+  ) =>
+    await runWithSecretsActivationLock(async () => {
+      try {
+        return await finishPreparedSnapshot(snapshot, activationParams);
+      } catch (err) {
+        return handleSecretsActivationError(err, activationParams, snapshot.sourceConfig);
+      }
+    });
 
-export async function prepareGatewayStartupConfig(params: {
-  configSnapshot: ConfigFileSnapshot;
-  authOverride?: GatewayAuthConfig;
-  tailscaleOverride?: GatewayTailscaleConfig;
-  activateRuntimeSecrets: ActivateRuntimeSecrets;
-  persistStartupAuth?: boolean;
-}): Promise<Awaited<ReturnType<typeof ensureGatewayStartupAuth>>> {
-  assertValidGatewayStartupConfigSnapshot(params.configSnapshot);
-
-  const runtimeConfig = applyConfigOverrides(params.configSnapshot.config);
-  const startupPreflightConfig = applyGatewayAuthOverridesForStartupPreflight(runtimeConfig, {
-    auth: params.authOverride,
-    tailscale: params.tailscaleOverride,
-  });
-  const needsAuthSecretPreflight = hasActiveGatewayAuthSecretRef(startupPreflightConfig);
-  const preflightConfig = needsAuthSecretPreflight
-    ? (
-        await params.activateRuntimeSecrets(startupPreflightConfig, {
-          reason: "startup",
-          activate: false,
-        })
-      ).config
-    : startupPreflightConfig;
-  const preflightAuthOverride =
-    typeof preflightConfig.gateway?.auth?.token === "string" ||
-    typeof preflightConfig.gateway?.auth?.password === "string"
-      ? {
-          ...params.authOverride,
-          ...(typeof preflightConfig.gateway?.auth?.token === "string"
-            ? { token: preflightConfig.gateway.auth.token }
-            : {}),
-          ...(typeof preflightConfig.gateway?.auth?.password === "string"
-            ? { password: preflightConfig.gateway.auth.password }
-            : {}),
+  const activatePreparedSnapshotIfCurrent: ActivateRuntimeSecrets["activatePreparedSnapshotIfCurrent"] =
+    async (snapshot, expectedRevision, activationParams, onActivated, canActivate, checkpoint) => {
+      return await runWithSecretsActivationLock(async () => {
+        // Source observations and durable preparation share activation ownership.
+        await checkpoint?.();
+        if (
+          getActiveSecretsRuntimeSnapshotRevisionState() !== expectedRevision ||
+          !hasCurrentAuthStoreCredentialsRevision(snapshot) ||
+          (canActivate && !canActivate())
+        ) {
+          return null;
         }
-      : params.authOverride;
+        let activated: PreparedRuntimeSecretsSnapshot;
+        let publication: Promise<void> | undefined;
+        let callbackOpen = true;
+        try {
+          activated = await finishPreparedSnapshot(snapshot, activationParams, {
+            checkpoint,
+            canActivate: () =>
+              getActiveSecretsRuntimeSnapshotRevisionState() === expectedRevision &&
+              (canActivate?.() ?? true),
+            onActivated: onActivated
+              ? () => {
+                  publication = Promise.resolve(
+                    onActivated((...args) => restoreSnapshot(() => callbackOpen, ...args)),
+                  );
+                }
+              : undefined,
+          });
+        } catch (err) {
+          callbackOpen = false;
+          if (err === supersededActivation) {
+            return null;
+          }
+          return handleSecretsActivationError(err, activationParams, snapshot.sourceConfig);
+        }
+        try {
+          await publication;
+          return activated;
+        } finally {
+          callbackOpen = false;
+        }
+      });
+    };
 
-  const authBootstrap = await ensureGatewayStartupAuth({
-    cfg: runtimeConfig,
-    env: process.env,
-    authOverride: preflightAuthOverride,
-    tailscaleOverride: params.tailscaleOverride,
-    persist: params.persistStartupAuth ?? true,
-    baseHash: params.configSnapshot.hash,
-  });
-  const runtimeStartupConfig = applyGatewayAuthOverridesForStartupPreflight(authBootstrap.cfg, {
-    auth: params.authOverride,
-    tailscale: params.tailscaleOverride,
-  });
-  const activatedConfig = (
-    await params.activateRuntimeSecrets(runtimeStartupConfig, {
-      reason: "startup",
-      activate: true,
-    })
-  ).config;
-  return {
-    ...authBootstrap,
-    cfg: activatedConfig,
-  };
-}
-
-function hasActiveGatewayAuthSecretRef(config: OpenClawConfig): boolean {
-  const states = evaluateGatewayAuthSurfaceStates({
-    config,
-    defaults: config.secrets?.defaults,
-    env: process.env,
-  });
-  return GATEWAY_AUTH_SURFACE_PATHS.some((path) => {
-    const state = states[path];
-    return state.hasSecretRef && state.active;
-  });
-}
-
-function pruneSkippedStartupSecretSurfaces(config: OpenClawConfig): OpenClawConfig {
-  const skipChannels =
-    isTruthyEnvValue(process.env.OPENCLAW_SKIP_CHANNELS) ||
-    isTruthyEnvValue(process.env.OPENCLAW_SKIP_PROVIDERS);
-  if (!skipChannels || !config.channels) {
-    return config;
-  }
-  return {
-    ...config,
-    channels: undefined,
-  };
-}
-
-function assertRuntimeGatewayAuthNotKnownWeak(config: OpenClawConfig): void {
-  assertGatewayAuthNotKnownWeak(
-    resolveGatewayAuth({
-      authConfig: config.gateway?.auth,
-      env: process.env,
-      tailscaleMode: config.gateway?.tailscale?.mode ?? "off",
-    }),
-  );
-}
-
-function logGatewayAuthSurfaceDiagnostics(
-  prepared: {
-    sourceConfig: OpenClawConfig;
-    warnings: Array<{ code: string; path: string; message: string }>;
-  },
-  logSecrets: GatewayStartupLog,
-): void {
-  const states = evaluateGatewayAuthSurfaceStates({
-    config: prepared.sourceConfig,
-    defaults: prepared.sourceConfig.secrets?.defaults,
-    env: process.env,
-  });
-  const inactiveWarnings = new Map<string, string>();
-  for (const warning of prepared.warnings) {
-    if (warning.code !== "SECRETS_REF_IGNORED_INACTIVE_SURFACE") {
-      continue;
-    }
-    inactiveWarnings.set(warning.path, warning.message);
-  }
-  for (const path of GATEWAY_AUTH_SURFACE_PATHS) {
-    const state = states[path];
-    if (!state.hasSecretRef) {
-      continue;
-    }
-    const stateLabel = state.active ? "active" : "inactive";
-    const inactiveDetails =
-      !state.active && inactiveWarnings.get(path) ? inactiveWarnings.get(path) : undefined;
-    const details = inactiveDetails ?? state.reason;
-    logSecrets.info(`[SECRETS_GATEWAY_AUTH_SURFACE] ${path} is ${stateLabel}. ${details}`);
-  }
-}
-
-function applyGatewayAuthOverridesForStartupPreflight(
-  config: OpenClawConfig,
-  overrides: GatewayStartupConfigOverrides,
-): OpenClawConfig {
-  if (!overrides.auth && !overrides.tailscale) {
-    return config;
-  }
-  return {
-    ...config,
-    gateway: {
-      ...config.gateway,
-      auth: mergeGatewayAuthConfig(config.gateway?.auth, overrides.auth),
-      tailscale: mergeGatewayTailscaleConfig(config.gateway?.tailscale, overrides.tailscale),
+  const providerAuthActivationParams = { reason: "reload", activate: true } as const;
+  registerProviderAuthRuntimeSnapshotActivationOwner({
+    runExclusive: runWithSecretsActivationLock,
+    isCurrent: (snapshot, expectedRevision) =>
+      getActiveSecretsRuntimeSnapshotRevisionState() === expectedRevision &&
+      hasCurrentAuthStoreCredentialsRevision(snapshot),
+    assertValid: (snapshot) => assertRuntimeGatewayAuthNotKnownWeak(snapshot.config),
+    publish: async (snapshot) => {
+      if (
+        pendingDeferredLineageRevision !== null &&
+        hasActiveSecretsRuntimeSnapshotLineage(pendingDeferredLineageRevision)
+      ) {
+        return;
+      }
+      await finishPreparedSnapshot(snapshot, providerAuthActivationParams, {
+        alreadyActivated: true,
+        stateScope: "provider-auth",
+        stateDegradedOwners: listProviderAuthDegradedOwners(snapshot),
+      });
     },
+    onError: (error, snapshot) =>
+      handleSecretsActivationError(error, providerAuthActivationParams, snapshot.sourceConfig),
+  });
+
+  const publishStateTransition: ActivateRuntimeSecrets["publishStateTransition"] = (
+    snapshot,
+    options,
+  ) => {
+    const transition = deferredStateTransitions.get(snapshot);
+    deferredStateTransitions.delete(snapshot);
+    if (transition && pendingDeferredLineageRevision === transition.activationRevision) {
+      pendingDeferredLineageRevision = null;
+    }
+    if (!transition) {
+      const sourceOnlyOwnsLineage =
+        options?.sourceOnly === true &&
+        options.expectedRevision !== undefined &&
+        hasActiveSecretsRuntimeSnapshotLineage(options.expectedRevision);
+      const activeSnapshot = sourceOnlyOwnsLineage ? getActiveSecretsRuntimeSnapshotState() : null;
+      const currentDegradation = degradation;
+      const sourceOnlyContractRecovered =
+        activeSnapshot !== null &&
+        currentDegradation?.supportsSourceOnlyRecovery &&
+        !hasSameSecretReloadContract(currentDegradation.config, activeSnapshot.sourceConfig);
+      if (sourceOnlyContractRecovered) {
+        if ((activeSnapshot.degradedOwners?.length ?? 0) > 0) {
+          const activeScope = resolvePreparedSecretsStateScope(activeSnapshot);
+          publishDegradation(activeSnapshot, "reload", activeScope);
+        } else {
+          publishRecovery(activeSnapshot.config, currentDegradation.generation);
+        }
+      }
+      return;
+    }
+    if (!hasActiveSecretsRuntimeSnapshotLineage(transition.activationRevision)) {
+      return;
+    }
+    const activeSnapshot = getActiveSecretsRuntimeSnapshotState();
+    if (!activeSnapshot) {
+      return;
+    }
+    logRuntimeSecretWarnings({
+      snapshot: activeSnapshot,
+      log: params.logSecrets,
+      ownerUnavailable: "active-only",
+    });
+    if ((activeSnapshot.degradedOwners?.length ?? 0) > 0) {
+      const activeScope = resolvePreparedSecretsStateScope(activeSnapshot);
+      const { reason, activationScope } = transition;
+      publishDegradation(activeSnapshot, reason, activeScope, activationScope);
+      return;
+    }
+    if (
+      options?.sourceOnly === true &&
+      (!degradation?.supportsSourceOnlyRecovery ||
+        hasSameSecretReloadContract(degradation.config, activeSnapshot.sourceConfig))
+    ) {
+      return;
+    }
+    const generation =
+      transition.kind === "recovered" ? transition.degradationGeneration : undefined;
+    publishRecovery(activeSnapshot.config, generation, transition.activationScope);
   };
+
+  return Object.assign(prepareRuntimeSecrets, {
+    activatePreparedSnapshot,
+    activatePreparedSnapshotIfCurrent,
+    restoreSnapshotIfCurrent: (
+      ...args: Parameters<ActivateRuntimeSecrets["restoreSnapshotIfCurrent"]>
+    ) => runWithSecretsActivationLock(() => restoreSnapshot(() => true, ...args)),
+    publishStateTransition,
+  });
 }

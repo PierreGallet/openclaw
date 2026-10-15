@@ -1,8 +1,9 @@
+// Vydra tests cover vydra plugin behavior.
 import {
   registerProviderPlugin,
   requireRegisteredProvider,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
-import { isLiveTestEnabled } from "openclaw/plugin-sdk/test-env";
+import { isLiveTestEnabled } from "openclaw/plugin-sdk/test-live";
 import { describe, expect, it } from "vitest";
 import plugin from "./index.js";
 
@@ -12,7 +13,7 @@ const ENABLE_VYDRA_VIDEO_LIVE = process.env.OPENCLAW_LIVE_VYDRA_VIDEO === "1";
 const LIVE_IMAGE_MODEL = process.env.OPENCLAW_LIVE_VYDRA_IMAGE_MODEL?.trim() || "grok-imagine";
 const LIVE_VIDEO_MODEL = process.env.OPENCLAW_LIVE_VYDRA_VIDEO_MODEL?.trim() || "veo3";
 const DEFAULT_LIVE_KLING_IMAGE_URL =
-  "https://raw.githubusercontent.com/openclaw/openclaw/main/docs/assets/showcase/roof-camera-sky.jpg";
+  "https://raw.githubusercontent.com/openclaw/openclaw/main/test/fixtures/media/roof-camera-sky.jpg";
 const LIVE_KLING_IMAGE_URL =
   process.env.OPENCLAW_LIVE_VYDRA_KLING_IMAGE_URL?.trim() || DEFAULT_LIVE_KLING_IMAGE_URL;
 const VYDRA_KLING_TIMEOUT_MS = 12 * 60_000;
@@ -29,9 +30,11 @@ function expectBufferedAsset(
   kind: "image" | "video",
   minBytes: number,
 ): void {
-  expect(asset).toBeDefined();
-  expect(asset?.mimeType.startsWith(`${kind}/`)).toBe(true);
-  if (!asset?.buffer) {
+  if (!asset) {
+    throw new Error(`expected generated ${kind} asset`);
+  }
+  expect(asset.mimeType.startsWith(`${kind}/`)).toBe(true);
+  if (!asset.buffer) {
     throw new Error(`expected generated ${kind} buffer`);
   }
   expect(asset.buffer.byteLength).toBeGreaterThan(minBytes);
@@ -58,9 +61,7 @@ describe.skipIf(!LIVE || !VYDRA_API_KEY)("vydra live", () => {
     const { speechProviders } = await registerVydraPlugin();
     const provider = requireRegisteredProvider(speechProviders, "vydra");
     const voices = await provider.listVoices?.({});
-    expect(voices).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: "21m00Tcm4TlvDq8ikWAM" })]),
-    );
+    expect(voices?.some((voice) => voice.id === "21m00Tcm4TlvDq8ikWAM")).toBe(true);
 
     const result = await provider.synthesize({
       text: "OpenClaw integration test OK.",

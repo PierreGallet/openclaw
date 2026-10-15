@@ -1,13 +1,17 @@
+/**
+ * Test mocks that pin Browser SSRF DNS lookups to a public example address.
+ */
 import { vi } from "vitest";
 
-vi.mock("../sdk-security-runtime.js", async () => {
-  const actual = await vi.importActual<typeof import("../sdk-security-runtime.js")>(
-    "../sdk-security-runtime.js",
+const lookupFn = vi.hoisted(() => async (_hostname: string, options?: { all?: boolean }) => {
+  const result = { address: "93.184.216.34", family: 4 };
+  return options?.all === true ? [result] : result;
+});
+
+vi.mock("openclaw/plugin-sdk/security-runtime", async () => {
+  const actual = await vi.importActual<typeof import("openclaw/plugin-sdk/security-runtime")>(
+    "openclaw/plugin-sdk/security-runtime",
   );
-  const lookupFn = async (_hostname: string, options?: { all?: boolean }) => {
-    const result = { address: "93.184.216.34", family: 4 };
-    return options?.all === true ? [result] : result;
-  };
   return {
     ...actual,
     resolvePinnedHostnameWithPolicy: (hostname: string, params: object = {}) =>

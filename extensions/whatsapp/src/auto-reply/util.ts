@@ -1,13 +1,20 @@
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/text-runtime";
+import {
+  isRecord,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
-export function elide(text?: string, limit = 400) {
-  if (!text) {
-    return text;
+export function markWhatsAppVisibleDeliveryError(error: unknown): unknown {
+  if (isRecord(error)) {
+    try {
+      Object.assign(error, { sentBeforeError: true, visibleReplySent: true });
+      return error;
+    } catch {
+      // Fall back to a wrapper when a platform error object is non-extensible.
+    }
   }
-  if (text.length <= limit) {
-    return text;
-  }
-  return `${text.slice(0, limit)}… (truncated ${text.length - limit} chars)`;
+  const visibleError = new Error("visible WhatsApp reply delivery failed", { cause: error });
+  Object.assign(visibleError, { sentBeforeError: true, visibleReplySent: true });
+  return visibleError;
 }
 
 export function isLikelyWhatsAppCryptoError(reason: unknown) {
@@ -28,13 +35,7 @@ export function isLikelyWhatsAppCryptoError(reason: unknown) {
         return Object.prototype.toString.call(value);
       }
     }
-    if (typeof value === "number") {
-      return String(value);
-    }
-    if (typeof value === "boolean") {
-      return String(value);
-    }
-    if (typeof value === "bigint") {
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") {
       return String(value);
     }
     if (typeof value === "symbol") {
@@ -45,9 +46,7 @@ export function isLikelyWhatsAppCryptoError(reason: unknown) {
     }
     return Object.prototype.toString.call(value);
   };
-  const raw =
-    reason instanceof Error ? `${reason.message}\n${reason.stack ?? ""}` : formatReason(reason);
-  const haystack = normalizeLowercaseStringOrEmpty(raw);
+  const haystack = normalizeLowercaseStringOrEmpty(formatReason(reason));
   const hasAuthError =
     haystack.includes("unsupported state or unable to authenticate data") ||
     haystack.includes("bad mac");
@@ -55,7 +54,6 @@ export function isLikelyWhatsAppCryptoError(reason: unknown) {
     return false;
   }
   return (
-    haystack.includes("@whiskeysockets/baileys") ||
     haystack.includes("baileys") ||
     haystack.includes("noise-handler") ||
     haystack.includes("aesdecryptgcm")

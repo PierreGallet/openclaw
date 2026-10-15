@@ -19,7 +19,8 @@ type VoiceSpeakerContext = Omit<VoiceSpeakerIdentity, "memberRoleIds"> & {
 export class DiscordVoiceSpeakerContextResolver {
   private readonly cache = new Map<
     string,
-    VoiceSpeakerContext & {
+    {
+      context: VoiceSpeakerContext;
       expiresAt: number;
     }
   >();
@@ -32,9 +33,13 @@ export class DiscordVoiceSpeakerContextResolver {
   ) {}
 
   async resolveContext(guildId: string, userId: string): Promise<VoiceSpeakerContext> {
-    const cached = this.getCachedContext(guildId, userId);
+    const key = `${guildId}:${userId}`;
+    const cached = this.cache.get(key);
     if (cached) {
-      return cached;
+      if (cached.expiresAt > Date.now()) {
+        return { ...cached.context };
+      }
+      this.cache.delete(key);
     }
     const identity = await this.resolveIdentity(guildId, userId);
     const context = {
@@ -42,9 +47,16 @@ export class DiscordVoiceSpeakerContextResolver {
       label: identity.label,
       name: identity.name,
       tag: identity.tag,
-      senderIsOwner: this.resolveIsOwner(identity),
+      senderIsOwner: resolveDiscordOwnerAccess({
+        allowFrom: this.params.ownerAllowFrom,
+        sender: identity,
+        allowNameMatching: false,
+      }).ownerAllowed,
     };
-    this.setCachedContext(guildId, userId, context);
+    this.cache.set(key, {
+      context: { ...context },
+      expiresAt: Date.now() + SPEAKER_CONTEXT_CACHE_TTL_MS,
+    });
     return context;
   }
 
@@ -80,48 +92,5 @@ export class DiscordVoiceSpeakerContextResolver {
         return { id: userId, label: userId, memberRoleIds: [] };
       }
     }
-  }
-
-  private resolveIsOwner(identity: Pick<VoiceSpeakerIdentity, "id" | "name" | "tag">): boolean {
-    return resolveDiscordOwnerAccess({
-      allowFrom: this.params.ownerAllowFrom,
-      sender: {
-        id: identity.id,
-        name: identity.name,
-        tag: identity.tag,
-      },
-      allowNameMatching: false,
-    }).ownerAllowed;
-  }
-
-  private resolveCacheKey(guildId: string, userId: string): string {
-    return `${guildId}:${userId}`;
-  }
-
-  private getCachedContext(guildId: string, userId: string): VoiceSpeakerContext | undefined {
-    const key = this.resolveCacheKey(guildId, userId);
-    const cached = this.cache.get(key);
-    if (!cached) {
-      return undefined;
-    }
-    if (cached.expiresAt <= Date.now()) {
-      this.cache.delete(key);
-      return undefined;
-    }
-    return {
-      id: cached.id,
-      label: cached.label,
-      name: cached.name,
-      tag: cached.tag,
-      senderIsOwner: cached.senderIsOwner,
-    };
-  }
-
-  private setCachedContext(guildId: string, userId: string, context: VoiceSpeakerContext): void {
-    const key = this.resolveCacheKey(guildId, userId);
-    this.cache.set(key, {
-      ...context,
-      expiresAt: Date.now() + SPEAKER_CONTEXT_CACHE_TTL_MS,
-    });
   }
 }

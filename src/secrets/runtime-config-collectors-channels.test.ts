@@ -1,3 +1,4 @@
+/** Tests channel-specific runtime config secret collectors. */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../config/config.js";
 import type { ResolverContext } from "./runtime-shared.js";
@@ -27,24 +28,25 @@ describe("runtime channel config collectors", () => {
       collectRuntimeConfigAssignments,
     });
     getBootstrapChannelSecrets.mockReturnValue(undefined);
-
-    collectChannelConfigAssignments({
-      config: {
-        channels: {
-          bluebubbles: {
-            accounts: {
-              ops: {},
-            },
+    const config = {
+      channels: {
+        imessage: {
+          accounts: {
+            ops: {},
           },
         },
-      } as OpenClawConfig,
+      },
+    } as OpenClawConfig;
+
+    collectChannelConfigAssignments({
+      config,
       defaults: undefined,
       context: {} as ResolverContext,
     });
 
     expect(loadChannelSecretContractApi).toHaveBeenCalledWith({
-      channelId: "bluebubbles",
-      config: expect.any(Object),
+      channelId: "imessage",
+      config,
       env: undefined,
       loadablePluginOrigins: undefined,
     });
@@ -60,20 +62,21 @@ describe("runtime channel config collectors", () => {
     getBootstrapChannelSecrets.mockReturnValue({
       collectRuntimeConfigAssignments,
     });
+    const config = {
+      channels: {
+        legacy: {},
+      },
+    } as OpenClawConfig;
 
     collectChannelConfigAssignments({
-      config: {
-        channels: {
-          legacy: {},
-        },
-      } as OpenClawConfig,
+      config,
       defaults: undefined,
       context: {} as ResolverContext,
     });
 
     expect(loadChannelSecretContractApi).toHaveBeenCalledWith({
       channelId: "legacy",
-      config: expect.any(Object),
+      config,
       env: undefined,
       loadablePluginOrigins: undefined,
     });

@@ -1,306 +1,232 @@
 ---
 name: crabbox
-description: Use Crabbox for OpenClaw remote Linux validation. Default to Blacksmith Testbox; includes direct Blacksmith and owned AWS/Hetzner fallback notes when Crabbox fails.
+description: "Crabbox and Blacksmith Testbox remote testing: isolation, cross-platform E2E, diagnostics, cleanup."
 ---
 
 # Crabbox
 
-Use Crabbox when OpenClaw needs remote Linux proof for broad tests, CI-parity
-checks, secrets, hosted services, Docker/E2E/package lanes, warmed reusable
-boxes, sync timing, logs/results, cache inspection, or lease cleanup.
+- Deliberate remote proof: follow [proof policy](../openclaw-testing/SKILL.md#proof-policy).
+  Prefer bounded local proof on a qualified, available host. Expensive or
+  platform-specific work can use remote capacity. Queued: stop owned allocation;
+  use PR CI or a safe local scope and report uncovered requirements.
+- Never wait on queues or chain provider fallbacks.
 
-Default backend: `blacksmith-testbox`. The separate `blacksmith-testbox` skill
-has been removed; this skill owns both the normal Crabbox path and the direct
-Blacksmith fallback playbook.
+Backends:
 
-## First Checks
+- `blacksmith-testbox`: trusted maintainer source. Prepared CI. `tbx_...`.
+- `aws`: direct brokered Crabbox. Fresh PRs. Custom sync/env/capture. `cbx_...`.
+- `local-container`: Docker fallback. Not remote proof.
+- `ssh`: existing operator host. macOS/Windows/WSL2.
 
-- Run from the repo root. Crabbox sync mirrors the current checkout.
-- Check the wrapper and providers before remote work:
+Always report provider, id, run URL, command, result. Never call Testbox “AWS
+Crabbox.”
 
-```sh
-command -v crabbox
-../crabbox/bin/crabbox --version
-pnpm crabbox:run -- --help | sed -n '1,120p'
-```
+## Repository Contract
 
-- OpenClaw scripts prefer `../crabbox/bin/crabbox` when present. The user PATH
-  shim can be stale.
-- Check `.crabbox.yaml` for repo defaults, but override provider explicitly.
-  Even if config still says AWS, maintainer validation should normally pass
-  `--provider blacksmith-testbox`.
-- Prefer local targeted tests for tight edit loops. Broad gates belong remote.
+- Resolve example commands, bootstrap, container image, PR from trusted consumer
+  instructions. Never invent commands or copy another consumer's setup.
+- Consumer-specific setup stays outside portable skill. See
+  [placeholder definitions](references/operations.md#repository-contract).
 
-## macOS And Windows Targets
+## Authorization and Isolation
 
-Use these only when the task needs an existing non-Linux host. OpenClaw broad
-validation still defaults to `blacksmith-testbox`.
+- Task-needed creation, reuse, cleanup, temporary state, clean checkouts:
+  pre-approved. Preserve existing branches, checkouts, unrelated edits.
+- Source trust, credentials, production access, budget, publication remain
+  authority boundaries. Isolated state; never touch operator Gateway without
+  per-task approval.
 
-Crabbox supports static SSH targets:
+## Route First
 
-```sh
-../crabbox/bin/crabbox run --provider ssh --target macos --static-host mac-studio.local -- xcodebuild test
-../crabbox/bin/crabbox run --provider ssh --target windows --windows-mode normal --static-host win-dev.local -- pwsh -NoProfile -Command "dotnet test"
-../crabbox/bin/crabbox run --provider ssh --target windows --windows-mode wsl2 --static-host win-dev.local -- pnpm test
-```
+- Preserve resolved provider: Testbox for trusted source; direct AWS when its
+  semantics required; secretless CI/AWS for untrusted code. Never run untrusted
+  wrappers/config locally or hydrate untrusted lease.
+- Acquire when command ready; reuse owned ID; stop afterward.
+- Smallest proven profile. Larger: recorded memory evidence or measured
+  total-cost benefit required, not generic failure/delay/timeout. Do not raise
+  worker counts to compensate.
+- Testbox sizing: `--blacksmith-workflow`, never direct `--class`/`--type`;
+  profile changes require fresh leases.
+- Blacksmith runner labels request a tier, not guaranteed CPU or RAM.
+  Blacksmith can allocate smaller machines depending on service availability.
+  For resource-sensitive tests or benchmarks, measure available CPUs,
+  affinity/quotas, and usable RAM on the allocated machine. Size workers and
+  workloads from those measurements. Record the requested tier and observed
+  resources separately. Do not qualify hardware or performance from labels alone.
+- Size, duration, hydration failure, capacity never authorize provider overrides;
+  explicit user selection or required backend semantics do.
 
-- `target=macos` and `target=windows --windows-mode wsl2` use the POSIX SSH,
-  bash, Git, rsync, and tar contract.
-- Native Windows uses OpenSSH, PowerShell, Git, and tar; sync is manifest tar
-  archive transfer into `static.workRoot`.
-- `crabbox actions hydrate/register` are Linux-only today; use plain
-  `crabbox run` loops for static macOS and Windows hosts.
-- Live proof needs a reachable, operator-managed SSH host. Without one, verify
-  with `../crabbox/bin/crabbox run --help`, config/flag tests, and the Crabbox
-  Go test suite.
+## Preflight
 
-## Default Blacksmith Backend
-
-Use this for `pnpm check`, `pnpm check:changed`, `pnpm test`,
-`pnpm test:changed`, Docker/E2E/live/package gates, or anything likely to fan
-out across many Vitest projects.
-
-Changed gate:
-
-```sh
-pnpm crabbox:run -- --provider blacksmith-testbox \
-  --blacksmith-org openclaw \
-  --blacksmith-workflow .github/workflows/ci-check-testbox.yml \
-  --blacksmith-job check \
-  --blacksmith-ref main \
-  --idle-timeout 90m \
-  --ttl 240m \
-  --timing-json \
-  --shell -- \
-  "env CI=1 NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_TEST_PROJECTS_PARALLEL=6 OPENCLAW_VITEST_MAX_WORKERS=1 OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS=900000 pnpm test:changed"
-```
-
-Full suite:
+Trusted repo root: read `.crabbox.yaml`, resolve installed binary, inspect
+provider/commands:
 
 ```sh
-pnpm crabbox:run -- --provider blacksmith-testbox \
-  --blacksmith-org openclaw \
-  --blacksmith-workflow .github/workflows/ci-check-testbox.yml \
-  --blacksmith-job check \
-  --blacksmith-ref main \
-  --idle-timeout 90m \
-  --ttl 240m \
-  --timing-json \
-  --shell -- \
-  "env CI=1 NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_TEST_PROJECTS_PARALLEL=6 OPENCLAW_VITEST_MAX_WORKERS=1 OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS=900000 pnpm test"
+export CRABBOX="$(command -v crabbox)"
+test -n "$CRABBOX"
+"$CRABBOX" --version
+"$CRABBOX" config show --json | jq '{provider, profile, target}'
+"$CRABBOX" run --help
 ```
 
-Focused rerun:
+- Use consumer's trusted wrapper/install instructions.
+- Repairs: verify upstream; use clean task-owned checkout; preserve installed
+  binary + unrelated source. Never trust sibling checkout merely by name.
+
+## Lease lifetime
+
+- TTL counts from creation, including hydration; idle timeout counts inactivity.
+  Earlier deadline wins. Defaults: 30m each, 4h maximum. Owner/org overrides can
+  allow up to 24h; use effective policy and sanitized clamp notices, not requested
+  durations. Policy tightening also applies to live leases.
+- `--keep` and `stop: never` do not prevent expiry. Request explicit bounded TTL
+  and idle for retained direct leases. Plain heartbeat, setup, sync, SSH, and
+  desktop use do not extend total TTL; `run` requests bounded auto-extension only
+  while a command executes, within policy, budget, and provider capability.
+- Before long source-dependent work, inspect remaining total lifetime. If allowed,
+  request one bounded `extend <id> --ttl <desired-total> --json`; extension does
+  not reset idle. Denied/budget/unsupported/nonadvancing/inactive outcomes require
+  a visible skip or failure, never provider switching or infinite lease chains.
+  Creation-fixed providers such as Daytona need enough TTL at allocation.
+- Direct guest-refresh failure can leave a longer provider deadline with the old
+  on-box deadline. Keep the same local state and retry the same fixed total TTL
+  only to reconcile; do not treat the failed extension as protection.
+- Honor trusted `directLeases: deny` and `directLeaseAllow`. A denied provider
+  requires the configured coordinator route; never bypass with direct credentials.
+  Testbox retains its native job and idle limits;
+  `--ttl` does not extend a delegated workflow.
+- `list` shows live coordinator leases; `list --retained` adds kept terminal
+  resources whose cleanup is unconfirmed. Use exact-ID inspect/stop for recovery.
+  Retain claims and recovery state until a blocking stop confirms completion.
+
+## Trusted Testbox
+
+Resolved provider = Testbox (or explicitly requested): commands preserve it.
+Add `--provider blacksmith-testbox` only for explicit override:
 
 ```sh
-pnpm crabbox:run -- --provider blacksmith-testbox \
-  --blacksmith-org openclaw \
-  --blacksmith-workflow .github/workflows/ci-check-testbox.yml \
-  --blacksmith-job check \
-  --blacksmith-ref main \
-  --idle-timeout 90m \
-  --ttl 240m \
-  --timing-json \
-  --shell -- \
-  "env CI=1 NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_VITEST_MAX_WORKERS=1 OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS=900000 pnpm test <path-or-filter>"
+"$CRABBOX" run --timing-json -- CI=1 <check-command>
 ```
 
-Read the JSON summary. Useful fields:
-
-- `provider`: should be `blacksmith-testbox`
-- `leaseId`: `tbx_...`
-- `syncDelegated`: should be `true`
-- `commandMs` / `totalMs`
-- `exitCode`
-
-Crabbox should stop one-shot Blacksmith Testboxes automatically after the run.
-Verify cleanup when a run fails, is interrupted, or the command output is
-unclear:
+Several commands: warm once, save id, reuse, stop.
 
 ```sh
-blacksmith testbox list
+"$CRABBOX" warmup --keep --timing-json
+"$CRABBOX" run --id <tbx_id> --timing-json -- <check-command>
+"$CRABBOX" stop <tbx_id>
 ```
 
-## Reuse And Keepalive
+Rules:
 
-For most Blacksmith-backed Crabbox calls, one-shot is enough. Use reuse only
-when you need multiple manual commands on the same hydrated box.
+- One lease, one active command. No sync/reclaim during run.
+- Prefer `bash -c`; login profiles can change directories. In executing shell,
+  assert physical checkout + expected source/patch; HEAD alone ≠ dirty-sync proof.
+  Follow consumer's documented hydration shell contract.
+- Native Testbox runs own sync, including reused `--id` runs. Never rely on
+  `--no-sync` for remote baseline: Blacksmith has no native bypass; released
+  Crabbox versions can silently ignore flag. Unchanged intentional rerun ≠ exception.
+- `--reclaim` only for deliberate checkout-path ownership transfer.
+- Base/head change: stop; rewarm. No stale-lease override.
+- Raw SHA unreliable for `warmup --ref`; use branch/tag.
+- `blacksmith testbox list` hides states. Use `list --all` or `status --id <tbx_id>`.
+- Testbox status/stop: `--id`. No status `--json`.
+- Delegated provider rejects `--fresh-pr`, `--full-resync`, `--script*`,
+  `--env-helper`, capture/download flags.
 
-If Crabbox returns a reusable id or you intentionally keep a lease:
+### Blacksmith directory downloads
+
+Recursive downloads + required remote trailing slash:
+[directory downloads](references/operations.md#blacksmith-directory-downloads).
+
+## Untrusted AWS
+
+- Clean trusted default-branch checkout. Installed trusted Crabbox binary.
+- Fresh lease per reviewed full head SHA. No instance role, Tailscale, hydration.
+- Forward only `CI`. Upload trusted bootstrap beside `--fresh-pr`.
 
 ```sh
-pnpm crabbox:run -- --provider blacksmith-testbox --id <tbx_id> --no-sync --timing-json --shell -- "pnpm test <path>"
+cd <clean-trusted-default-branch-checkout>
+env -u CRABBOX_AWS_INSTANCE_PROFILE \
+  "$CRABBOX" config show --json | \
+  jq -e '.aws.instanceProfile == ""' >/dev/null
+
+env -u CRABBOX_AWS_INSTANCE_PROFILE \
+  -u CRABBOX_TAILSCALE \
+  -u CRABBOX_TAILSCALE_AUTH_KEY \
+  -u CRABBOX_TAILSCALE_AUTH_KEY_ENV \
+  -u CRABBOX_TAILSCALE_EXIT_NODE \
+  -u CRABBOX_TAILSCALE_EXIT_NODE_ALLOW_LAN_ACCESS \
+  -u CRABBOX_TAILSCALE_HOSTNAME_TEMPLATE \
+  -u CRABBOX_TAILSCALE_TAGS \
+  "$CRABBOX" warmup \
+  --provider aws --network public --tailscale=false \
+  --tailscale-exit-node= \
+  --tailscale-exit-node-allow-lan-access=false \
+  --ttl 4h --idle-timeout 90m --keep --timing-json
+
+"$CRABBOX" inspect --provider aws --id <cbx_id> --json | \
+  jq -e '.network == "public" and .tailscale == null' >/dev/null
+
+env -u CRABBOX_AWS_INSTANCE_PROFILE \
+  CRABBOX_ENV_ALLOW=CI \
+  "$CRABBOX" run \
+  --provider aws --id <cbx_id> \
+  --fresh-pr <owner/repo#number> \
+  --no-hydrate --timing-json \
+  --script <trusted-bootstrap-script> -- \
+  <expected_full_head_sha> <check-command>
+
+env -u CRABBOX_AWS_INSTANCE_PROFILE \
+  "$CRABBOX" stop --provider aws <cbx_id>
 ```
 
-Stop boxes you created before handoff:
+- Trusted bootstrap must prove IMDSv2 IAM credentials return 404; verify SHA;
+  remove runtime injection variables; pin toolchain; isolate `HOME` before
+  install/test.
+- Changed head: fresh lease. Missing remote PR or no-role proof: secretless fork CI.
 
-```sh
-pnpm crabbox:stop -- <id-or-slug>
-blacksmith testbox stop --id <tbx_id>
-```
+## Direct AWS
 
-## If Crabbox Fails
+- Trusted AWS commands, auth diagnostics, resync, clean PR/container runs: read
+  [direct providers](references/operations.md#direct-aws).
+- Preserve `--no-hydrate` on container runs; report local-container proof as local.
 
-Keep the fallback narrow. First decide whether the failure is Crabbox itself,
-Blacksmith/Testbox, repo hydration, sync, or the test command.
+## Observability
 
-Fast checks:
+- Collecting artifacts/injecting credentials: read
+  [capture and environment flags](references/operations.md#observability).
+- Exact key, one command. Never print secrets, write in repo, or put in shell history.
+- No safe injection path: live auth blocked; fake-key proof insufficient.
 
-```sh
-command -v crabbox
-../crabbox/bin/crabbox --version
-crabbox run --provider blacksmith-testbox --help | sed -n '1,140p'
-command -v blacksmith
-blacksmith --version
-blacksmith testbox list
-```
+## Real E2E
 
-Common Crabbox-only failures:
+- Exercise requested user entry point with isolated consumer state, not just
+  remote unit tests.
+- For install/provider/interactive proof + safe revision comparison: read
+  [E2E procedure](references/operations.md#real-e2e).
 
-- Provider missing or old CLI: use `../crabbox/bin/crabbox` from the sibling
-  repo, or update/install Crabbox before retrying.
-- Bad local config: pass `--provider blacksmith-testbox` plus explicit
-  `--blacksmith-*` flags instead of relying on `.crabbox.yaml`.
-- Slug/claim confusion: use the raw `tbx_...` id, or run one-shot without
-  `--id`.
-- Sync/timing bug: add `--debug --timing-json`; capture the final JSON and the
-  printed Actions URL.
-- Cleanup uncertainty: run `blacksmith testbox list` and stop only boxes you
-  created.
+## Desktop / Cross-OS
 
-If Crabbox cannot dispatch, sync, attach, or stop but Blacksmith itself works,
-use direct Blacksmith from the repo root:
-
-```sh
-blacksmith testbox warmup ci-check-testbox.yml --ref main --idle-timeout 90
-blacksmith testbox run --id <tbx_id> "env CI=1 NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_TEST_PROJECTS_PARALLEL=6 OPENCLAW_VITEST_MAX_WORKERS=1 OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS=900000 pnpm test:changed"
-blacksmith testbox stop --id <tbx_id>
-```
-
-Direct full suite:
-
-```sh
-blacksmith testbox run --id <tbx_id> "env CI=1 NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_TEST_PROJECTS_PARALLEL=6 OPENCLAW_VITEST_MAX_WORKERS=1 OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS=900000 pnpm test"
-```
-
-Auth fallback, only when `blacksmith` says auth is missing:
-
-```sh
-blacksmith auth login --non-interactive --organization openclaw
-```
-
-Raw Blacksmith footguns:
-
-- Run from repo root. The CLI syncs the current directory.
-- Save the returned `tbx_...` id in the session.
-- Reuse that id for focused reruns; stop it before handoff.
-- Raw commit SHAs are not reliable `warmup --ref` refs; use a branch or tag.
-- Treat `blacksmith testbox list` as cleanup diagnostics, not a shared reusable
-  queue.
-
-Escalate to owned AWS/Hetzner only when Blacksmith is down, quota-limited,
-missing the needed environment, or owned capacity is the explicit goal. Use the
-Owned Cloud Fallback section below.
-
-## Blacksmith Backend Notes
-
-Crabbox Blacksmith backend delegates setup to:
-
-- org: `openclaw`
-- workflow: `.github/workflows/ci-check-testbox.yml`
-- job: `check`
-- ref: `main` unless testing a branch/tag intentionally
-
-The hydration workflow owns checkout, Node/pnpm setup, dependency install,
-secrets, ready marker, and keepalive. Crabbox owns dispatch, sync, SSH command
-execution, timing, logs/results, and cleanup.
-
-Minimal direct Blacksmith fallback, from repo root:
-
-```sh
-blacksmith testbox warmup ci-check-testbox.yml --ref main --idle-timeout 90
-blacksmith testbox run --id <tbx_id> "env CI=1 NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_TEST_PROJECTS_PARALLEL=6 OPENCLAW_VITEST_MAX_WORKERS=1 pnpm test:changed"
-blacksmith testbox stop --id <tbx_id>
-```
-
-Use direct Blacksmith only when Crabbox is the broken layer and Blacksmith
-itself still works. Prefer direct `blacksmith testbox list` for cleanup
-diagnostics, not as a reusable work queue.
-
-Important Blacksmith footguns:
-
-- Always run from repo root. The CLI syncs the current directory.
-- Raw commit SHAs are not reliable `warmup --ref` refs; use a branch or tag.
-- If auth is missing and browser auth is acceptable:
-
-```sh
-blacksmith auth login --non-interactive --organization openclaw
-```
-
-## Owned Cloud Fallback
-
-Use AWS/Hetzner only when Blacksmith is down, quota-limited, missing the needed
-environment, or owned capacity is explicitly the goal.
-
-```sh
-pnpm crabbox:warmup -- --provider aws --class beast --market on-demand --idle-timeout 90m
-pnpm crabbox:hydrate -- --id <cbx_id-or-slug>
-pnpm crabbox:run -- --id <cbx_id-or-slug> --timing-json --shell -- "env NODE_OPTIONS=--max-old-space-size=4096 OPENCLAW_TEST_PROJECTS_PARALLEL=6 OPENCLAW_VITEST_MAX_WORKERS=1 OPENCLAW_VITEST_NO_OUTPUT_TIMEOUT_MS=900000 pnpm test:changed"
-pnpm crabbox:stop -- <cbx_id-or-slug>
-```
-
-Install/auth for owned Crabbox if needed:
-
-```sh
-brew install openclaw/tap/crabbox
-printf '%s' "$CRABBOX_COORDINATOR_TOKEN" | crabbox login --url https://crabbox.openclaw.ai --provider aws --token-stdin
-```
-
-macOS config lives at:
-
-```text
-~/Library/Application Support/crabbox/config.yaml
-```
-
-It should include `broker.url`, `broker.token`, and usually `provider: aws`
-for owned-cloud lanes. Do not let that config override the OpenClaw default
-when Blacksmith proof is requested; pass `--provider blacksmith-testbox`.
-
-## Diagnostics
-
-```sh
-crabbox status --id <id-or-slug> --wait
-crabbox inspect --id <id-or-slug> --json
-crabbox sync-plan
-crabbox history --lease <id-or-slug>
-crabbox logs <run_id>
-crabbox results <run_id>
-crabbox cache stats --id <id-or-slug>
-crabbox ssh --id <id-or-slug>
-blacksmith testbox list
-```
-
-Use `--debug` on `run` when measuring sync timing.
-Use `--timing-json` on warmup, hydrate, and run when comparing backends.
-Use `--market spot|on-demand` only on AWS warmup/one-shot runs.
+SSH targets, paid macOS preflight, WebVNC, app handoff verification: read
+[desktop and cross-OS commands](references/operations.md#desktop-and-cross-os).
 
 ## Failure Triage
 
-- Crabbox cannot find provider: verify `../crabbox/bin/crabbox --help` lists
-  `blacksmith-testbox`; update Crabbox before falling back.
-- Hydration stuck or failed: open the printed GitHub Actions run URL and inspect
-  the hydration step.
-- Sync failed: rerun with `--debug`; check changed-file count and whether the
-  checkout is dirty.
-- Command failed: rerun only the failing shard/file first. Do not rerun a full
-  suite until the focused failure is understood.
-- Cleanup uncertain: `blacksmith testbox list`; stop owned `tbx_...` leases you
-  created.
-- Crabbox broken but Blacksmith works: use the direct Blacksmith fallback above,
-  then file/fix the Crabbox issue.
+Identify wrapper, provider, hydration, sync, SSH, or command failure:
 
-## Boundary
+```sh
+"$CRABBOX" doctor
+"$CRABBOX" status --id <id>
+"$CRABBOX" inspect --id <id> --json
+"$CRABBOX" logs <run_id>
+"$CRABBOX" results <run_id>
+blacksmith testbox list --all
+blacksmith testbox status --id <tbx_id>
+```
 
-Do not add OpenClaw-specific setup to Crabbox itself. Put repo setup in the
-hydration workflow and keep Crabbox generic around lease, sync, command
-execution, logs/results, timing, and cleanup.
+- Queued capacity: stop owned allocations; follow proof policy. No retry storm
+  or provider switching.
+- Stale sync: `--debug --timing-json`, then `--full-resync` once on direct providers.
+- Read failed phase/JUnit before focused rerun. Broken wrapper: diagnose with
+  installed CLI on same provider; update through consumer's trusted path.
+- Stop only owned IDs; `stop` takes no `--timing-json`.

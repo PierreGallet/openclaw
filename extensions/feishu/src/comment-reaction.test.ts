@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+// Feishu tests cover comment reaction plugin behavior.
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClawdbotConfig } from "../runtime-api.js";
 import {
   cleanupAmbientCommentTypingReaction,
@@ -18,6 +19,27 @@ vi.mock("./client.js", () => ({
 
 describe("createCommentTypingReactionLifecycle", () => {
   const request = vi.fn();
+  const commentReactionUrl =
+    "/open-apis/drive/v2/files/doc_token_1/comments/reaction?file_type=docx";
+
+  function expectedTypingReactionRequest(action: "add" | "delete") {
+    return {
+      method: "POST",
+      url: commentReactionUrl,
+      data: {
+        action,
+        reply_id: "reply_1",
+        reaction_type: "Typing",
+      },
+      timeout: 30_000,
+    };
+  }
+
+  afterAll(() => {
+    vi.doUnmock("./accounts.js");
+    vi.doUnmock("./client.js");
+    vi.resetModules();
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -59,38 +81,6 @@ describe("createCommentTypingReactionLifecycle", () => {
       },
     });
 
-  it("adds and removes a comment typing reaction using reply_id", async () => {
-    const lifecycle = createTypingReactionLifecycle();
-
-    await lifecycle.start();
-    await lifecycle.cleanup();
-
-    expect(request).toHaveBeenNthCalledWith(
-      1,
-      expect.objectContaining({
-        method: "POST",
-        url: "/open-apis/drive/v2/files/doc_token_1/comments/reaction?file_type=docx",
-        data: {
-          action: "add",
-          reply_id: "reply_1",
-          reaction_type: "Typing",
-        },
-      }),
-    );
-    expect(request).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        method: "POST",
-        url: "/open-apis/drive/v2/files/doc_token_1/comments/reaction?file_type=docx",
-        data: {
-          action: "delete",
-          reply_id: "reply_1",
-          reaction_type: "Typing",
-        },
-      }),
-    );
-  });
-
   it("skips requests when reply_id is missing", async () => {
     const lifecycle = createTypingReactionLifecycle(undefined);
 
@@ -108,16 +98,7 @@ describe("createCommentTypingReactionLifecycle", () => {
     await lifecycle.cleanup();
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        data: {
-          action: "delete",
-          reply_id: "reply_1",
-          reaction_type: "Typing",
-        },
-      }),
-    );
+    expect(request).toHaveBeenNthCalledWith(2, expectedTypingReactionRequest("delete"));
   });
 
   it("retries delete during later cleanup after an ambient delete failure", async () => {
@@ -142,25 +123,8 @@ describe("createCommentTypingReactionLifecycle", () => {
     await lifecycle.cleanup();
 
     expect(request).toHaveBeenCalledTimes(3);
-    expect(request).toHaveBeenNthCalledWith(
-      2,
-      expect.objectContaining({
-        data: {
-          action: "delete",
-          reply_id: "reply_1",
-          reaction_type: "Typing",
-        },
-      }),
-    );
-    expect(request).toHaveBeenNthCalledWith(
-      3,
-      expect.objectContaining({
-        data: {
-          action: "delete",
-          reply_id: "reply_1",
-          reaction_type: "Typing",
-        },
-      }),
-    );
+    expect(request).toHaveBeenNthCalledWith(1, expectedTypingReactionRequest("add"));
+    expect(request).toHaveBeenNthCalledWith(2, expectedTypingReactionRequest("delete"));
+    expect(request).toHaveBeenNthCalledWith(3, expectedTypingReactionRequest("delete"));
   });
 });

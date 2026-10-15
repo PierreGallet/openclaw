@@ -1,3 +1,4 @@
+import { parseTcpPort } from "openclaw/plugin-sdk/number-runtime";
 import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk/routing";
 import type {
   ChannelSetupDmPolicy,
@@ -7,14 +8,18 @@ import type {
 import {
   createAllowFromSection,
   createPromptParsedAllowFromForAccount,
+  createSetupTranslator,
   createStandardChannelSetupStatus,
   formatDocsLink,
   setSetupChannelEnabled,
+  splitSetupEntries,
 } from "openclaw/plugin-sdk/setup";
 import {
   normalizeOptionalString,
+  normalizeStringEntries,
   normalizeStringifiedOptionalString,
-} from "openclaw/plugin-sdk/text-runtime";
+  uniqueStrings,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveDefaultIrcAccountId, resolveIrcAccount } from "./accounts.js";
 import {
   isChannelTarget,
@@ -23,7 +28,6 @@ import {
 } from "./normalize.js";
 import {
   ircSetupAdapter,
-  parsePort,
   setIrcAllowFrom,
   setIrcDmPolicy,
   setIrcGroupAccess,
@@ -32,15 +36,28 @@ import {
 } from "./setup-core.js";
 import type { CoreConfig } from "./types.js";
 
+const t = createSetupTranslator();
+
 const channel = "irc" as const;
 const USE_ENV_FLAG = "__ircUseEnv";
 const TLS_FLAG = "__ircTls";
 
-function parseListInput(raw: string): string[] {
-  return raw
-    .split(/[\n,;]+/g)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
+type IrcTextInput = NonNullable<ChannelSetupWizard["textInputs"]>[number];
+
+function ircAccountTextInput(
+  configKey: "host" | "nick" | "username" | "realname",
+  input: Pick<IrcTextInput, "inputKey" | "message" | "initialValue">,
+): IrcTextInput {
+  return {
+    ...input,
+    currentValue: ({ cfg, accountId }) =>
+      resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config[configKey] || undefined,
+    shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
+    validate: ({ value }) => (normalizeStringifiedOptionalString(value) ? undefined : "Required"),
+    normalizeValue: ({ value }) => normalizeStringifiedOptionalString(value) ?? "",
+    applySet: async ({ cfg, accountId, value }) =>
+      updateIrcAccountConfig(cfg as CoreConfig, accountId, { enabled: true, [configKey]: value }),
+  };
 }
 
 function normalizeGroupEntry(raw: string): string | null {
@@ -58,23 +75,27 @@ function normalizeGroupEntry(raw: string): string | null {
   return `#${normalized.replace(/^#+/, "")}`;
 }
 
+function parseAutoJoinChannels(value: string): string[] {
+  return splitSetupEntries(value)
+    .map(normalizeGroupEntry)
+    .filter((entry): entry is string => Boolean(entry && entry !== "*"))
+    .filter(isChannelTarget);
+}
+
 const promptIrcAllowFrom = createPromptParsedAllowFromForAccount<CoreConfig>({
-  defaultAccountId: (cfg) => resolveDefaultIrcAccountId(cfg),
-  noteTitle: "IRC allowlist",
+  defaultAccountId: resolveDefaultIrcAccountId,
+  noteTitle: t("wizard.irc.allowlistTitle"),
   noteLines: [
-    "Allowlist IRC DMs by sender.",
-    "Examples:",
+    t("wizard.irc.allowlistIntro"),
+    t("wizard.irc.examples"),
     "- alice",
     "- alice!ident@example.org",
-    "Multiple entries: comma-separated.",
+    t("wizard.irc.multipleEntries"),
   ],
-  message: "IRC allowFrom (nick or nick!user@host)",
+  message: t("wizard.irc.allowFromPrompt"),
   placeholder: "alice, bob!ident@example.org",
   parseEntries: (raw) => ({
-    entries: parseListInput(raw)
-      .map((entry) => normalizeIrcAllowEntry(entry))
-      .map((entry) => entry.trim())
-      .filter(Boolean),
+    entries: normalizeStringEntries(splitSetupEntries(raw).map(normalizeIrcAllowEntry)),
   }),
   getExistingAllowFrom: ({ cfg }) => cfg.channels?.irc?.allowFrom ?? [],
   applyAllowFrom: ({ cfg, allowFrom }) => setIrcAllowFrom(cfg, allowFrom),
@@ -89,7 +110,9 @@ async function promptIrcNickServConfig(params: {
   const existing = resolved.config.nickserv;
   const hasExisting = Boolean(existing?.password || existing?.passwordFile);
   const wants = await params.prompter.confirm({
-    message: hasExisting ? "Update NickServ settings?" : "Configure NickServ identify/register?",
+    message: hasExisting
+      ? t("wizard.irc.nickServUpdatePrompt")
+      : t("wizard.irc.nickServConfigurePrompt"),
     initialValue: hasExisting,
   });
   if (!wants) {
@@ -98,7 +121,7 @@ async function promptIrcNickServConfig(params: {
 
   const service = (
     await params.prompter.text({
-      message: "NickServ service nick",
+      message: t("wizard.irc.nickServServicePrompt"),
       initialValue: existing?.service || "NickServ",
       validate: (value) => (normalizeStringifiedOptionalString(value) ? undefined : "Required"),
     })
@@ -109,7 +132,7 @@ async function promptIrcNickServConfig(params: {
     Boolean(process.env.IRC_NICKSERV_PASSWORD?.trim()) &&
     !(existing?.password || existing?.passwordFile)
       ? await params.prompter.confirm({
-          message: "IRC_NICKSERV_PASSWORD detected. Use env var?",
+          message: t("wizard.irc.nickServPasswordEnvPrompt"),
           initialValue: true,
         })
       : false;
@@ -118,7 +141,7 @@ async function promptIrcNickServConfig(params: {
     ? undefined
     : (
         await params.prompter.text({
-          message: "NickServ password (blank to disable NickServ auth)",
+          message: t("wizard.irc.nickServPasswordPrompt"),
           validate: () => undefined,
         })
       ).trim();
@@ -131,13 +154,13 @@ async function promptIrcNickServConfig(params: {
   }
 
   const register = await params.prompter.confirm({
-    message: "Send NickServ REGISTER on connect?",
+    message: t("wizard.irc.nickServRegisterPrompt"),
     initialValue: existing?.register ?? false,
   });
   const registerEmail = register
     ? (
         await params.prompter.text({
-          message: "NickServ register email",
+          message: t("wizard.irc.nickServRegisterEmailPrompt"),
           initialValue:
             existing?.registerEmail ||
             (params.accountId === DEFAULT_ACCOUNT_ID
@@ -164,22 +187,17 @@ const ircDmPolicy: ChannelSetupDmPolicy = {
   allowFromKey: "channels.irc.allowFrom",
   getCurrent: (cfg) => (cfg as CoreConfig).channels?.irc?.dmPolicy ?? "pairing",
   setPolicy: (cfg, policy) => setIrcDmPolicy(cfg as CoreConfig, policy),
-  promptAllowFrom: async ({ cfg, prompter, accountId }) =>
-    await promptIrcAllowFrom({
-      cfg: cfg as CoreConfig,
-      prompter,
-      accountId,
-    }),
+  promptAllowFrom: promptIrcAllowFrom,
 };
 
 export const ircSetupWizard: ChannelSetupWizard = {
   channel,
   status: createStandardChannelSetupStatus({
     channelLabel: "IRC",
-    configuredLabel: "configured",
-    unconfiguredLabel: "needs host + nick",
-    configuredHint: "configured",
-    unconfiguredHint: "needs host + nick",
+    configuredLabel: t("wizard.channels.statusConfigured"),
+    unconfiguredLabel: t("wizard.channels.statusNeedsHostNick"),
+    configuredHint: t("wizard.channels.statusConfigured"),
+    unconfiguredHint: t("wizard.channels.statusNeedsHostNick"),
     configuredScore: 1,
     unconfiguredScore: 0,
     includeStatusLine: true,
@@ -187,14 +205,14 @@ export const ircSetupWizard: ChannelSetupWizard = {
       resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).configured,
   }),
   introNote: {
-    title: "IRC setup",
+    title: t("wizard.irc.setupTitle"),
     lines: [
-      "IRC needs server host + bot nick.",
-      "Recommended: TLS on port 6697.",
-      "Optional: NickServ identify/register can be configured after the basic account fields.",
-      'Set channels.irc.groupPolicy="allowlist" and channels.irc.groups for tighter channel control.',
-      'Note: IRC channels are mention-gated by default. To allow unmentioned replies, set channels.irc.groups["#channel"].requireMention=false (or "*" for all).',
-      "Env vars supported: IRC_HOST, IRC_PORT, IRC_TLS, IRC_NICK, IRC_USERNAME, IRC_REALNAME, IRC_PASSWORD, IRC_CHANNELS, IRC_NICKSERV_PASSWORD, IRC_NICKSERV_REGISTER_EMAIL.",
+      t("wizard.irc.helpNeedsHostNick"),
+      t("wizard.irc.helpRecommendedTls"),
+      t("wizard.irc.helpNickServOptional"),
+      t("wizard.irc.helpGroupControl"),
+      t("wizard.irc.helpMentionGate"),
+      t("wizard.irc.helpEnvVars"),
       `Docs: ${formatDocsLink("/channels/irc", "channels/irc")}`,
     ],
     shouldShow: ({ cfg, accountId }) =>
@@ -209,7 +227,7 @@ export const ircSetupWizard: ChannelSetupWizard = {
 
     if (envReady) {
       const useEnv = await prompter.confirm({
-        message: "IRC_HOST and IRC_NICK detected. Use env vars?",
+        message: t("wizard.irc.envPrompt"),
         initialValue: true,
       });
       if (useEnv) {
@@ -224,7 +242,7 @@ export const ircSetupWizard: ChannelSetupWizard = {
     }
 
     const tls = await prompter.confirm({
-      message: "Use TLS for IRC?",
+      message: t("wizard.irc.tlsPrompt"),
       initialValue: resolved.config.tls ?? true,
     });
     return {
@@ -241,23 +259,13 @@ export const ircSetupWizard: ChannelSetupWizard = {
   },
   credentials: [],
   textInputs: [
-    {
+    ircAccountTextInput("host", {
       inputKey: "httpHost",
-      message: "IRC server host",
-      currentValue: ({ cfg, accountId }) =>
-        resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.host || undefined,
-      shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
-      validate: ({ value }) => (normalizeStringifiedOptionalString(value) ? undefined : "Required"),
-      normalizeValue: ({ value }) => normalizeStringifiedOptionalString(value) ?? "",
-      applySet: async ({ cfg, accountId, value }) =>
-        updateIrcAccountConfig(cfg as CoreConfig, accountId, {
-          enabled: true,
-          host: value,
-        }),
-    },
+      message: t("wizard.irc.serverHostPrompt"),
+    }),
     {
       inputKey: "httpPort",
-      message: "IRC server port",
+      message: t("wizard.irc.serverPortPrompt"),
       currentValue: ({ cfg, accountId }) =>
         String(resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.port ?? ""),
       shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
@@ -268,86 +276,46 @@ export const ircSetupWizard: ChannelSetupWizard = {
         return String(defaultPort);
       },
       validate: ({ value }) => {
-        const parsed = Number.parseInt(normalizeStringifiedOptionalString(value) ?? "", 10);
-        return Number.isFinite(parsed) && parsed >= 1 && parsed <= 65535
-          ? undefined
-          : "Use a port between 1 and 65535";
+        const raw = normalizeStringifiedOptionalString(value) ?? "";
+        return parseTcpPort(raw) !== null ? undefined : "Use a port between 1 and 65535";
       },
-      normalizeValue: ({ value }) => String(parsePort(value, 6697)),
+      normalizeValue: ({ value }) => String(parseTcpPort(value) ?? 6697),
       applySet: async ({ cfg, accountId, value }) =>
         updateIrcAccountConfig(cfg as CoreConfig, accountId, {
           enabled: true,
-          port: parsePort(value, 6697),
+          port: parseTcpPort(value) ?? 6697,
         }),
     },
-    {
+    ircAccountTextInput("nick", {
       inputKey: "token",
-      message: "IRC nick",
-      currentValue: ({ cfg, accountId }) =>
-        resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.nick || undefined,
-      shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
-      validate: ({ value }) => (normalizeStringifiedOptionalString(value) ? undefined : "Required"),
-      normalizeValue: ({ value }) => normalizeStringifiedOptionalString(value) ?? "",
-      applySet: async ({ cfg, accountId, value }) =>
-        updateIrcAccountConfig(cfg as CoreConfig, accountId, {
-          enabled: true,
-          nick: value,
-        }),
-    },
-    {
+      message: t("wizard.irc.nickPrompt"),
+    }),
+    ircAccountTextInput("username", {
       inputKey: "userId",
-      message: "IRC username",
-      currentValue: ({ cfg, accountId }) =>
-        resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.username || undefined,
-      shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
+      message: t("wizard.irc.usernamePrompt"),
       initialValue: ({ cfg, accountId, credentialValues }) =>
         resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.username ||
         credentialValues.token ||
         "openclaw",
-      validate: ({ value }) => (normalizeStringifiedOptionalString(value) ? undefined : "Required"),
-      normalizeValue: ({ value }) => normalizeStringifiedOptionalString(value) ?? "",
-      applySet: async ({ cfg, accountId, value }) =>
-        updateIrcAccountConfig(cfg as CoreConfig, accountId, {
-          enabled: true,
-          username: value,
-        }),
-    },
-    {
+    }),
+    ircAccountTextInput("realname", {
       inputKey: "deviceName",
-      message: "IRC real name",
-      currentValue: ({ cfg, accountId }) =>
-        resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.realname || undefined,
-      shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
+      message: t("wizard.irc.realNamePrompt"),
       initialValue: ({ cfg, accountId }) =>
         resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.realname || "OpenClaw",
-      validate: ({ value }) => (normalizeStringifiedOptionalString(value) ? undefined : "Required"),
-      normalizeValue: ({ value }) => normalizeStringifiedOptionalString(value) ?? "",
-      applySet: async ({ cfg, accountId, value }) =>
-        updateIrcAccountConfig(cfg as CoreConfig, accountId, {
-          enabled: true,
-          realname: value,
-        }),
-    },
+    }),
     {
       inputKey: "groupChannels",
-      message: "Auto-join IRC channels (optional, comma-separated)",
+      message: t("wizard.irc.autoJoinPrompt"),
       placeholder: "#openclaw, #ops",
       required: false,
       applyEmptyValue: true,
       currentValue: ({ cfg, accountId }) =>
         resolveIrcAccount({ cfg: cfg as CoreConfig, accountId }).config.channels?.join(", "),
       shouldPrompt: ({ credentialValues }) => credentialValues[USE_ENV_FLAG] !== "1",
-      normalizeValue: ({ value }) =>
-        parseListInput(value)
-          .map((entry) => normalizeGroupEntry(entry))
-          .filter((entry): entry is string => Boolean(entry && entry !== "*"))
-          .filter((entry) => isChannelTarget(entry))
-          .join(", "),
+      normalizeValue: ({ value }) => parseAutoJoinChannels(value).join(", "),
       applySet: async ({ cfg, accountId, value }) => {
-        const channels = parseListInput(value)
-          .map((entry) => normalizeGroupEntry(entry))
-          .filter((entry): entry is string => Boolean(entry && entry !== "*"))
-          .filter((entry) => isChannelTarget(entry));
+        const channels = parseAutoJoinChannels(value);
         return updateIrcAccountConfig(cfg as CoreConfig, accountId, {
           enabled: true,
           channels: channels.length > 0 ? channels : undefined,
@@ -367,7 +335,11 @@ export const ircSetupWizard: ChannelSetupWizard = {
     setPolicy: ({ cfg, accountId, policy }) =>
       setIrcGroupAccess(cfg as CoreConfig, accountId, policy, [], normalizeGroupEntry),
     resolveAllowlist: async ({ entries }) =>
-      [...new Set(entries.map((entry) => normalizeGroupEntry(entry)).filter(Boolean))] as string[],
+      uniqueStrings(
+        entries
+          .map((entry) => normalizeGroupEntry(entry))
+          .filter((entry): entry is string => Boolean(entry)),
+      ),
     applyAllowlist: ({ cfg, accountId, resolved }) =>
       setIrcGroupAccess(
         cfg as CoreConfig,
@@ -378,17 +350,17 @@ export const ircSetupWizard: ChannelSetupWizard = {
       ),
   },
   allowFrom: createAllowFromSection({
-    helpTitle: "IRC allowlist",
+    helpTitle: t("wizard.irc.allowlistTitle"),
     helpLines: [
-      "Allowlist IRC DMs by sender.",
-      "Examples:",
+      t("wizard.irc.allowlistIntro"),
+      t("wizard.irc.examples"),
       "- alice",
       "- alice!ident@example.org",
-      "Multiple entries: comma-separated.",
+      t("wizard.irc.multipleEntries"),
     ],
-    message: "IRC allowFrom (nick or nick!user@host)",
+    message: t("wizard.irc.allowFromPrompt"),
     placeholder: "alice, bob!ident@example.org",
-    invalidWithoutCredentialNote: "Use an IRC nick or nick!user@host entry.",
+    invalidWithoutCredentialNote: t("wizard.irc.allowFromInvalid"),
     parseId: (raw) => {
       const normalized = normalizeIrcAllowEntry(raw);
       return normalized || null;
@@ -403,7 +375,7 @@ export const ircSetupWizard: ChannelSetupWizard = {
       const groupKeys = Object.keys(resolvedAfterGroups.config.groups ?? {});
       if (groupKeys.length > 0) {
         const wantsMentions = await prompter.confirm({
-          message: "Require @mention to reply in IRC channels?",
+          message: t("wizard.irc.requireMentionPrompt"),
           initialValue: true,
         });
         if (!wantsMentions) {
@@ -427,10 +399,10 @@ export const ircSetupWizard: ChannelSetupWizard = {
     return { cfg: next };
   },
   completionNote: {
-    title: "IRC next steps",
+    title: t("wizard.irc.nextStepsTitle"),
     lines: [
-      "Next: restart gateway and verify status.",
-      "Command: openclaw channels status --probe",
+      t("wizard.irc.nextRestartGateway"),
+      t("wizard.irc.nextStatusCommand"),
       `Docs: ${formatDocsLink("/channels/irc", "channels/irc")}`,
     ],
   },
