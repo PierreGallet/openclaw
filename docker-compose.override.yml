@@ -6,8 +6,8 @@ services:
     # leak/runaway to this container instead of letting it contend for
     # the whole host's RAM (an unbounded OOM has taken the server down).
     # memswap_limit > mem_limit allows a brief spill to swap before kill.
-    mem_limit: 2g
-    memswap_limit: 4g
+    mem_limit: 3g
+    memswap_limit: 5g
     # CPU cap: peak ~0.6 core; 2.0 is ample headroom and bounds a runaway.
     cpus: 2.0
     environment:
