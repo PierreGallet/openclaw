@@ -27,5 +27,10 @@ ENV PATH="${HOMEBREW_PREFIX}/bin:${HOMEBREW_PREFIX}/sbin:${PATH}"
 # Pre-install tools so they persist across deploys
 RUN brew install gh
 USER root
-RUN npm install -g @anthropic-ai/claude-code
+# The package's postinstall swaps bin/claude.exe (an "echo error" stub) for the
+# native binary; it did not run in this build, so run it explicitly and fail
+# the build if the binary is still missing.
+RUN npm install -g @anthropic-ai/claude-code && \
+    node /usr/local/lib/node_modules/@anthropic-ai/claude-code/install.cjs && \
+    claude --version
 USER node
