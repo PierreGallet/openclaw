@@ -12,12 +12,20 @@ services:
     cpus: 2.0
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      # Claude Code (claude-cli/* models) keeps its subscription login here;
+      # without the bind mount below it is lost on every image rebuild.
+      CLAUDE_CONFIG_DIR: /home/node/.claude
+    volumes:
+      - "${OPENCLAW_CLAUDE_DIR:-${HOME:-/tmp}/.openclaw-claude}:/home/node/.claude"
 
   openclaw-cli:
     container_name: openclaw_cli
     image: openclaw:custom
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      CLAUDE_CONFIG_DIR: /home/node/.claude
+    volumes:
+      - "${OPENCLAW_CLAUDE_DIR:-${HOME:-/tmp}/.openclaw-claude}:/home/node/.claude"
 
   # Nginx is managed by the genius (infra) repo
   # Ollama is managed by the genius (infra) repo

@@ -45,10 +45,12 @@ fi
 
 # Pre-create bind-mount sources so Docker doesn't create them root-owned
 mkdir -p "${OPENCLAW_AUTH_PROFILE_SECRET_DIR:-$HOME/.openclaw-auth-profile-secrets}"
+mkdir -p "${OPENCLAW_CLAUDE_DIR:-$HOME/.openclaw-claude}"
 
-# Rebuild Docker images
+# Rebuild Docker images. Plugins are bundled from this checkout so they match
+# the core build; npm releases can expect SDK exports this fork's core lacks.
 echo "Building base Docker image..."
-docker build -t openclaw:local .
+docker build --build-arg OPENCLAW_EXTENSIONS="codex,acpx,brave" -t openclaw:local .
 echo "Building custom Docker image (with brew)..."
 docker build -t openclaw:custom -f Dockerfile.custom .
 
